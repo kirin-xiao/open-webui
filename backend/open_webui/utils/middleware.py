@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 from typing import Any, Optional
 from urllib.parse import unquote
 from uuid import uuid4
@@ -24,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from open_webui.config import (
     CACHE_DIR,
     CODE_INTERPRETER_BLOCKED_MODULES,
+    CODE_INTERPRETER_PYODIDE_PERSISTENCE_PROMPT,
     CODE_INTERPRETER_PYODIDE_PROMPT,
     DEFAULT_CODE_INTERPRETER_PROMPT,
     DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
@@ -38,11 +40,11 @@ from open_webui.env import (
     ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION,
     ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND,
     ENABLE_PLUGINS,
+    ENABLE_PYODIDE_FILE_PERSISTENCE,
     ENABLE_QUERIES_CACHE,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_RESPONSES_API_STATEFUL,
     GLOBAL_LOG_LEVEL,
-    RAG_SYSTEM_CONTEXT,
 )
 from open_webui.events import EVENTS, publish_event
 from open_webui.models.access_grants import AccessGrants
@@ -87,8 +89,20 @@ from open_webui.utils.access_control.folders import has_folder_access
 from open_webui.utils.ask_user import stage_ask_user_tool_calls
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
+from open_webui.utils.chat_injections import (
+    STATUS_KNOWLEDGE_RETRIEVED,
+    attach_injection,
+    emit_injection_status,
+    record_message_injection,
+    record_rag_injection,
+)
 from open_webui.utils.code_interpreter import execute_code_jupyter
-from open_webui.utils.context_compaction import compact_messages_for_request
+from open_webui.utils.context_compaction import (
+    compact_for_overflow,
+    compact_messages_for_request,
+    insert_checkpoint_message,
+    is_context_overflow_error,
+)
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -103,7 +117,7 @@ from open_webui.utils.filter import (
 )
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.mcp.client import MCPClient
-from open_webui.utils.memory import add_memory_context, review_memory_after_turn
+from open_webui.utils.memory import add_memory_context, model_allows_memory, review_memory_after_turn
 from open_webui.utils.misc import (
     add_or_update_system_message,
     add_or_update_user_message,
@@ -128,7 +142,7 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.payload import apply_params_to_form_data, apply_system_prompt_to_body, resolve_system_prompt
 from open_webui.utils.plugin import load_function_module_by_id
-from open_webui.utils.response import merge_usage, normalize_usage
+from open_webui.utils.response import log_cache_usage, merge_usage, normalize_usage
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.skills import (
     apply_skills_create_prompt,
@@ -136,11 +150,18 @@ from open_webui.utils.skills import (
     has_prior_real_chat_content,
     strip_skill_mentions,
 )
+from open_webui.utils.system_baseline import (
+    append_current_date_line,
+    apply_system_baseline,
+    assemble_frozen_top_content,
+    compute_inputs_hash,
+)
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
     tools_function_calling_generation_template,
 )
+from open_webui.tools.builtin import SUBAGENT_CANONICAL_NAME, SUBAGENT_TOOL_NAMES
 from open_webui.utils.tools import (
     build_tool_server_headers,
     get_attached_knowledge,
@@ -433,7 +454,38 @@ def get_citation_source_from_tool_result(
         if isinstance(tool_result, dict) and 'error' in tool_result:
             return []
 
-        if tool_name in ('view_knowledge_file', 'view_file'):
+        if tool_name == 'search_web':
+            if not isinstance(tool_result, list):
+                return []
+
+            # Parse JSON array: [{"title": "...", "link": "...", "snippet": "..."}]
+            results = tool_result
+            documents = []
+            metadata = []
+
+            for result in results:
+                title = result.get('title', '')
+                link = result.get('link', '')
+                snippet = result.get('snippet', '')
+
+                documents.append(f'{title}\n{snippet}')
+                metadata.append(
+                    {
+                        'source': link,
+                        'name': title,
+                        'url': link,
+                    }
+                )
+
+            return [
+                {
+                    'source': {'name': 'search_web', 'id': 'search_web'},
+                    'document': documents,
+                    'metadata': metadata,
+                }
+            ]
+
+        elif tool_name in ('view_knowledge_file', 'view_file'):
             if not isinstance(tool_result, dict):
                 return []
 
@@ -940,18 +992,27 @@ def handle_responses_streaming_event(
 def get_source_context(sources: list, source_ids: dict = None, include_content: bool = True) -> str:
     """
     Build <source> tag context string from citation sources.
+
+    name/url are taken from the per-document metadata when available, so tool
+    results (e.g. search_web) render tags the model can map back to a specific
+    result. Attribute values are HTML-escaped.
     """
     context_string = ''
     if source_ids is None:
         source_ids = {}
     for source in sources:
+        source_obj = source.get('source', {}) or {}
         for doc, meta in zip(source.get('document', []), source.get('metadata', [])):
-            source_id = meta.get('source') or source.get('source', {}).get('id') or 'N/A'
+            meta = meta or {}
+            source_id = meta.get('source') or source_obj.get('id') or 'N/A'
             if source_id not in source_ids:
                 source_ids[source_id] = len(source_ids) + 1
-            src_name = source.get('source', {}).get('name')
-            src_type = source.get('source', {}).get('type')
-            src_rid = source.get('source', {}).get('id')
+            src_name = meta.get('name') or source_obj.get('name')
+            src_type = source_obj.get('type')
+            src_rid = source_obj.get('id')
+            src_url = meta.get('url') or (
+                source_id if isinstance(source_id, str) and source_id.startswith(('http://', 'https://')) else ''
+            )
             body = doc if include_content else ''
             extra_attrs = ''
             for key, value in filter_source_metadata(meta).items():
@@ -960,9 +1021,10 @@ def get_source_context(sources: list, source_ids: dict = None, include_content: 
                 extra_attrs += f' {key}="{html.escape(str(value))}"'
             context_string += (
                 f'<source id="{source_ids[source_id]}"'
-                + (f' name="{src_name}"' if src_name else '')
-                + (f' resource-type="{src_type}"' if src_type else '')
-                + (f' resource-id="{src_rid}"' if src_rid else '')
+                + (f' name="{escape(str(src_name), quote=True)}"' if src_name else '')
+                + (f' url="{escape(str(src_url), quote=True)}"' if src_url else '')
+                + (f' resource-type="{escape(str(src_type), quote=True)}"' if src_type else '')
+                + (f' resource-id="{escape(str(src_rid), quote=True)}"' if src_rid else '')
                 + extra_attrs
                 + f'>{body}</source>\n'
             )
@@ -975,6 +1037,8 @@ async def apply_source_context_to_messages(
     sources: list,
     user_message: str,
     include_content: bool = True,
+    metadata: dict | None = None,
+    event_emitter=None,
 ) -> list:
     """
     Build source context from citation sources and apply to messages.
@@ -993,18 +1057,34 @@ async def apply_source_context_to_messages(
     if not context:
         return messages
 
-    if RAG_SYSTEM_CONTEXT:
-        return add_or_update_system_message(
-            await rag_template(await Config.get('rag.template'), context, user_message),
-            messages,
-            append=True,
-        )
-    else:
-        return add_or_update_user_message(
-            await rag_template(await Config.get('rag.template'), context, user_message),
-            messages,
-            append=False,
-        )
+    # Retrieval is per-turn data: it is delivered as a frozen tail injection
+    # (never a rewrite of the system prompt), so the cached prefix stays stable
+    # regardless of ``RAG_SYSTEM_CONTEXT`` (#30239, Phase 3).
+    rendered = await rag_template(await Config.get('rag.template'), context, user_message)
+    chat_id = (metadata or {}).get('chat_id')
+    anchor = (metadata or {}).get('user_message_id')
+    # Freeze the rendered retrieval context against the user turn it augments so
+    # later turns replay it byte-identically instead of dropping it (the request
+    # prefix would otherwise diverge inside u_N). See #30239.
+    if is_saved_chat_id(chat_id) and anchor:
+        # Compare mode runs one request per branch; only the primary branch
+        # owns the ledger so branches do not race the same meta key with
+        # different retrieval results.
+        owns_ledger = not metadata.get('compare_mode') or metadata.get('is_primary_branch')
+        if owns_ledger:
+            try:
+                _, recorded = await record_rag_injection(chat_id, anchor=anchor, text=rendered)
+            except Exception:
+                log.exception('Failed to record RAG injection; context will not replay')
+            else:
+                if not recorded:
+                    # Replay already restored this anchor's frozen block.
+                    return messages
+                # A fresh retrieval block was frozen onto this turn: surface it.
+                await emit_injection_status(event_emitter, STATUS_KNOWLEDGE_RETRIEVED, len(sources))
+    # Anchor-authoritative placement: a guided-regeneration turn (no id) must not
+    # receive a block the ledger records against u_N.
+    return attach_injection(messages, anchor, rendered, position='prepend')
 
 
 BASE64_IMAGE_DATA_URI_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}', re.IGNORECASE)
@@ -2040,7 +2120,30 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
             system_message_content = f'<context>Image generation was attempted but failed because of an error. The system is currently unable to generate the image. Tell the user that the following error occurred: {error_message}</context>'
 
     if system_message_content:
-        form_data['messages'] = add_or_update_system_message(system_message_content, form_data['messages'])
+        # Per-turn outcome (created / failed / disabled): it must travel at the
+        # bottom, not into the frozen system prompt, or a later turn replays this
+        # turn's verdict. Freeze it on the user turn so replay is byte-stable
+        # (#30239, Phase 3). Unsaved and channel chats have no ledger surface and
+        # keep the legacy system-message behavior.
+        anchor = metadata.get('user_message_id')
+        chat_id = metadata.get('chat_id')
+        if is_saved_chat_id(chat_id) and anchor:
+            try:
+                await record_message_injection(
+                    chat_id,
+                    anchor=anchor,
+                    text=system_message_content,
+                    position='append',
+                    source='image_generation',
+                    replace=True,
+                )
+            except Exception:
+                log.exception('Failed to record image-generation context; it will not replay')
+            form_data['messages'] = attach_injection(
+                form_data['messages'], anchor, system_message_content, position='append'
+            )
+        else:
+            form_data['messages'] = add_or_update_system_message(system_message_content, form_data['messages'])
 
     return form_data
 
@@ -2217,7 +2320,17 @@ async def convert_url_images_to_base64(form_data, user=None):
     return form_data
 
 
-MESSAGE_REPLAY_KEYS = ('id', 'role', 'content', 'output', 'files', 'contextSummary', 'usage', 'model')
+MESSAGE_REPLAY_KEYS = (
+    'id',
+    'role',
+    'content',
+    'output',
+    'files',
+    'contextSummary',
+    'context_summary',
+    'usage',
+    'model',
+)
 
 
 async def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]:
@@ -2240,6 +2353,20 @@ async def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[
             msg.get('role') == 'assistant' and msg.get('error') and not msg.get('content') and not msg.get('output')
         )
     ]
+
+
+async def apply_chat_injection_ledger(chat_id: str, messages: list[dict]) -> None:
+    """Replay frozen memory/RAG injections onto rehydrated history (#30239).
+
+    The stored chat has no injection text — it is re-applied here from the
+    ``chat.meta`` ledger at the same chronological position it first occupied,
+    so the request prefix stays byte-identical across turns.
+    """
+    from open_webui.utils.chat_injections import apply_chat_injections, load_chat_meta
+
+    if not messages:
+        return
+    apply_chat_injections(messages, await load_chat_meta(chat_id))
 
 
 def get_reasoning_format(model: dict) -> str | None:
@@ -2387,6 +2514,20 @@ async def connect_mcp_server(
     return client, tool_specs
 
 
+def compaction_models(request) -> dict:
+    """Model registry for compaction, including a direct-connection model.
+
+    The direct path keeps its model in ``request.state`` rather than the app
+    registry, so the summarizer can still resolve it.
+    """
+    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
+        return {
+            **dict(request.app.state.MODELS.items()),
+            request.state.model['id']: request.state.model,
+        }
+    return request.app.state.MODELS
+
+
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
@@ -2434,6 +2575,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Guided regeneration: extract before it reaches the LLM provider
     regeneration_prompt = form_data.pop('regeneration_prompt', None)
 
+    # Raw chat-level system prompt, frozen into the baseline inputs hash (#30239).
+    _initial_system_message = get_system_message(form_data.get('messages', []))
+    chat_system_prompt = get_content_from_message(_initial_system_message) if _initial_system_message else ''
+    folder_system_prompt = None
+    # Raw signature of content inlined into the top whose *source* text is not
+    # otherwise hashed (skill bodies, terminal/tool-server prompts). Feeds
+    # ``compute_inputs_hash`` so editing a skill body or a server prompt
+    # re-baselines instead of being silently suppressed by the freeze (#30239).
+    system_injection_signature: list[str] = []
+    # Attached-knowledge items that reach the top as ``<attached_knowledge>``;
+    # populated when builtin tools are in play, read into the inputs hash below.
+    attached_knowledge: list[dict] = []
+
     # Load messages from DB when available — DB preserves structured 'output' items
     # which the frontend strips, causing tool calls to be merged into content.
     chat_id = metadata.get('chat_id')
@@ -2452,6 +2606,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
             system_message = get_system_message(form_data.get('messages', []))
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
+
+            # Replay frozen tail injections (#30239) before anything converts
+            # content to multimodal blocks: an earlier turn's memory/RAG block is
+            # restored at its original position so the request prefix is byte-
+            # stable across turns. Replay is idempotent, so a retried turn that
+            # already has a ledger entry is not doubled.
+            try:
+                await apply_chat_injection_ledger(chat_id, form_data['messages'])
+            except Exception:
+                log.exception('Failed to replay chat injections; continuing with raw history')
 
             # Inject image files into content as image_url parts (mirrors frontend logic)
             for message in form_data['messages']:
@@ -2480,34 +2644,40 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
 
-    if is_saved_chat_id(chat_id) and user_message_id:
-        if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-            compaction_models = {
-                **dict(request.app.state.MODELS.items()),
-                request.state.model['id']: request.state.model,
-            }
-        else:
-            compaction_models = request.app.state.MODELS
+    # Compare mode runs one request per branch; only the primary branch owns the
+    # shared compaction checkpoint so branches cannot race the same boundary
+    # message. Temporary chats never auto-compact: they have no persistence
+    # surface for the checkpoint (``is_saved_chat_id`` gates below), and this
+    # rewrite deliberately keeps that behavior.
+    owns_ledger = not metadata.get('compare_mode') or metadata.get('is_primary_branch')
+    if is_saved_chat_id(chat_id) and user_message_id and owns_ledger:
+        models_for_compaction = compaction_models(request)
 
         system_message = get_system_message(form_data.get('messages', []))
         system_prompt = get_content_from_message(system_message) if system_message else ''
 
+        # Keep the unprojected history (with message ids) for reactive overflow
+        # recovery: by the time a provider error surfaces, the payload has been
+        # through ``process_messages_with_output`` (which strips ids). Recovery
+        # re-compacts from this source so the durable checkpoint lands on the
+        # correct boundary message.
+        request.state.context_compaction_source_messages = list(form_data.get('messages', []))
+
         try:
-            form_data['messages'], context_summary, _ = await compact_messages_for_request(
+            form_data['messages'], checkpoint = await compact_messages_for_request(
                 request,
                 user,
                 form_data.get('messages', []),
                 metadata,
                 form_data.get('model'),
-                compaction_models,
+                models_for_compaction,
                 system_prompt,
             )
-            if context_summary:
-                form_data['messages'] = add_or_update_system_message(
-                    f'[CONVERSATION SUMMARY]\n{context_summary}',
-                    form_data['messages'],
-                    append=True,
-                )
+            if checkpoint:
+                # Replaces the old ``[CONVERSATION SUMMARY]`` system-message
+                # injection: a transient user-role checkpoint is framed as
+                # historical context and never enters the frozen system top.
+                form_data['messages'] = insert_checkpoint_message(form_data['messages'], checkpoint)
         except Exception:
             log.exception('Context compaction failed; continuing with full chat history')
 
@@ -2588,6 +2758,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
         if folder and folder.data:
             if 'system_prompt' in folder.data:
+                folder_system_prompt = folder.data['system_prompt']
                 form_data = await apply_system_prompt_to_body(folder.data['system_prompt'], form_data, metadata, user)
             if 'files' in folder.data:
                 if metadata.get('params', {}).get('function_calling') == 'legacy':
@@ -2670,6 +2841,37 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     features = form_data.pop('features', None) or {}
     extra_params['__features__'] = features
+
+    # P0-1: compute the memory-injection gate once. It is the same gate
+    # ``add_memory_context`` runs under (feature + config + permission + model
+    # capability), so the memory preamble can be assembled in the frozen top only
+    # when memory is actually in play — a memory-off chat's prompt contains no
+    # ``<memory_context>`` vocabulary at all.
+    memory_context_enabled = False
+    if 'memory' in features and features['memory'] and model_allows_memory(model):
+        if await Config.get('memories.enable') and await Config.get('memories.system_context.enable'):
+            # features is client-supplied; re-check the permission the native FC path enforces.
+            if getattr(user, 'role', None) == 'admin' or await has_permission(
+                getattr(user, 'id', ''),
+                'features.memories',
+                await Config.get('user.permissions'),
+            ):
+                memory_context_enabled = True
+
+    # P0-1: identity always leads the frozen top (``append=False`` before any
+    # other injector); the memory preamble trails it only under the gate above,
+    # and before ``add_memory_context`` appends the ``<memory_context>`` base.
+    # Both fragments fold into the injection signature so toggling memory (or
+    # editing a constant) re-baselines as a user action. Internal task/sub-agent
+    # requests carry their own system prompt and never freeze, so they are
+    # excluded (the same guard `apply_system_baseline` uses).
+    if not metadata.get('internal'):
+        form_data['messages'], frozen_top_signature = assemble_frozen_top_content(
+            form_data['messages'],
+            memory_enabled=memory_context_enabled,
+        )
+        system_injection_signature.extend(frozen_top_signature)
+
     if features:
         if 'voice' in features and features['voice']:
             if await Config.get('task.voice.prompt.enable'):
@@ -2677,24 +2879,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 if not template:
                     template = DEFAULT_VOICE_MODE_PROMPT_TEMPLATE
 
+                system_injection_signature.append(f'voice:{template}')
                 form_data['messages'] = add_or_update_system_message(
                     template,
                     form_data['messages'],
                 )
 
-        if (
-            'memory' in features
-            and features['memory']
-            and await Config.get('memories.enable')
-            and await Config.get('memories.system_context.enable')
-        ):
-            # features is client-supplied; re-check the permission the native FC path enforces.
-            if getattr(user, 'role', None) == 'admin' or await has_permission(
-                getattr(user, 'id', ''),
-                'features.memories',
-                await Config.get('user.permissions'),
-            ):
-                form_data = await add_memory_context(request, form_data, user, model)
+        if memory_context_enabled:
+            form_data = await add_memory_context(
+                request, form_data, user, model, metadata, event_emitter=event_emitter
+            )
 
         if 'web_search' in features and features['web_search'] and await Config.get('web.search.enable'):
             # features is client-supplied; re-check the permission the native FC path enforces.
@@ -2730,6 +2924,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 # Append filesystem awareness only for pyodide engine
                 if engine != 'jupyter':
                     prompt += CODE_INTERPRETER_PYODIDE_PROMPT
+                    if ENABLE_PYODIDE_FILE_PERSISTENCE:
+                        prompt += CODE_INTERPRETER_PYODIDE_PERSISTENCE_PROMPT
 
                 form_data['messages'] = add_or_update_user_message(
                     prompt,
@@ -2743,8 +2939,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 # providers with prefix caching don't re-bill the full
                 # conversation on every turn.
                 if engine != 'jupyter':
+                    pyodide_prompt = CODE_INTERPRETER_PYODIDE_PROMPT
+                    if ENABLE_PYODIDE_FILE_PERSISTENCE:
+                        pyodide_prompt += CODE_INTERPRETER_PYODIDE_PERSISTENCE_PROMPT
+                    system_injection_signature.append(f'pyodide:{pyodide_prompt}')
                     form_data['messages'] = add_or_update_system_message(
-                        CODE_INTERPRETER_PYODIDE_PROMPT,
+                        pyodide_prompt,
                         form_data['messages'],
                         append=True,
                     )
@@ -2840,6 +3040,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         skill_manifest = ''
         for skill in available_skills:
             if skill.id in mentioned_skill_ids or not use_builtin_tools:
+                system_injection_signature.append(f'skill:{skill.id}:{skill.content}')
                 form_data['messages'] = add_or_update_system_message(
                     f'<skill name="{skill.name}">\n{skill.content}\n</skill>',
                     form_data['messages'],
@@ -2879,6 +3080,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     terminal_skill_map = {skill['id']: skill for skill in listed_terminal_skills}
                     terminal_skills = [skill for sid in terminal_skill_ids if (skill := terminal_skill_map.get(sid))]
 
+                # The terminal server controls its list order; sort so the manifest
+                # and the freeze signature stay deterministic across turns (an
+                # unstable order would re-baseline the top every request).
+                terminal_skills = sorted(
+                    (skill for skill in terminal_skills if isinstance(skill, dict) and skill.get('id')),
+                    key=lambda skill: str(skill['id']),
+                )
+
                 for skill in terminal_skills:
                     sid = skill['id']
                     if sid in mentioned_skill_ids or not use_builtin_tools:
@@ -2887,8 +3096,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                             request, user.model_dump(), metadata, skill_name, extra_params
                         )
                         if loaded:
+                            terminal_skill_context = format_terminal_skill_context(loaded)
+                            system_injection_signature.append(f'terminal_skill:{sid}:{terminal_skill_context}')
                             form_data['messages'] = add_or_update_system_message(
-                                format_terminal_skill_context(loaded),
+                                terminal_skill_context,
                                 form_data['messages'],
                                 append=True,
                             )
@@ -2897,6 +3108,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         skill_manifest += format_terminal_skill_manifest_entry(skill)
 
         if skill_manifest:
+            system_injection_signature.append(f'available_skills:{skill_manifest}')
             form_data['messages'] = add_or_update_system_message(
                 f'<available_skills>\n{skill_manifest}</available_skills>',
                 form_data['messages'],
@@ -3052,6 +3264,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 if terminal_tools:
                     tools_dict = {**tools_dict, **terminal_tools}
                 if system_prompt:
+                    system_injection_signature.append(f'terminal_prompt:{terminal_id}:{system_prompt}')
                     form_data['messages'] = add_or_update_system_message(
                         system_prompt,
                         form_data['messages'],
@@ -3067,6 +3280,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     continue
                 system_prompt = tool_server.pop('system_prompt', None)
                 if system_prompt:
+                    system_injection_signature.append(
+                        f'tool_server_prompt:{tool_server.get("id") or tool_server.get("url") or ""}:{system_prompt}'
+                    )
                     form_data['messages'] = add_or_update_system_message(
                         system_prompt,
                         form_data['messages'],
@@ -3103,8 +3319,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             if (model.get('info', {}).get('meta', {}).get('builtinTools') or {}).get('knowledge', True):
                 from html import escape
 
+                attached_knowledge = get_attached_knowledge(model, metadata)
                 knowledge_tags = []
-                for item in get_attached_knowledge(model, metadata):
+                for item in attached_knowledge:
                     if not item.get('id') or not item.get('type'):
                         continue
                     attrs = f'type="{escape(str(item["type"]), quote=True)}" id="{escape(str(item["id"]), quote=True)}"'
@@ -3232,7 +3449,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     # If context is not empty, insert it into the messages
     if sources and prompt:
-        form_data['messages'] = await apply_source_context_to_messages(request, form_data['messages'], sources, prompt)
+        form_data['messages'] = await apply_source_context_to_messages(
+            request, form_data['messages'], sources, prompt, metadata=metadata, event_emitter=event_emitter
+        )
 
     # If there are citations, add them to the data_items
     sources = [
@@ -3272,7 +3491,160 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     form_data = normalize_messages_for_model(form_data)
 
+    # Freeze the merged system message once per chat and replay its bytes on later
+    # turns (#30239). Runs last so every injector and request filter is already in
+    # the top; the inputs hash covers the raw user-controlled sources, so a real
+    # edit re-baselines while date/memory/retrieval drift is suppressed.
+    try:
+        baseline_inputs_hash = compute_inputs_hash(
+            model_id=form_data.get('model'),
+            model_system=model_system_prompt,
+            chat_system=chat_system_prompt,
+            folder_system=folder_system_prompt,
+            features=metadata.get('features'),
+            tool_ids=metadata.get('tool_ids'),
+            skill_ids=metadata.get('skill_ids'),
+            terminal_id=metadata.get('terminal_id'),
+            tool_servers=metadata.get('tool_servers'),
+            direct=bool(metadata.get('direct')),
+            use_builtin_tools=bool(use_builtin_tools),
+            is_note_chat=bool(is_note_chat),
+            function_calling=metadata.get('params', {}).get('function_calling'),
+            attached_knowledge=attached_knowledge,
+            system_injection_signature='\n'.join(system_injection_signature),
+        )
+        frozen_system = await apply_system_baseline(
+            chat_id,
+            form_data.get('messages', []),
+            metadata,
+            inputs_hash=baseline_inputs_hash,
+        )
+        metadata['system_baseline_inputs_hash'] = baseline_inputs_hash
+        if frozen_system is not None:
+            # Capture-surface invariant (P3): metadata['system_prompt'] is the
+            # FROZEN baseline with the model-configured prompt prepended, and it
+            # deliberately excludes the per-request date line appended below.
+            # `metadata` is carried into persisted chat state, and per-request
+            # data must never be persisted (see append_current_date_line); the
+            # date exists only on the outgoing message. A capture of
+            # metadata['system_prompt'] (e.g. temp_system_prompt_record.txt) is
+            # therefore a strict prefix of the system bytes a provider receives:
+            # the provider payload is this text followed by `Current date: …`.
+            # Do not "fix" the divergence by appending the date here.
+            metadata['system_prompt'] = (
+                f'{resolved_model_system_prompt}\n{frozen_system}' if resolved_model_system_prompt else frozen_system
+            ) or None
+    except Exception:
+        log.exception('Failed to apply the system-prompt baseline; continuing with the live render')
+
+    # P0-2: the current date is per-request, so it is appended *after* the frozen
+    # bytes are replayed and is never persisted into chat.meta['system_baseline'],
+    # metadata['system_prompt'] (the capture surface), or any stored message.
+    # Because it is last, the static prefix up to it still hits the provider
+    # cache. A user-written {{CURRENT_DATE}} in their own prompt remains frozen
+    # per chat; this always-on line supersedes it.
+    try:
+        form_data['messages'] = append_current_date_line(
+            form_data.get('messages', []),
+            user=user,
+            metadata=metadata,
+        )
+    except Exception:
+        log.debug('Failed to append the current date line; continuing without it', exc_info=True)
+
     return form_data, metadata, events
+
+
+def is_error_response(response) -> bool:
+    """True for a provider error returned as a response object (not raised)."""
+    return isinstance(response, JSONResponse) and response.status_code >= 400
+
+
+async def recover_from_context_overflow(request, form_data, user, model, metadata, error) -> bool:
+    """Force one lower-budget compaction and rewrite ``form_data`` for a retry.
+
+    Returns True only when a new checkpoint was produced and the payload is ready
+    to resend. Gate order matters: an overflow that follows a normal preflight
+    compaction is not recoverable (that compaction already ran for this step), and
+    the per-request ``context_overflow_recovery_attempted`` flag keeps recovery to
+    at most once per logical step even if the retry overflows again.
+    """
+    if not is_context_overflow_error(error):
+        return False
+    if getattr(request.state, 'context_compaction_ran', False):
+        return False
+    if getattr(request.state, 'context_overflow_recovery_attempted', False):
+        return False
+
+    chat_id = metadata.get('chat_id')
+    if not is_saved_chat_id(chat_id) or not metadata.get('user_message_id'):
+        return False
+    # Compare mode: only the primary branch owns the shared compaction checkpoint
+    # (same ``owns_ledger`` gate as the auto path). A non-primary branch compacting
+    # here would race the primary on the boundary message and diverge the branches.
+    if metadata.get('compare_mode') and not metadata.get('is_primary_branch'):
+        return False
+    request.state.context_overflow_recovery_attempted = True
+
+    system_message = get_system_message(form_data.get('messages', []))
+    system_prompt = get_content_from_message(system_message) if system_message else ''
+    # Prefer the unprojected history captured during payload assembly so the
+    # checkpoint is written to the real boundary message (post-processing strips
+    # message ids). Pair it with the live system top, which carries the
+    # per-request date line and resolved prompt variables.
+    source_messages = getattr(request.state, 'context_compaction_source_messages', None)
+    if source_messages:
+        history = [message for message in source_messages if message.get('role') != 'system']
+        source_messages = [system_message, *history] if system_message else history
+    else:
+        source_messages = form_data.get('messages', [])
+    try:
+        projected, checkpoint = await compact_for_overflow(
+            request,
+            user,
+            source_messages,
+            metadata,
+            form_data.get('model'),
+            compaction_models(request),
+            system_prompt,
+        )
+    except Exception:
+        log.exception('Reactive context-overflow compaction failed; surfacing the provider error')
+        return False
+
+    if not checkpoint:
+        return False
+
+    form_data['messages'] = insert_checkpoint_message(projected, checkpoint)
+    form_data['messages'] = process_messages_with_output(
+        form_data['messages'], reasoning_format=get_reasoning_format(model)
+    )
+    form_data['messages'] = sanitize_tool_pairs(form_data['messages'])
+    log.info('Recovered from context overflow for chat=%s; retrying with a lower keep budget', chat_id)
+    return True
+
+
+async def run_with_overflow_recovery(request, form_data, user, model, metadata, completion_call):
+    """Run one provider completion, recovering once from a context overflow.
+
+    ``completion_call`` is a zero-argument awaitable returning the provider
+    response (or raising). On an overflow, ``recover_from_context_overflow``
+    rewrites ``form_data`` in place and the completion is retried exactly once.
+    Any other error — or a second overflow — propagates so the original failure
+    is never masked.
+    """
+    try:
+        response = await completion_call()
+    except Exception as error:
+        if not await recover_from_context_overflow(request, form_data, user, model, metadata, error):
+            raise
+        return await completion_call()
+
+    if is_error_response(response) and await recover_from_context_overflow(
+        request, form_data, user, model, metadata, response
+    ):
+        return await completion_call()
+    return response
 
 
 async def get_event_emitter_and_caller(metadata):
@@ -3561,6 +3933,9 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
             assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, message_id)
             if assistant_message:
                 db_messages.append({k: v for k, v in assistant_message.items() if k in MESSAGE_REPLAY_KEYS})
+            # Rebuild must replay the frozen tail ledger too, or every memory/RAG
+            # block vanishes from the request that follows an approved tool call.
+            await apply_chat_injection_ledger(chat_id, db_messages)
             for message in db_messages:
                 output = message.get('output')
                 # reasoning_details can be model/provider-bound, so only replay them
@@ -3605,6 +3980,33 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
 
         if not paused:
             normalize_messages_for_model(form_data)
+            # Same reason as the ledger replay above: the rebuilt payload has no
+            # system message, so re-insert the frozen baseline or the top vanishes
+            # (and diverges from the turn that had it) after an approved tool call.
+            # Applied after filters, like process_chat_payload. metadata['system_prompt']
+            # already holds model-default + frozen bytes, so it needs no resync here.
+            baseline_inputs_hash = metadata.get('system_baseline_inputs_hash')
+            if baseline_inputs_hash:
+                try:
+                    await apply_system_baseline(
+                        chat_id,
+                        form_data['messages'],
+                        metadata,
+                        inputs_hash=baseline_inputs_hash,
+                    )
+                except Exception:
+                    log.exception('Failed to re-apply the system-prompt baseline after tool approval')
+
+            # P0-2: the rebuilt payload lost the per-request date line; re-append
+            # it after the frozen bytes, still never persisted (see process_chat_payload).
+            try:
+                form_data['messages'] = append_current_date_line(
+                    form_data['messages'],
+                    user=user,
+                    metadata=metadata,
+                )
+            except Exception:
+                log.debug('Failed to re-append the current date line', exc_info=True)
 
         return paused
 
@@ -3650,6 +4052,11 @@ async def pause_for_tool_approval(chat_id: str, message_id: str, output: list[di
                 'variables': metadata.get('variables') or {},
                 'files': metadata.get('files') or [],
                 'params': metadata.get('params') or {},
+                # Compare-mode context must survive the approval pause/resume
+                # round-trip, otherwise a resumed branch would re-enable the
+                # memory writers it shares with its siblings (#30238).
+                'compare_mode': metadata.get('compare_mode') or False,
+                'is_primary_branch': metadata.get('is_primary_branch') or False,
             },
         },
         touch=False,
@@ -3705,7 +4112,7 @@ def build_response_object(response, response_data):
     return response
 
 
-def update_assistant_message_from_stream(assistant_message, raw):
+def update_assistant_message_from_stream(assistant_message, raw, model: str = ''):
     line = raw.decode('utf-8', 'replace') if isinstance(raw, bytes) else raw
     if not isinstance(line, str):
         return
@@ -3735,12 +4142,14 @@ def update_assistant_message_from_stream(assistant_message, raw):
             if output:
                 assistant_message['output'] = output
             if meta and meta.get('usage'):
+                log_cache_usage(meta.get('usage'), source='stream.outlet', model=model)
                 assistant_message['usage'] = merge_usage(assistant_message.get('usage'), meta['usage'])
             continue
 
         raw_usage = data.get('usage', {}) or {}
         raw_usage.update(data.get('timings', {}))
         if raw_usage:
+            log_cache_usage(raw_usage, source='stream.outlet', model=model)
             assistant_message['usage'] = merge_usage(assistant_message.get('usage'), raw_usage)
 
         for choice in data.get('choices', []):
@@ -4226,6 +4635,13 @@ async def non_streaming_chat_response_handler(response, ctx):
     save_to_chat = is_saved_chat_id(chat_id)
     continuing = bool(metadata.get('assistant_message_id'))
 
+    model = ctx.get('model')
+    model_id = model.get('id', '') if isinstance(model, dict) else str(model or '')
+
+    # Log once per provider response, before the persistence/outlet branches
+    # below: a response without an event emitter still reports usage.
+    log_cache_usage(response_data.get('usage'), source='non_streaming', model=model_id)
+
     if event_emitter:
         try:
             if 'error' in response_data:
@@ -4436,6 +4852,7 @@ async def streaming_chat_response_handler(response, ctx):
 
     user = ctx['user']
     model = ctx['model']
+    model_id = model.get('id', '') if isinstance(model, dict) else str(model or '')
 
     metadata = ctx['metadata']
     events = ctx['events']
@@ -5186,6 +5603,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
+                                            log_cache_usage(response_metadata.get('usage'), source='stream.responses', model=model_id)
                                             usage = merge_usage(usage, response_metadata['usage'])
                                             response_metadata['usage'] = usage
 
@@ -5214,6 +5632,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     raw_usage = data.get('usage', {}) or {}
                                     raw_usage.update(data.get('timings', {}))  # llama.cpp
                                     if raw_usage:
+                                        log_cache_usage(raw_usage, source='stream.chat', model=model_id)
                                         usage = merge_usage(usage, raw_usage)
                                         await event_emitter(
                                             {
@@ -5836,6 +6255,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
                 tool_call_sources = []  # Track citation sources from tool results
                 all_tool_call_sources = []  # Accumulated sources across all iterations
+                rag_injection_announced = False  # One injection-visibility status per turn
                 user_message = get_last_user_message(form_data['messages'])
 
                 # Check if citations are enabled for this model
@@ -5994,6 +6414,17 @@ async def streaming_chat_response_handler(response, ctx):
                         if params is None:
                             return {}, None, None, None, False
                         tool = tools.get(name)
+                        # `delegate_task` / `task` are resolvable aliases of `subagent`
+                        # so persisted chats and models continuing them keep working.
+                        if not tool and name in SUBAGENT_TOOL_NAMES and name != SUBAGENT_CANONICAL_NAME:
+                            tool = tools.get(SUBAGENT_CANONICAL_NAME)
+                            # The legacy schema called the work `task`; the canonical
+                            # schema splits it into `description`/`prompt`. Translate so
+                            # replayed old calls still execute instead of dropping args.
+                            if tool and 'task' in params and 'prompt' not in params:
+                                legacy_task = params.pop('task')
+                                params.setdefault('description', legacy_task)
+                                params['prompt'] = legacy_task
                         if not tool:
                             return params, f'Error: Tool "{name}" not found.', None, None, False
                         spec = tool.get('spec', {})
@@ -6028,19 +6459,53 @@ async def streaming_chat_response_handler(response, ctx):
                             result = {'error': str(e)}
                         return params, result, tool, tool_type, direct_tool
 
+                    # Sub-agent calls (canonical name plus legacy aliases) run in
+                    # parallel. A single turn may not continue the same sub-agent
+                    # session twice: two concurrent continuations would race on the
+                    # child chat's history.
+                    seen_subagent_sessions: set[str] = set()
+
+                    async def execute_subagent_call(tool_call):
+                        try:
+                            params = parse_tool_params(tool_call)
+                        except ValueError:
+                            return await execute_tool_call(tool_call)
+                        if isinstance(params, dict):
+                            session_id = params.get('sessionID')
+                            if isinstance(session_id, str) and session_id:
+                                if session_id in seen_subagent_sessions:
+                                    return (
+                                        params,
+                                        f'Error: sessionID "{session_id}" was passed more than once '
+                                        'in one tool batch; each sub-agent session may be continued '
+                                        'once per turn.',
+                                        None,
+                                        None,
+                                        False,
+                                    )
+                                seen_subagent_sessions.add(session_id)
+                        return await execute_tool_call(tool_call)
+
+                    # `subagent` is always parallel; alias names are parallel only
+                    # when they resolve to it and are not shadowed by a real tool.
+                    active_subagent_names = {
+                        name
+                        for name in SUBAGENT_TOOL_NAMES
+                        if name == SUBAGENT_CANONICAL_NAME or tools.get(name) is None
+                    }
                     delegate_calls = [
                         tool_call
                         for tool_call in response_tool_calls
-                        if tool_call.get('function', {}).get('name') == 'delegate_task'
+                        if tool_call.get('function', {}).get('name') in active_subagent_names
                     ]
                     tool_results = {}
                     for tool_call in response_tool_calls:
-                        if tool_call.get('function', {}).get('name') != 'delegate_task':
+                        if tool_call.get('function', {}).get('name') not in active_subagent_names:
                             tool_results[id(tool_call)] = await execute_tool_call(tool_call)
                     tool_results.update(
                         zip(
                             [id(tool_call) for tool_call in delegate_calls],
-                            await asyncio.gather(*(execute_tool_call(tool_call) for tool_call in delegate_calls)),
+                            await asyncio.gather(*(execute_subagent_call(tool_call) for tool_call in delegate_calls)),
                         )
                     )
 
@@ -6092,6 +6557,7 @@ async def streaming_chat_response_handler(response, ctx):
                             citations_enabled
                             and tool_function_name
                             in [
+                                'search_web',
                                 'fetch_url',
                                 'view_file',
                                 'view_knowledge_file',
@@ -6192,6 +6658,20 @@ async def streaming_chat_response_handler(response, ctx):
                             else:
                                 replace_system_message_content('', form_data['messages'])
 
+                            # P0-2: the restore above rewinds the system message to
+                            # metadata['system_prompt'] — the frozen bytes *without*
+                            # the per-request date line (appended after the freeze).
+                            # Re-append it so continuation calls in this run keep the
+                            # date; still never persisted (see process_chat_payload).
+                            try:
+                                form_data['messages'] = append_current_date_line(
+                                    form_data['messages'],
+                                    user=user,
+                                    metadata=metadata,
+                                )
+                            except Exception:
+                                log.debug('Failed to re-append the current date line', exc_info=True)
+
                             # Build context: file sources with content,
                             # tool sources as citation markers only.
                             source_ids = {}
@@ -6209,17 +6689,38 @@ async def streaming_chat_response_handler(response, ctx):
                                     source_context,
                                     user_message,
                                 )
-                                if RAG_SYSTEM_CONTEXT:
-                                    form_data['messages'] = add_or_update_system_message(
-                                        rag_content,
-                                        form_data['messages'],
-                                        append=True,
+                                # Same frozen-tail rule as apply_source_context_to_messages:
+                                # retrieval never rewrites the system prompt (#30239).
+                                # The user turn was just reset to the raw prompt and is
+                                # re-spliced with a combined file+tool block, so the
+                                # ledger follows the final block (replace=True) — replay
+                                # then matches this turn's last request, not a stale
+                                # file-only block.
+                                rag_anchor = metadata.get('user_message_id')
+                                rag_chat_id = metadata.get('chat_id')
+                                if is_saved_chat_id(rag_chat_id) and rag_anchor:
+                                    owns_ledger = not metadata.get('compare_mode') or metadata.get(
+                                        'is_primary_branch'
                                     )
-                                else:
-                                    form_data['messages'] = add_or_update_user_message(
-                                        rag_content,
-                                        form_data['messages'],
-                                        append=False,
+                                    if owns_ledger:
+                                        try:
+                                            await record_rag_injection(
+                                                rag_chat_id,
+                                                anchor=rag_anchor,
+                                                text=rag_content,
+                                                replace=True,
+                                            )
+                                        except Exception:
+                                            log.exception('Failed to record RAG injection from tool sources')
+                                form_data['messages'] = attach_injection(
+                                    form_data['messages'], rag_anchor, rag_content, position='prepend'
+                                )
+                                if not rag_injection_announced:
+                                    rag_injection_announced = True
+                                    await emit_injection_status(
+                                        event_emitter,
+                                        STATUS_KNOWLEDGE_RETRIEVED,
+                                        len(metadata.get('sources') or []) + len(all_tool_call_sources),
                                     )
                         tool_call_sources.clear()
 
@@ -6699,7 +7200,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                     if data:
                         if has_api_outlet_filters:
-                            update_assistant_message_from_stream(assistant_message, data)
+                            update_assistant_message_from_stream(assistant_message, data, model=model_id)
                         yield data
 
                 if has_api_outlet_filters and assistant_message:
