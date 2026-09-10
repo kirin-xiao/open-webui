@@ -13,6 +13,7 @@ import sys
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 from typing import Any, Optional
 from urllib.parse import unquote
 from uuid import uuid4
@@ -409,7 +410,38 @@ def get_citation_source_from_tool_result(
         if isinstance(tool_result, dict) and 'error' in tool_result:
             return []
 
-        if tool_name in ('view_knowledge_file', 'view_file'):
+        if tool_name == 'search_web':
+            if not isinstance(tool_result, list):
+                return []
+
+            # Parse JSON array: [{"title": "...", "link": "...", "snippet": "..."}]
+            results = tool_result
+            documents = []
+            metadata = []
+
+            for result in results:
+                title = result.get('title', '')
+                link = result.get('link', '')
+                snippet = result.get('snippet', '')
+
+                documents.append(f'{title}\n{snippet}')
+                metadata.append(
+                    {
+                        'source': link,
+                        'name': title,
+                        'url': link,
+                    }
+                )
+
+            return [
+                {
+                    'source': {'name': 'search_web', 'id': 'search_web'},
+                    'document': documents,
+                    'metadata': metadata,
+                }
+            ]
+
+        elif tool_name in ('view_knowledge_file', 'view_file'):
             if not isinstance(tool_result, dict):
                 return []
 
@@ -916,24 +948,34 @@ def handle_responses_streaming_event(
 def get_source_context(sources: list, source_ids: dict = None, include_content: bool = True) -> str:
     """
     Build <source> tag context string from citation sources.
+
+    name/url are taken from the per-document metadata when available, so tool
+    results (e.g. search_web) render tags the model can map back to a specific
+    result. Attribute values are HTML-escaped.
     """
     context_string = ''
     if source_ids is None:
         source_ids = {}
     for source in sources:
+        source_obj = source.get('source', {}) or {}
         for doc, meta in zip(source.get('document', []), source.get('metadata', [])):
-            source_id = meta.get('source') or source.get('source', {}).get('id') or 'N/A'
+            meta = meta or {}
+            source_id = meta.get('source') or source_obj.get('id') or 'N/A'
             if source_id not in source_ids:
                 source_ids[source_id] = len(source_ids) + 1
-            src_name = source.get('source', {}).get('name')
-            src_type = source.get('source', {}).get('type')
-            src_rid = source.get('source', {}).get('id')
+            src_name = meta.get('name') or source_obj.get('name')
+            src_type = source_obj.get('type')
+            src_rid = source_obj.get('id')
+            src_url = meta.get('url') or (
+                source_id if isinstance(source_id, str) and source_id.startswith(('http://', 'https://')) else ''
+            )
             body = doc if include_content else ''
             context_string += (
                 f'<source id="{source_ids[source_id]}"'
-                + (f' name="{src_name}"' if src_name else '')
-                + (f' resource-type="{src_type}"' if src_type else '')
-                + (f' resource-id="{src_rid}"' if src_rid else '')
+                + (f' name="{escape(str(src_name), quote=True)}"' if src_name else '')
+                + (f' url="{escape(str(src_url), quote=True)}"' if src_url else '')
+                + (f' resource-type="{escape(str(src_type), quote=True)}"' if src_type else '')
+                + (f' resource-id="{escape(str(src_rid), quote=True)}"' if src_rid else '')
                 + f'>{body}</source>\n'
             )
     return context_string
@@ -5962,6 +6004,7 @@ async def streaming_chat_response_handler(response, ctx):
                             citations_enabled
                             and tool_function_name
                             in [
+                                'search_web',
                                 'fetch_url',
                                 'view_file',
                                 'view_knowledge_file',
