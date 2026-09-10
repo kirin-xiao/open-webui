@@ -22,7 +22,7 @@ def search_exa(
         query (str): The query to search for
         count (int): Number of results to return
         filter_list (list[str] | None): List of domains to filter results by
-        max_content_length (int | None): Maximum characters per result; None leaves text unlimited.
+        max_content_length (int | None): Safety cap on the highlights snippet; None leaves it uncapped.
     """
     log.info('Searching with Exa for query: %s', query)
 
@@ -32,7 +32,9 @@ def search_exa(
         'query': query,
         'numResults': count or 5,
         'includeDomains': filter_list,
-        'contents': {'text': {'maxCharacters': max_content_length} if max_content_length is not None else True},
+        # Use Exa's token-efficient highlights instead of the full page text,
+        # which can be hundreds of KB per result when the web loader is bypassed.
+        'contents': {'highlights': True},
         'type': 'auto',  # Use the auto search type (keyword or neural)
     }
 
@@ -41,13 +43,25 @@ def search_exa(
         response.raise_for_status()
         data = response.json()
 
+        def get_snippet(result: dict) -> str:
+            highlights = result.get('highlights') or []
+            if isinstance(highlights, list):
+                snippet = '\n'.join(str(h) for h in highlights).strip()
+            else:
+                snippet = str(highlights).strip()
+            if not snippet:
+                snippet = (result.get('text') or '').strip()
+            if max_content_length is not None:
+                snippet = snippet[:max_content_length]
+            return snippet
+
         results = data['results']
         log.info('Found %s results', len(results))
         return [
             SearchResult(
                 link=result['url'],
                 title=result['title'],
-                snippet=(result.get('text') or '')[:max_content_length],
+                snippet=get_snippet(result),
             )
             for result in results
         ]
