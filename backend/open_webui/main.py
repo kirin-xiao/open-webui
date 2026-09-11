@@ -309,6 +309,14 @@ class CORSStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
         response = await super().get_response(path, scope)
         response.headers['Access-Control-Allow-Origin'] = '*'
+        # Pyodide wheels are versioned by filename and never change in place, so
+        # they can be cached indefinitely. Core runtime files and the lockfile
+        # reuse stable names across builds, so revalidate them via ETag instead
+        # of letting a stale copy survive a Pyodide upgrade.
+        if path.endswith('.whl'):
+            response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        else:
+            response.headers['Cache-Control'] = 'no-cache'
         return response
 
 

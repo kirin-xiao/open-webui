@@ -219,6 +219,9 @@
 		}
 	};
 
+	const LOAD_TIMEOUT_MS = 300000;
+	const EXECUTION_TIMEOUT_MS = 60000;
+
 	const executePythonAsWorker = async (code) => {
 		// Packages are resolved by the worker from `pyodide-lock.json` via
 		// loadPackagesFromImports, so no hardcoded import->package list is needed.
@@ -234,28 +237,80 @@
 			localPyodideWorker = worker;
 		}
 
-		worker.postMessage({
-			id: id,
-			code: code
-		});
+		let settled = false;
+		let loadTimeoutId = null;
+		let executionTimeoutId = null;
 
-		const timeoutId = setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
-				if (!isShared) {
-					worker.terminate();
-					localPyodideWorker = null;
-				}
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			worker.removeEventListener('message', handler);
+			worker.removeEventListener('error', onError);
+
+			if (error) {
+				stderr = error;
 			}
-		}, 60000);
+
+			executing = false;
+		};
+
+		// A timed-out run cannot be interrupted in-process, so drop the worker.
+		// The persistent worker's IDBFS files survive because they live in
+		// IndexedDB; a fresh worker reloads them on the next run.
+		const terminateWorker = () => {
+			worker.terminate();
+			if (isShared) {
+				pyodideWorkerStore.set(null);
+			} else {
+				localPyodideWorker = null;
+			}
+		};
+
+		// Loading (Pyodide init + package downloads) gets its own generous budget
+		// so cold-cache installs are not misreported as an execution timeout. The
+		// execution limit is only started once user code actually begins to run.
+		const armLoadTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = null;
+			loadTimeoutId = setTimeout(() => {
+				finish('Package Loading Time Limit Exceeded');
+				terminateWorker();
+			}, LOAD_TIMEOUT_MS);
+		};
+
+		const armExecutionTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			loadTimeoutId = null;
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = setTimeout(() => {
+				finish('Execution Time Limit Exceeded');
+				terminateWorker();
+			}, EXECUTION_TIMEOUT_MS);
+		};
 
 		const handler = (event) => {
 			// Ignore messages from other requests on the shared worker
 			if (event.data?.id !== id) return;
 
-			console.log('pyodideWorker.onmessage', event);
 			const { id: _id, ...data } = event.data;
+
+			// Status/progress messages are not completion. `executing` starts the
+			// execution limit; `loading`/`packages` (e.g. an install-retry) fall
+			// back to the load budget.
+			if (data.type === 'status') {
+				if (data.phase === 'executing') {
+					armExecutionTimeout();
+				} else {
+					armLoadTimeout();
+				}
+				return;
+			}
+
+			console.log('pyodideWorker.onmessage', event);
 
 			console.log(_id, data);
 
@@ -320,22 +375,26 @@
 			data['stderr'] && (stderr = data['stderr']);
 			data['result'] && (result = data['result']);
 
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
+			finish();
 
 			// Signal PyodideFileNav to auto-refresh after execution
 			window.dispatchEvent(new Event('pyodide:files'));
 		};
 
-		worker.addEventListener('message', handler);
-
-		worker.onerror = (event) => {
+		const onError = (event) => {
 			console.log('pyodideWorker.onerror', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
+			finish();
 		};
+
+		worker.addEventListener('message', handler);
+		worker.addEventListener('error', onError);
+
+		worker.postMessage({
+			id: id,
+			code: code
+		});
+
+		armLoadTimeout();
 	};
 
 	let mermaid = null;

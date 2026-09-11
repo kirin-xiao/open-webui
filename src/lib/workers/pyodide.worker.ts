@@ -183,6 +183,18 @@ function appendOutput(current: string | null, line: string): string {
 	return current ? `${current}${line}\n` : `${line}\n`;
 }
 
+type ExecutionPhase = 'loading' | 'packages' | 'executing';
+
+/**
+ * Report which phase an execution request is in. The host separates Pyodide
+ * init / package downloads (`loading`, `packages`) from user-code execution
+ * (`executing`) so a slow cold-cache install is not killed by the execution
+ * timeout.
+ */
+function postStatus(id: string, phase: ExecutionPhase) {
+	self.postMessage({ id, type: 'status', phase });
+}
+
 /**
  * Load packages that the code needs. `loadPackagesFromImports` only sees static
  * imports, so we additionally feed it string-literal dynamic imports
@@ -219,7 +231,7 @@ async function loadPackagesForCode(code: string): Promise<string[]> {
  * to a known Pyodide package, install that package and retry once. Otherwise
  * surface a precise error instead of a bare ModuleNotFoundError.
  */
-async function runUserCode(code: string, loadErrors: string[]): Promise<unknown> {
+async function runUserCode(id: string, code: string, loadErrors: string[]): Promise<unknown> {
 	try {
 		return await self.pyodide.runPythonAsync(code);
 	} catch (error: unknown) {
@@ -239,12 +251,14 @@ async function runUserCode(code: string, loadErrors: string[]): Promise<unknown>
 		const pkgToInstall = lockPkg ?? missing;
 
 		try {
+			postStatus(id, 'packages');
 			const micropip = self.pyodide.pyimport('micropip');
 			await micropip.install(pkgToInstall);
 			self.stdout = appendOutput(
 				self.stdout,
 				`[open-webui] installed missing package '${pkgToInstall}' for module '${missing}' and retrying`
 			);
+			postStatus(id, 'executing');
 			return await self.pyodide.runPythonAsync(code);
 		} catch (installError: unknown) {
 			const detail = installError instanceof Error ? installError.message : String(installError);
@@ -274,6 +288,7 @@ async function executeCode(
 	try {
 		// Auto-load imported packages (static imports plus string-literal
 		// dynamic imports). Load failures are collected, not thrown.
+		postStatus(id, 'loading');
 		const loadErrors = await loadPackagesForCode(code);
 
 		// check if matplotlib is imported in the code
@@ -310,7 +325,8 @@ matplotlib.pyplot.show = show`);
 			}
 		}
 
-		self.result = await runUserCode(code, loadErrors);
+		postStatus(id, 'executing');
+		self.result = await runUserCode(id, code, loadErrors);
 
 		// Safely process and recursively serialize the result
 		self.result = processResult(self.result);

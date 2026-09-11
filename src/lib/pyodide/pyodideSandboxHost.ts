@@ -180,7 +180,7 @@ ${packageHelperSource}
 		return loadErrors;
 	}
 
-	async function runUserCode(code, loadErrors) {
+	async function runUserCode(id, code, loadErrors) {
 		try {
 			return await pyodide.runPythonAsync(code);
 		} catch (error) {
@@ -193,6 +193,7 @@ ${packageHelperSource}
 			// else is a best-effort PyPI install by its import name.
 			const pkgToInstall = pkg || missing;
 			try {
+				post({ id: id, type: 'status', phase: 'packages' });
 				await pyodide.pyimport('micropip').install(pkgToInstall);
 				stdout =
 					(stdout ? stdout : '') +
@@ -201,6 +202,7 @@ ${packageHelperSource}
 					"' for module '" +
 					missing +
 					"' and retrying\n";
+				post({ id: id, type: 'status', phase: 'executing' });
 				return await pyodide.runPythonAsync(code);
 			} catch (installError) {
 				const detail =
@@ -227,13 +229,15 @@ ${packageHelperSource}
 		let result = null;
 		if (files && files.length > 0) upload(files);
 		try {
+			post({ id: id, type: 'status', phase: 'loading' });
 			const loadErrors = await loadPackagesForCode(code);
 			if (code.includes('matplotlib')) {
 				try {
 					await patchMatplotlib();
 				} catch (e) {}
 			}
-			result = clean(await runUserCode(code, loadErrors));
+			post({ id: id, type: 'status', phase: 'executing' });
+			result = clean(await runUserCode(id, code, loadErrors));
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
 		}

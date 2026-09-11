@@ -117,6 +117,7 @@
 
 			function handler(event: MessageEvent) {
 				if (event.data?.id !== id) return;
+				if (event.data?.type === 'status') return;
 				clearTimeout(timeout);
 				worker.removeEventListener('message', handler);
 				resolve(event.data);

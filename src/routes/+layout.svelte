@@ -291,12 +291,15 @@
 		return worker;
 	};
 
+	const LOAD_TIMEOUT_MS = 300000;
+	const EXECUTION_TIMEOUT_MS = 60000;
+
 	const executePythonAsWorker = async (id, code, cb, files = []) => {
 		let result = null;
 		let stdout = null;
 		let stderr = null;
 
-		let executing = true;
+		let settled = false;
 
 		const worker = getOrCreateWorker();
 
@@ -319,39 +322,67 @@
 			}
 		}
 
-		worker.postMessage({
-			type: 'execute',
-			id: id,
-			code: code,
-			files: filePayloads.length > 0 ? filePayloads : undefined
-		});
+		let loadTimeoutId = null;
+		let executionTimeoutId = null;
 
-		// Timeout for this specific execution (not the worker itself)
-		let timeoutId = setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
+		const buildPayload = () =>
+			JSON.parse(
+				JSON.stringify(
+					{
+						stdout: stdout,
+						stderr: stderr,
+						result: result
+					},
+					(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
+				)
+			);
+
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			worker.removeEventListener('message', onMessage);
+			worker.removeEventListener('error', onError);
+
+			if (error) {
+				stderr = error;
+			}
+
+			if (cb) {
+				cb(buildPayload());
+			}
+		};
+
+		// Loading (Pyodide init + package downloads) gets its own generous budget
+		// so cold-cache installs are not misreported as an execution timeout. The
+		// execution limit is only started once user code actually begins to run.
+		const armLoadTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = null;
+			loadTimeoutId = setTimeout(() => {
+				finish('Package Loading Time Limit Exceeded');
 
 				// Terminate and recreate the worker on timeout
 				worker.terminate();
 				pyodideWorker.set(null);
+			}, LOAD_TIMEOUT_MS);
+		};
 
-				if (cb) {
-					cb(
-						JSON.parse(
-							JSON.stringify(
-								{
-									stdout: stdout,
-									stderr: stderr,
-									result: result
-								},
-								(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-							)
-						)
-					);
-				}
-			}
-		}, 60000);
+		const armExecutionTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			loadTimeoutId = null;
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = setTimeout(() => {
+				finish('Execution Time Limit Exceeded');
+
+				// Terminate and recreate the worker on timeout
+				worker.terminate();
+				pyodideWorker.set(null);
+			}, EXECUTION_TIMEOUT_MS);
+		};
 
 		// Use addEventListener so multiple concurrent executions don't clobber each other
 		const onMessage = (event) => {
@@ -361,58 +392,43 @@
 			// Ignore FS responses (they use a type field)
 			if (data.type && data.type.startsWith('fs:')) return;
 
+			// Status/progress messages are not completion. `executing` starts the
+			// execution limit; `loading`/`packages` (e.g. an install-retry) fall
+			// back to the load budget.
+			if (data.type === 'status') {
+				if (data.phase === 'executing') {
+					armExecutionTimeout();
+				} else {
+					armLoadTimeout();
+				}
+				return;
+			}
+
 			console.log('pyodideWorker.onmessage', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', onMessage);
-			worker.removeEventListener('error', onError);
 
 			data['stdout'] && (stdout = data['stdout']);
 			data['stderr'] && (stderr = data['stderr']);
 			data['result'] && (result = data['result']);
 
-			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify(
-							{
-								stdout: stdout,
-								stderr: stderr,
-								result: result
-							},
-							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-						)
-					)
-				);
-			}
-
-			executing = false;
+			finish();
 		};
 
 		const onError = (event) => {
 			console.log('pyodideWorker.onerror', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', onMessage);
-			worker.removeEventListener('error', onError);
-
-			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify(
-							{
-								stdout: stdout,
-								stderr: stderr,
-								result: result
-							},
-							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
-						)
-					)
-				);
-			}
-			executing = false;
+			finish();
 		};
 
 		worker.addEventListener('message', onMessage);
 		worker.addEventListener('error', onError);
+
+		worker.postMessage({
+			type: 'execute',
+			id: id,
+			code: code,
+			files: filePayloads.length > 0 ? filePayloads : undefined
+		});
+
+		armLoadTimeout();
 	};
 
 	const resolveToolServer = (serverUrl) => {
