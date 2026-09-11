@@ -11,8 +11,18 @@ type QueuedMessage = { message: unknown; transfer: Transferable[] };
 // Inline the shared pure helpers into the sandboxed script so the iframe and
 // the worker cannot drift. They are self-contained by design (see
 // pyodidePackages.ts).
-const packageHelperSource = [parseMissingModule, resolveImportToPackage, findLiteralDynamicImports]
-	.map((fn) => fn.toString())
+//
+// Production builds minify the imported bindings (esbuild renames them), so
+// `fn.toString()` alone would declare a mangled function name while the
+// sandbox body below still calls the original literal name. Assigning each
+// function to a `const` with its original name via the object keys (which are
+// string literals and never mangled) keeps the call sites valid in every build.
+const packageHelperSource = Object.entries({
+	parseMissingModule,
+	resolveImportToPackage,
+	findLiteralDynamicImports
+})
+	.map(([name, fn]) => `const ${name} = ${fn.toString()};`)
 	.join('\n\n');
 
 export const sandboxScript = String.raw`
