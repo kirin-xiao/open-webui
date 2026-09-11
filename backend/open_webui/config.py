@@ -484,8 +484,9 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 
 ##### Pyodide Environment
 
-- This Python environment runs via Pyodide in the browser. **Do not install packages** — `pip install`, `subprocess`, and `micropip.install()` are not available.
-- If a required library is unavailable, use an alternative approach with available modules. Do not attempt to install anything.
+- This Python environment runs via Pyodide in the browser. Packages are downloaded and loaded automatically the first time you `import` them, which may take a few seconds. Just `import` what you need.
+- Do not call `pip`, `subprocess`, or `micropip.install()` yourself — package loading is handled for you, and `subprocess` is not available in the browser sandbox.
+- If an import genuinely fails, the error will name the module; then use an available alternative.
 
 ##### Persistent File System
 

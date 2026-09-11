@@ -1,4 +1,9 @@
 import { loadPyodide, type PyodideInterface } from 'pyodide';
+import {
+	findLiteralDynamicImports,
+	parseMissingModule,
+	resolveImportToPackage
+} from '../pyodide/pyodidePackages';
 
 declare global {
 	interface Window {
@@ -174,6 +179,83 @@ function fsMkdir(path: string) {
 // Code execution
 // ---------------------------------------------------------------------------
 
+function appendOutput(current: string | null, line: string): string {
+	return current ? `${current}${line}\n` : `${line}\n`;
+}
+
+/**
+ * Load packages that the code needs. `loadPackagesFromImports` only sees static
+ * imports, so we additionally feed it string-literal dynamic imports
+ * (`importlib.import_module("x")`, `__import__("x")`, `find_spec("x")`). Load
+ * failures are returned rather than thrown so the user's code still runs and
+ * can handle a missing package itself.
+ */
+async function loadPackagesForCode(code: string): Promise<string[]> {
+	const loadErrors: string[] = [];
+
+	const dynamicImports = findLiteralDynamicImports(code);
+	if (dynamicImports.length > 0) {
+		const synthetic = dynamicImports.map((name) => `import ${name}`).join('\n');
+		try {
+			await self.pyodide.loadPackagesFromImports(synthetic);
+		} catch (error) {
+			loadErrors.push(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	try {
+		await self.pyodide.loadPackagesFromImports(code, {
+			errorCallback: (message: string) => loadErrors.push(message)
+		});
+	} catch (error) {
+		loadErrors.push(error instanceof Error ? error.message : String(error));
+	}
+
+	return loadErrors;
+}
+
+/**
+ * Run user code, and if it fails with an uncaught ModuleNotFoundError that maps
+ * to a known Pyodide package, install that package and retry once. Otherwise
+ * surface a precise error instead of a bare ModuleNotFoundError.
+ */
+async function runUserCode(code: string, loadErrors: string[]): Promise<unknown> {
+	try {
+		return await self.pyodide.runPythonAsync(code);
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		const missing = parseMissingModule(message);
+		if (!missing) throw error;
+
+		// `lockfile` is exposed by the Pyodide API but not in the public types.
+		const lockfile = (
+			self.pyodide as unknown as {
+				lockfile?: { packages?: Record<string, { imports?: string[] }> };
+			}
+		).lockfile;
+		const lockPkg = resolveImportToPackage(missing, lockfile?.packages);
+		// Lock-listed packages resolve from the local/CDN index; anything else is
+		// a best-effort PyPI install by its import name.
+		const pkgToInstall = lockPkg ?? missing;
+
+		try {
+			const micropip = self.pyodide.pyimport('micropip');
+			await micropip.install(pkgToInstall);
+			self.stdout = appendOutput(
+				self.stdout,
+				`[open-webui] installed missing package '${pkgToInstall}' for module '${missing}' and retrying`
+			);
+			return await self.pyodide.runPythonAsync(code);
+		} catch (installError: unknown) {
+			const detail = installError instanceof Error ? installError.message : String(installError);
+			const loader = loadErrors.length > 0 ? ` Loader: ${loadErrors.join('; ')}.` : '';
+			throw new Error(
+				`Module '${missing}' is not available in this Pyodide environment and could not be installed as '${pkgToInstall}': ${detail}.${loader}`
+			);
+		}
+	}
+}
+
 async function executeCode(
 	id: string,
 	code: string,
@@ -190,14 +272,9 @@ async function executeCode(
 	}
 
 	try {
-		// Auto-load any packages actually imported by the code (e.g. matplotlib,
-		// numpy, pandas). Non-importing mentions are ignored, so a survey or a
-		// `find_spec()` probe never triggers a load.
-		try {
-			await self.pyodide.loadPackagesFromImports(code);
-		} catch {
-			// A package may be unavailable; let the user's own code handle it.
-		}
+		// Auto-load imported packages (static imports plus string-literal
+		// dynamic imports). Load failures are collected, not thrown.
+		const loadErrors = await loadPackagesForCode(code);
 
 		// check if matplotlib is imported in the code
 		if (code.includes('matplotlib')) {
@@ -233,7 +310,7 @@ matplotlib.pyplot.show = show`);
 			}
 		}
 
-		self.result = await self.pyodide.runPythonAsync(code);
+		self.result = await runUserCode(code, loadErrors);
 
 		// Safely process and recursively serialize the result
 		self.result = processResult(self.result);

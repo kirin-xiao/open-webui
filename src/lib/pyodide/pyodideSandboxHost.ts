@@ -1,9 +1,24 @@
+import {
+	findLiteralDynamicImports,
+	parseMissingModule,
+	resolveImportToPackage
+} from './pyodidePackages';
+
 type MessageListener = (event: MessageEvent) => void;
 type ErrorListener = (event: Event) => void;
 type QueuedMessage = { message: unknown; transfer: Transferable[] };
 
-const sandboxScript = String.raw`
+// Inline the shared pure helpers into the sandboxed script so the iframe and
+// the worker cannot drift. They are self-contained by design (see
+// pyodidePackages.ts).
+const packageHelperSource = [parseMissingModule, resolveImportToPackage, findLiteralDynamicImports]
+	.map((fn) => fn.toString())
+	.join('\n\n');
+
+export const sandboxScript = String.raw`
 (function () {
+${packageHelperSource}
+
 	let pyodide = null;
 	let pyodideReady = null;
 	let stdout = null;
@@ -128,21 +143,87 @@ const sandboxScript = String.raw`
 		].join('\n'));
 	}
 
+	async function loadPackagesForCode(code) {
+		const loadErrors = [];
+		const dynamicImports = findLiteralDynamicImports(code);
+		if (dynamicImports.length > 0) {
+			const synthetic = dynamicImports
+				.map(function (name) {
+					return 'import ' + name;
+				})
+				.join('\n');
+			try {
+				await pyodide.loadPackagesFromImports(synthetic);
+			} catch (error) {
+				loadErrors.push(error && error.message ? error.message : String(error));
+			}
+		}
+		try {
+			await pyodide.loadPackagesFromImports(code, {
+				errorCallback: function (message) {
+					loadErrors.push(message);
+				}
+			});
+		} catch (error) {
+			loadErrors.push(error && error.message ? error.message : String(error));
+		}
+		return loadErrors;
+	}
+
+	async function runUserCode(code, loadErrors) {
+		try {
+			return await pyodide.runPythonAsync(code);
+		} catch (error) {
+			const message = error && error.message ? error.message : String(error);
+			const missing = parseMissingModule(message);
+			if (!missing) throw error;
+			const lockPackages = pyodide.lockfile ? pyodide.lockfile.packages : null;
+			const pkg = resolveImportToPackage(missing, lockPackages);
+			// Lock-listed packages resolve from the local/CDN index; anything
+			// else is a best-effort PyPI install by its import name.
+			const pkgToInstall = pkg || missing;
+			try {
+				await pyodide.pyimport('micropip').install(pkgToInstall);
+				stdout =
+					(stdout ? stdout : '') +
+					"[open-webui] installed missing package '" +
+					pkgToInstall +
+					"' for module '" +
+					missing +
+					"' and retrying\n";
+				return await pyodide.runPythonAsync(code);
+			} catch (installError) {
+				const detail =
+					installError && installError.message ? installError.message : String(installError);
+				const loader =
+					loadErrors && loadErrors.length > 0 ? ' Loader: ' + loadErrors.join('; ') + '.' : '';
+				throw new Error(
+					"Module '" +
+						missing +
+						"' is not available in this Pyodide environment and could not be installed as '" +
+						pkgToInstall +
+						"': " +
+						detail +
+						'.' +
+						loader
+				);
+			}
+		}
+	}
+
 	async function execute(id, code, files) {
 		stdout = null;
 		stderr = null;
 		let result = null;
 		if (files && files.length > 0) upload(files);
 		try {
-			try {
-				await pyodide.loadPackagesFromImports(code);
-			} catch (e) {}
+			const loadErrors = await loadPackagesForCode(code);
 			if (code.includes('matplotlib')) {
 				try {
 					await patchMatplotlib();
 				} catch (e) {}
 			}
-			result = clean(await pyodide.runPythonAsync(code));
+			result = clean(await runUserCode(code, loadErrors));
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
 		}

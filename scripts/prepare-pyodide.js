@@ -1,3 +1,8 @@
+// Curated set of wheels that are downloaded and vendored into static/pyodide/
+// for offline use. Only list packages that exist in the Pyodide distribution
+// (or in `pypiPackages` below); `seaborn`/`openpyxl` are intentionally absent
+// because the Pyodide lock does not contain them (and openpyxl also needs
+// `et_xmlfile`). The runtime resolves such packages from PyPI on demand.
 const packages = [
 	'micropip',
 	'packaging',
@@ -11,11 +16,9 @@ const packages = [
 	'regex',
 	'sympy',
 	'tiktoken',
-	'seaborn',
 	'pytz',
 	'black',
-	'openai',
-	'openpyxl'
+	'openai'
 ];
 
 // Pure-Python packages whose wheels must be downloaded from PyPI and saved into
@@ -27,6 +30,11 @@ const pypiPackages = ['black', 'pathspec', 'mypy_extensions', 'pytokens'];
 import { loadPyodide } from 'pyodide';
 import { setGlobalDispatcher, ProxyAgent } from 'undici';
 import { writeFile, readFile, copyFile, readdir, rmdir, access, mkdir, rm } from 'fs/promises';
+import {
+	applyCdnFallback,
+	findMissingCurated,
+	findUnresolvedPackages
+} from './pyodide-lock-utils.js';
 
 /**
  * Loading network proxy configurations from the environment variables.
@@ -195,6 +203,38 @@ async function downloadPyPIWheels() {
 	console.log('Updated pyodide-lock.json with PyPI packages');
 }
 
+/**
+ * Make every lock entry resolvable in the default (non-slim) build: wheels that
+ * were not vendored into static/pyodide/ are served from the jsDelivr CDN
+ * instead of 404-ing against the local mount. Also reports curated packages
+ * that are missing from the lock entirely.
+ */
+async function finalizeLockWithCdnFallback() {
+	const { version } = JSON.parse(await readFile('node_modules/pyodide/package.json', 'utf-8'));
+	const lockPath = 'static/pyodide/pyodide-lock.json';
+	const lockData = JSON.parse(await readFile(lockPath, 'utf-8'));
+	const presentFileNames = await readdir('static/pyodide');
+
+	const { rewritten } = applyCdnFallback(lockData, presentFileNames, version);
+	const missingCurated = findMissingCurated(lockData, packages);
+	if (missingCurated.length > 0) {
+		console.warn(
+			`[pyodide] curated packages missing from the lockfile (will be resolved from PyPI on demand): ${missingCurated.join(', ')}`
+		);
+	}
+	const unresolved = findUnresolvedPackages(lockData, presentFileNames);
+	if (unresolved.length > 0) {
+		console.warn(
+			`[pyodide] lock entries still unresolvable after CDN fallback: ${unresolved.join(', ')}`
+		);
+	}
+
+	await writeFile(lockPath, JSON.stringify(lockData, null, 2));
+	console.log(
+		`[pyodide] rewrote ${rewritten} non-vendored lock entries to the jsDelivr CDN (${presentFileNames.length} local files present)`
+	);
+}
+
 initNetworkProxyFromEnv();
 if (process.env.USE_SLIM === 'true') {
 	// Rebuild generated assets so a previous full build cannot leave bundled wheels behind.
@@ -216,4 +256,5 @@ if (process.env.USE_SLIM === 'true') {
 	await downloadPackages();
 	await copyPyodide();
 	await downloadPyPIWheels();
+	await finalizeLockWithCdnFallback();
 }
