@@ -525,14 +525,14 @@ async def ask_user(
     Ask the user clarifying questions before continuing.
     Use this when the next step depends on user intent, preference, or a tradeoff that cannot be inferred safely.
 
-    :param questions: 1-3 question objects, each with id, header, question, and 2-3 options. Each option needs label and description.
+    :param questions: question objects, each with id, header, question, and options. Each option needs label and description.
     :param allow_other: Whether users may enter a free-form answer instead of choosing one of the options
     :param timeout_ms: How long the browser should keep the prompt open before cancelling it
     :return: JSON with status and answers keyed by question id
     """
     try:
-        if not isinstance(questions, list) or not 1 <= len(questions) <= 3:
-            raise ValueError('ask_user requires 1-3 questions.')
+        if not isinstance(questions, list) or not questions:
+            raise ValueError('ask_user requires at least one question.')
 
         normalized_questions = []
         seen_ids = set()
@@ -540,7 +540,7 @@ async def ask_user(
             if not isinstance(question, dict):
                 raise ValueError('Each question must be an object.')
 
-            question_id = str(question.get('id') or '').strip()[:64]
+            question_id = str(question.get('id') or '').strip()
             if not question_id:
                 raise ValueError('Each question requires a non-empty id.')
             if question_id in seen_ids:
@@ -548,16 +548,16 @@ async def ask_user(
             seen_ids.add(question_id)
 
             options = question.get('options')
-            if not isinstance(options, list) or not 2 <= len(options) <= 3:
-                raise ValueError('Each question requires 2-3 options.')
+            if not isinstance(options, list) or not options:
+                raise ValueError('Each question requires at least one option.')
 
             normalized_options = []
             for option in options:
                 if not isinstance(option, dict):
                     raise ValueError('Each option must be an object.')
 
-                label = str(option.get('label') or '').strip()[:80]
-                description = str(option.get('description') or '').strip()[:240]
+                label = str(option.get('label') or '').strip()
+                description = str(option.get('description') or '').strip()
                 if not label or not description:
                     raise ValueError('Each option requires a label and description.')
 
@@ -568,14 +568,14 @@ async def ask_user(
                     }
                 )
 
-            question_text = str(question.get('question') or '').strip()[:500]
+            question_text = str(question.get('question') or '').strip()
             if not question_text:
                 raise ValueError('Each question requires question text.')
 
             normalized_questions.append(
                 {
                     'id': question_id,
-                    'header': str(question.get('header') or '').strip()[:48] or f'Question {index + 1}',
+                    'header': str(question.get('header') or '').strip() or f'Question {index + 1}',
                     'question': question_text,
                     'options': normalized_options,
                     'allow_other': bool(question.get('allow_other', allow_other)),
