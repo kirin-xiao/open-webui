@@ -485,6 +485,7 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 ##### Pyodide Environment
 
 - This Python environment runs via Pyodide in the browser. Packages are downloaded and loaded automatically the first time you `import` them, which may take a few seconds. Just `import` what you need.
+- Prefer plain `import X` / `from X import Y` statements: those always trigger automatic package loading. Literal probes like `importlib.import_module("X")`, `__import__("X")` or `find_spec("X")` are also handled, but probes that use a variable or loop over module-name strings are NOT auto-loaded and can falsely report an available package as missing.
 - Do not call `pip`, `subprocess`, or `micropip.install()` yourself — package loading is handled for you, and `subprocess` is not available in the browser sandbox.
 - If an import genuinely fails, the error will name the module; then use an available alternative.
 
