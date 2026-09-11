@@ -16,6 +16,10 @@ __pycache__/
 *$py.class
 .nvmrc
 CLAUDE.md
+
+# Local tracker of upstream issues fixed in fork/dev (not committed)
+/issues/
+
 # C extensions
 *.so
 

@@ -190,10 +190,20 @@ async function executeCode(
 	}
 
 	try {
+		// Auto-load any packages actually imported by the code (e.g. matplotlib,
+		// numpy, pandas). Non-importing mentions are ignored, so a survey or a
+		// `find_spec()` probe never triggers a load.
+		try {
+			await self.pyodide.loadPackagesFromImports(code);
+		} catch {
+			// A package may be unavailable; let the user's own code handle it.
+		}
+
 		// check if matplotlib is imported in the code
 		if (code.includes('matplotlib')) {
-			// Override plt.show() to return base64 image
-			await self.pyodide.runPythonAsync(`import base64
+			try {
+				// Override plt.show() to return base64 image
+				await self.pyodide.runPythonAsync(`import base64
 import os
 from io import BytesIO
 
@@ -217,6 +227,10 @@ def show(*, block=None):
 	print(f"data:image/png;base64,{img_str}")
 
 matplotlib.pyplot.show = show`);
+			} catch {
+				// matplotlib unavailable; skip the patch so the user's code
+				// runs and can handle the missing package itself.
+			}
 		}
 
 		self.result = await self.pyodide.runPythonAsync(code);

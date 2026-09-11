@@ -134,7 +134,14 @@ const sandboxScript = String.raw`
 		let result = null;
 		if (files && files.length > 0) upload(files);
 		try {
-			if (code.includes('matplotlib')) await patchMatplotlib();
+			try {
+				await pyodide.loadPackagesFromImports(code);
+			} catch (e) {}
+			if (code.includes('matplotlib')) {
+				try {
+					await patchMatplotlib();
+				} catch (e) {}
+			}
 			result = clean(await pyodide.runPythonAsync(code));
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
