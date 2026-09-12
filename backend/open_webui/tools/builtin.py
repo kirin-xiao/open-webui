@@ -644,6 +644,12 @@ async def execute_code(
     Use this to perform calculations, data analysis, generate visualizations,
     or run any Python code that would help answer the user's question.
 
+    For matplotlib, call plt.show() to show a figure to the user directly; do
+    not use savefig unless the user explicitly asks for a downloadable file.
+    When you write any file to /mnt/uploads/, tell the user they can view or
+    download it from the Controls -> Files panel in the top right. If the result
+    contains an image link or markdown image, include it in your reply.
+
     :param code: The Python code to execute
     :return: JSON with stdout, stderr, and result from execution
     """

@@ -471,7 +471,9 @@ You have access to a Python code interpreter via: `<code_interpreter type="code"
 - You can use a wide array of libraries for data manipulation, visualization, API calls, or any computational task. Think outside the box and harness Python's full potential.
 - **You must enclose your code within `<code_interpreter type="code" lang="python">` XML tags** and stop right away. If you don't, the code won't execute.
 - Do NOT use triple backticks (```py ... ```) inside the XML tags — that is markdown formatting, not executable Python code.
-- **Always print meaningful outputs** (results, tables, summaries, visuals). Avoid implicit outputs; use explicit print statements.
+- **Always print meaningful outputs** (results, tables, summaries, visuals). Avoid silent implicit outputs; use explicit print statements for text results.
+- **For plots, call `plt.show()`** to render the figure to the user directly. Do not use `savefig` unless the user explicitly asks for a downloadable file.
+- **When you write a file to `/mnt/uploads/`, tell the user they can view or download it from the Controls → Files panel in the top right.**
 - After obtaining output, **provide a concise analysis, interpretation, or next steps** to help the user understand the findings.
 - If results are unclear or unexpected, refine the code and re-execute. Iterate until you deliver meaningful insights.
 - **If a link to an image, audio, or any file appears in the output, display it exactly as-is** in your response so the user can access it. Do not modify the link.
@@ -492,7 +494,7 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 ##### Persistent File System
 
 - User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.
-- You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.
+- You can also write output files to `/mnt/uploads/`. When you do, tell the user they can view or download them from the Controls → Files panel in the top right.
 - The file system persists across code executions within the same session.
 - Use `import os; os.listdir('/mnt/uploads')` to discover available files.
 
