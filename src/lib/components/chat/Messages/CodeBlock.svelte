@@ -1,12 +1,12 @@
 <script lang="ts">
 	import hljs from 'highlight.js';
 	import { toast } from 'svelte-sonner';
-	import { getContext, onMount, tick, onDestroy } from 'svelte';
+	import { getContext, onMount, tick } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { config, pyodideWorker as pyodideWorkerStore } from '$lib/stores';
+	import { config } from '$lib/stores';
 
-	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { getPyodideRuntime } from '$lib/pyodide/pyodideRuntimePool';
 	import { executeCode } from '$lib/apis/utils';
 	import {
 		copyToClipboard,
@@ -33,6 +33,7 @@
 
 	export let id = '';
 	export let edit = true;
+	export let chatId = '';
 
 	export let onSave = (e) => {};
 	export let onUpdate = (e, codeBlockId = '') => {};
@@ -51,8 +52,6 @@
 	export let className = '';
 	export let editorClassName = '';
 	export let stickyButtonsClassName = 'top-0';
-
-	let localPyodideWorker = null;
 
 	let _code = '';
 	$: _code = code;
@@ -226,16 +225,12 @@
 		// Packages are resolved by the worker from `pyodide-lock.json` via
 		// loadPackagesFromImports, so no hardcoded import->package list is needed.
 
-		// Reuse the shared Pyodide worker when code interpreter is active,
-		// so files written here are immediately visible in PyodideFileNav.
-		// Otherwise fall back to a throwaway worker.
-		const sharedWorker = $pyodideWorkerStore;
-		const isShared = !!sharedWorker;
-		const worker = sharedWorker ?? createPyodideWorker();
-
-		if (!isShared) {
-			localPyodideWorker = worker;
-		}
+		// Each chat gets its own interpreter so module state cannot leak across
+		// chats. The runtime is pooled and reused within the chat, so files
+		// written here remain visible in PyodideFileNav.
+		const runtime = getPyodideRuntime(chatId);
+		const worker = runtime.worker;
+		runtime.acquire();
 
 		let settled = false;
 		let loadTimeoutId = null;
@@ -249,6 +244,7 @@
 			clearTimeout(executionTimeoutId);
 			worker.removeEventListener('message', handler);
 			worker.removeEventListener('error', onError);
+			runtime.release();
 
 			if (error) {
 				stderr = error;
@@ -257,16 +253,12 @@
 			executing = false;
 		};
 
-		// A timed-out run cannot be interrupted in-process, so drop the worker.
-		// The persistent worker's IDBFS files survive because they live in
-		// IndexedDB; a fresh worker reloads them on the next run.
+		// A timed-out run cannot be interrupted in-process, so drop the exact
+		// interpreter that hung (not by chat id, which could now resolve to a
+		// different runtime). IDBFS files survive because they live in IndexedDB;
+		// a fresh interpreter reloads them on the next run.
 		const terminateWorker = () => {
-			worker.terminate();
-			if (isShared) {
-				pyodideWorkerStore.set(null);
-			} else {
-				localPyodideWorker = null;
-			}
+			runtime.reset();
 		};
 
 		// Loading (Pyodide init + package downloads) gets its own generous budget
@@ -389,10 +381,18 @@
 		worker.addEventListener('message', handler);
 		worker.addEventListener('error', onError);
 
-		worker.postMessage({
-			id: id,
-			code: code
-		});
+		try {
+			worker.postMessage({
+				id: id,
+				code: code
+			});
+		} catch (e) {
+			// A throwing postMessage (e.g. DataCloneError) would otherwise skip
+			// finish() and pin the runtime's busy counter forever.
+			console.error('Failed to post execution to Pyodide runtime:', e);
+			finish(e instanceof Error ? e.message : String(e));
+			return;
+		}
 
 		armLoadTimeout();
 	};
@@ -463,13 +463,6 @@
 	onMount(async () => {
 		if (token) {
 			onUpdate(token, id);
-		}
-	});
-
-	onDestroy(() => {
-		if (localPyodideWorker) {
-			localPyodideWorker.terminate();
-			localPyodideWorker = null;
 		}
 	});
 </script>

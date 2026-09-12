@@ -4,8 +4,7 @@
 
 <script lang="ts">
 	import { getContext, onMount, onDestroy, tick } from 'svelte';
-	import { pyodideWorker } from '$lib/stores';
-	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { getPyodideRuntime } from '$lib/pyodide/pyodideRuntimePool';
 	import type { FileEntry } from '$lib/apis/terminal';
 
 	import FileNavToolbar from './FileNav/FileNavToolbar.svelte';
@@ -19,6 +18,7 @@
 	const i18n = getContext('i18n');
 
 	export let overlay = false;
+	export let chatId: string | null = '';
 
 	// ── State ─────────────────────────────────────────────────────────────
 	let currentPath = savedPyodidePath;
@@ -97,21 +97,22 @@
 
 	// ── Worker management ─────────────────────────────────────────────────
 
-	function ensureWorker(): Worker {
-		let worker = $pyodideWorker;
-		if (!worker) {
-			worker = createPyodideWorker();
-			pyodideWorker.set(worker);
-		}
-		return worker;
-	}
-
 	function sendWorkerMessage(msg: any): Promise<any> {
-		const worker = ensureWorker();
+		const runtime = getPyodideRuntime(chatId);
+		const worker = runtime.worker;
 		const id = `fs-${++_reqId}`;
+		runtime.acquire();
 		return new Promise((resolve, reject) => {
+			let released = false;
+			const release = () => {
+				if (released) return;
+				released = true;
+				runtime.release();
+			};
+
 			const timeout = setTimeout(() => {
 				worker.removeEventListener('message', handler);
+				release();
 				reject('Timeout');
 			}, 30000);
 
@@ -120,11 +121,19 @@
 				if (event.data?.type === 'status') return;
 				clearTimeout(timeout);
 				worker.removeEventListener('message', handler);
+				release();
 				resolve(event.data);
 			}
 
-			worker.addEventListener('message', handler);
-			worker.postMessage({ ...msg, id });
+			try {
+				worker.addEventListener('message', handler);
+				worker.postMessage({ ...msg, id });
+			} catch (e) {
+				clearTimeout(timeout);
+				worker.removeEventListener('message', handler);
+				release();
+				reject(e);
+			}
 		});
 	}
 
@@ -339,7 +348,6 @@
 	};
 
 	onMount(() => {
-		ensureWorker();
 		loadDir(currentPath);
 		window.addEventListener('pyodide:files', onFilesChanged);
 	});

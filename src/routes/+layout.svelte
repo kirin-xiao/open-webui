@@ -1,7 +1,6 @@
 <script>
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
-	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
 	import { Toaster, toast } from 'svelte-sonner';
 
 	let loadingProgress = spring(0, {
@@ -34,11 +33,11 @@
 		showControls,
 		showFileNavPath,
 		showFileNavDir,
-		pyodideWorker,
 		desktopEvent
 	} from '$lib/stores';
 	import { refreshChatList } from '$lib/stores/chatList';
 	import { getFileContentById } from '$lib/apis/files';
+	import { getPyodideRuntime } from '$lib/pyodide/pyodideRuntimePool';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { beforeNavigate } from '$app/navigation';
@@ -278,30 +277,20 @@
 		});
 	};
 
-	/**
-	 * Get or create the persistent Pyodide worker.
-	 * The worker persists across executions so the virtual FS (IDBFS) is preserved.
-	 */
-	const getOrCreateWorker = () => {
-		let worker = $pyodideWorker;
-		if (!worker) {
-			worker = createPyodideWorker();
-			pyodideWorker.set(worker);
-		}
-		return worker;
-	};
-
 	const LOAD_TIMEOUT_MS = 300000;
 	const EXECUTION_TIMEOUT_MS = 60000;
 
-	const executePythonAsWorker = async (id, code, cb, files = []) => {
+	const executePythonAsWorker = async (id, code, cb, files = [], chatId = null) => {
 		let result = null;
 		let stdout = null;
 		let stderr = null;
 
 		let settled = false;
 
-		const worker = getOrCreateWorker();
+		// Each chat gets its own interpreter (isolated sys.modules / module
+		// attributes). Reused within the chat; the pool bounds memory.
+		const runtime = getPyodideRuntime(chatId);
+		const worker = runtime.worker;
 
 		// Fetch file content from the server and prepare for the worker
 		let filePayloads = [];
@@ -321,6 +310,10 @@
 				}
 			}
 		}
+
+		// Acquire only once the awaited file fetch is done, so a hung fetch can
+		// never hold the runtime busy and block a deferred reset.
+		runtime.acquire();
 
 		let loadTimeoutId = null;
 		let executionTimeoutId = null;
@@ -345,6 +338,7 @@
 			clearTimeout(executionTimeoutId);
 			worker.removeEventListener('message', onMessage);
 			worker.removeEventListener('error', onError);
+			runtime.release();
 
 			if (error) {
 				stderr = error;
@@ -365,9 +359,10 @@
 			loadTimeoutId = setTimeout(() => {
 				finish('Package Loading Time Limit Exceeded');
 
-				// Terminate and recreate the worker on timeout
-				worker.terminate();
-				pyodideWorker.set(null);
+				// A timed-out run cannot be interrupted in-process, so drop the
+				// exact interpreter that hung (not by chat id, which could now
+				// resolve to a different runtime). IDBFS files survive in IndexedDB.
+				runtime.reset();
 			}, LOAD_TIMEOUT_MS);
 		};
 
@@ -378,9 +373,10 @@
 			executionTimeoutId = setTimeout(() => {
 				finish('Execution Time Limit Exceeded');
 
-				// Terminate and recreate the worker on timeout
-				worker.terminate();
-				pyodideWorker.set(null);
+				// A timed-out run cannot be interrupted in-process, so drop the
+				// exact interpreter that hung (not by chat id, which could now
+				// resolve to a different runtime). IDBFS files survive in IndexedDB.
+				runtime.reset();
 			}, EXECUTION_TIMEOUT_MS);
 		};
 
@@ -421,12 +417,20 @@
 		worker.addEventListener('message', onMessage);
 		worker.addEventListener('error', onError);
 
-		worker.postMessage({
-			type: 'execute',
-			id: id,
-			code: code,
-			files: filePayloads.length > 0 ? filePayloads : undefined
-		});
+		try {
+			worker.postMessage({
+				type: 'execute',
+				id: id,
+				code: code,
+				files: filePayloads.length > 0 ? filePayloads : undefined
+			});
+		} catch (e) {
+			// A throwing postMessage (e.g. DataCloneError) would otherwise skip
+			// finish() and pin the runtime's busy counter forever.
+			console.error('Failed to post execution to Pyodide runtime:', e);
+			finish(e instanceof Error ? e.message : String(e));
+			return;
+		}
 
 		armLoadTimeout();
 	};
@@ -621,7 +625,7 @@
 		if (data?.session_id === $socket.id) {
 			if (type === 'execute:python') {
 				console.log('execute:python', data);
-				executePythonAsWorker(data.id, data.code, cb, data.files || []);
+				executePythonAsWorker(data.id, data.code, cb, data.files || [], event.chat_id);
 				return;
 			} else if (type === 'execute:tool') {
 				console.log('execute:tool', data);

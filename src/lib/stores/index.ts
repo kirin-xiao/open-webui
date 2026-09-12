@@ -98,9 +98,6 @@ export const adminFeedbackCount: Writable<number | null> = writable(null);
 export const toolServers = writable([]);
 export const terminalServers: Writable<any[] | null> = writable(null);
 
-// Persistent Pyodide worker for code interpreter FS
-export const pyodideWorker: Writable<Worker | null> = writable(null);
-
 export const banners: Writable<Banner[]> = writable([]);
 
 export const settings: Writable<Settings> = writable({});

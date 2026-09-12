@@ -494,7 +494,12 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 - User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.
 - You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.
 - The file system persists across code executions within the same session.
-- Use `import os; os.listdir('/mnt/uploads')` to discover available files."""
+- Use `import os; os.listdir('/mnt/uploads')` to discover available files.
+
+##### Persistent Python State
+
+- The interpreter persists for this conversation: variables and imported modules from earlier executions remain in scope.
+- If an earlier execution accidentally rebound an attribute on an imported module and later code sees a corrupted object, force a fresh module object: `import sys; del sys.modules['numpy']; import numpy`. To rebind in place and keep existing references valid, use `import importlib; import numpy; importlib.reload(numpy)` instead."""
 
 
 ####################################
