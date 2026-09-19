@@ -425,10 +425,21 @@ ENABLE_CODE_INTERPRETER = os.getenv('ENABLE_CODE_INTERPRETER', 'True').lower() =
 
 ENABLE_MEMORIES = os.getenv('ENABLE_MEMORIES', 'True').lower() == 'true'
 ENABLE_MEMORY_SYSTEM_CONTEXT = os.getenv('ENABLE_MEMORY_SYSTEM_CONTEXT', 'True').lower() == 'true'
+# Background memory review is opt-in (default off): it spends one extra model
+# call per review interval and rewrites the memory store, so it stays a
+# deliberate operator choice. Enable with ENABLE_MEMORY_BACKGROUND_REVIEW=True
+# (env) or the DB config key `memories.background_review.enable`; the cadence is
+# MEMORIES_REVIEW_INTERVAL_TURNS user turns (default 10). Besides adding and
+# correcting rows, the review runs a consolidation pass: merge layered
+# corrections into one active value per slot, recency wins, delete superseded
+# text, keep decision rules and drop narration.
 ENABLE_MEMORY_BACKGROUND_REVIEW = os.getenv('ENABLE_MEMORY_BACKGROUND_REVIEW', 'False').lower() == 'true'
 MEMORIES_REVIEW_INTERVAL_TURNS = int(os.getenv('MEMORIES_REVIEW_INTERVAL_TURNS', '10'))
 MEMORIES_USER_CHAR_LIMIT = int(os.getenv('MEMORIES_USER_CHAR_LIMIT', '2000'))
 MEMORIES_CONTEXT_CHAR_LIMIT = int(os.getenv('MEMORIES_CONTEXT_CHAR_LIMIT', '2000'))
+# Memory retrieval has its own relevance gate so tuning memory no longer
+# retunes document/KB RAG on instances with hybrid search enabled.
+MEMORIES_RELEVANCE_THRESHOLD = float(os.getenv('MEMORIES_RELEVANCE_THRESHOLD', '0.7'))
 
 CODE_INTERPRETER_ENGINE = os.getenv('CODE_INTERPRETER_ENGINE', 'pyodide')
 
@@ -472,7 +483,9 @@ You have access to a Python code interpreter via: `<code_interpreter type="code"
 - You can use a wide array of libraries for data manipulation, visualization, API calls, or any computational task. Think outside the box and harness Python's full potential.
 - **You must enclose your code within `<code_interpreter type="code" lang="python">` XML tags** and stop right away. If you don't, the code won't execute.
 - Do NOT use triple backticks (```py ... ```) inside the XML tags — that is markdown formatting, not executable Python code.
-- **Always print meaningful outputs** (results, tables, summaries, visuals). Avoid implicit outputs; use explicit print statements.
+- **Always print meaningful outputs** (results, tables, summaries, visuals). Avoid silent implicit outputs; use explicit print statements for text results.
+- **For plots, call `plt.show()`** to render the figure to the user directly. Do not use `savefig` unless the user explicitly asks for a downloadable file.
+- **When you write a file to `/mnt/uploads/`, tell the user they can view or download it from the Controls → Files panel in the top right.**
 - After obtaining output, **provide a concise analysis, interpretation, or next steps** to help the user understand the findings.
 - If results are unclear or unexpected, refine the code and re-execute. Iterate until you deliver meaningful insights.
 - **If a link to an image, audio, or any file appears in the output, display it exactly as-is** in your response so the user can access it. Do not modify the link.
@@ -485,15 +498,34 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 
 ##### Pyodide Environment
 
-- This Python environment runs via Pyodide in the browser. **Do not install packages** — `pip install`, `subprocess`, and `micropip.install()` are not available.
-- If a required library is unavailable, use an alternative approach with available modules. Do not attempt to install anything.
+- This Python environment runs via Pyodide in the browser. Packages are downloaded and loaded automatically the first time you `import` them, which may take a few seconds. Just `import` what you need.
+- Probe availability with a bare `import X` at the top level. An uncaught `ModuleNotFoundError` is what triggers the automatic install-and-retry — it is read from the error, not from how the import was written — so a probe wrapped in `try`/`except` makes an installable package look missing, and `find_spec` returns `None` without raising, so it never triggers the retry. Literal `importlib.import_module("X")`, `__import__("X")`, and `find_spec("X")` are pre-loaded from the local index up front; only names hidden behind a variable or loop are not.
+- `pip` and `subprocess` are not available in this sandbox. `micropip.install()` works, and is the right tool when you deliberately need a specific version (e.g. `await micropip.install("yfinance==0.2.40")`); it is async, so `await` it.
+- An install failure means that requirement could not be installed, and the error names the blocking package or dependency. That is an install limitation (for example a compiled dependency with no pure-Python wheel), not a network outage — a different version or an available alternative may still work.
+- Network access goes through the browser. `socket` and `urllib` are stubbed and are not a connectivity test: `socket.getaddrinfo` returns fake addresses, and `urllib` may fail with a transport/TLS error or a timeout regardless of the network state. Use `from pyodide.http import pyfetch` instead. A reachable URL can also fail a browser request because of CORS — a cross-origin restriction, not an offline sandbox.
+
+##### Persistent Python State
+
+- The interpreter persists for this conversation: variables and imported modules from earlier executions remain in scope.
+- If an earlier execution accidentally rebound an attribute on an imported module and later code sees a corrupted object, force a fresh module object: `import sys; del sys.modules['numpy']; import numpy`. To rebind in place and keep existing references valid, use `import importlib; import numpy; importlib.reload(numpy)` instead.
 
 ##### Persistent File System
 
 - User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.
-- You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.
-- The file system persists across code executions within the same session.
+- You can also write output files to `/mnt/uploads/`. When you do, tell the user they can view or download them from the Controls → Files panel in the top right.
+- Within a session, `/mnt/uploads/` and any working files you create persist across code executions.
 - Use `import os; os.listdir('/mnt/uploads')` to discover available files."""
+
+# Appended to the pyodide prompt when the deployment persists the interpreter's
+# file system across page reloads (ENABLE_PYODIDE_FILE_PERSISTENCE). This is not
+# a separate section: it continues `##### Persistent File System` above with the
+# durable/reload tier, so the rendered prompt has exactly one file-system section
+# that distinguishes session persistence from reload persistence.
+CODE_INTERPRETER_PYODIDE_PERSISTENCE_PROMPT = """
+- Across page reloads and browser restarts, files under `/mnt/uploads/` persist too: they are stored in the browser and restored the next time you run code in this conversation.
+- That durable tier covers `/mnt/uploads/` only — keep working files you want to keep there.
+- Python variables and imported modules are not part of it: a reload starts a fresh interpreter, so re-import and re-load any state you need (`##### Persistent Python State` covers the within-session case)."""
+
 
 
 ####################################
@@ -1915,6 +1947,8 @@ USER_PERMISSIONS_FEATURES_CODE_INTERPRETER = (
     os.getenv('USER_PERMISSIONS_FEATURES_CODE_INTERPRETER', 'True').lower() == 'true'
 )
 
+USER_PERMISSIONS_FEATURES_SUBAGENTS = os.getenv('USER_PERMISSIONS_FEATURES_SUBAGENTS', 'True').lower() == 'true'
+
 USER_PERMISSIONS_FEATURES_FOLDERS = os.getenv('USER_PERMISSIONS_FEATURES_FOLDERS', 'True').lower() == 'true'
 
 USER_PERMISSIONS_FEATURES_NOTES = os.getenv('USER_PERMISSIONS_FEATURES_NOTES', 'True').lower() == 'true'
@@ -2009,6 +2043,7 @@ DEFAULT_USER_PERMISSIONS = {
         'web_search': USER_PERMISSIONS_FEATURES_WEB_SEARCH,
         'image_generation': USER_PERMISSIONS_FEATURES_IMAGE_GENERATION,
         'code_interpreter': USER_PERMISSIONS_FEATURES_CODE_INTERPRETER,
+        'subagents': USER_PERMISSIONS_FEATURES_SUBAGENTS,
         'memories': USER_PERMISSIONS_FEATURES_MEMORIES,
         'automations': USER_PERMISSIONS_FEATURES_AUTOMATIONS,
         'calendar': USER_PERMISSIONS_FEATURES_CALENDAR,
@@ -2034,9 +2069,8 @@ ENABLE_CALENDAR = os.getenv('ENABLE_CALENDAR', 'True').lower() == 'true'
 ENABLE_AUTOMATIONS = os.getenv('ENABLE_AUTOMATIONS', 'True').lower() == 'true'
 
 ENABLE_SUBAGENTS = os.getenv('ENABLE_SUBAGENTS', 'False').lower() == 'true'
-SUBAGENTS_BACKGROUND_ENABLED = os.getenv('SUBAGENTS_BACKGROUND_ENABLED', 'False').lower() == 'true'
-SUBAGENTS_MAX_CONCURRENT = int(os.getenv('SUBAGENTS_MAX_CONCURRENT', '20'))
-SUBAGENTS_MAX_ASYNC = int(os.getenv('SUBAGENTS_MAX_ASYNC', '20'))
+SUBAGENTS_DEPTH = int(os.getenv('SUBAGENTS_DEPTH', '1'))
+SUBAGENTS_MODEL = os.getenv('SUBAGENTS_MODEL', '')
 SUBAGENTS_MAX_ITERATIONS = int(os.getenv('SUBAGENTS_MAX_ITERATIONS', '30'))
 SUBAGENTS_MAX_OUTPUT = int(os.getenv('SUBAGENTS_MAX_OUTPUT', '30000'))
 SUBAGENTS_SYSTEM_PROMPT = os.getenv('SUBAGENTS_SYSTEM_PROMPT', '')
@@ -2200,9 +2234,16 @@ CONTEXT_COMPACTION_TOKEN_THRESHOLD = int(os.getenv('CONTEXT_COMPACTION_TOKEN_THR
 _CONTEXT_COMPACTION_TOKEN_CAP = os.getenv('CONTEXT_COMPACTION_TOKEN_CAP')
 CONTEXT_COMPACTION_TOKEN_CAP = int(_CONTEXT_COMPACTION_TOKEN_CAP) if _CONTEXT_COMPACTION_TOKEN_CAP else None
 
-CONTEXT_COMPACTION_RETENTION_PERCENTAGE = min(
-    50, max(10, int(os.getenv('CONTEXT_COMPACTION_RETENTION_PERCENTAGE', '40')))
-)
+# Token headroom reserved below the prompt ceiling when model context metadata is
+# available (no such metadata ships in this repo, so the configured threshold
+# remains the primary trigger; see utils/context_compaction.py).
+CONTEXT_COMPACTION_BUFFER = int(os.getenv('CONTEXT_COMPACTION_BUFFER', '20000'))
+
+# Estimated tokens of the newest history retained verbatim by the tail walk.
+CONTEXT_COMPACTION_KEEP_TOKENS = int(os.getenv('CONTEXT_COMPACTION_KEEP_TOKENS', '15000'))
+
+# Automatic compaction on/off. Manual compaction is always allowed.
+CONTEXT_COMPACTION_AUTO = os.getenv('CONTEXT_COMPACTION_AUTO', 'True').lower() == 'true'
 
 CONTEXT_COMPACTION_PROMPT_TEMPLATE = os.getenv('CONTEXT_COMPACTION_PROMPT_TEMPLATE', '')
 
@@ -2847,6 +2888,7 @@ DEFAULT_CONFIG = {
     'memories.review_interval_turns': MEMORIES_REVIEW_INTERVAL_TURNS,
     'memories.user_char_limit': MEMORIES_USER_CHAR_LIMIT,
     'memories.context_char_limit': MEMORIES_CONTEXT_CHAR_LIMIT,
+    'memories.relevance_threshold': MEMORIES_RELEVANCE_THRESHOLD,
     'code_interpreter.engine': CODE_INTERPRETER_ENGINE,
     'code_interpreter.prompt_template': CODE_INTERPRETER_PROMPT_TEMPLATE,
     'code_interpreter.jupyter.url': CODE_INTERPRETER_JUPYTER_URL,
@@ -3106,9 +3148,8 @@ DEFAULT_CONFIG = {
     'calendar.enable': ENABLE_CALENDAR,
     'automations.enable': ENABLE_AUTOMATIONS,
     'subagents.enable': ENABLE_SUBAGENTS,
-    'subagents.background_enabled': SUBAGENTS_BACKGROUND_ENABLED,
-    'subagents.max_concurrent': SUBAGENTS_MAX_CONCURRENT,
-    'subagents.max_async': SUBAGENTS_MAX_ASYNC,
+    'subagents.depth': SUBAGENTS_DEPTH,
+    'subagents.model': SUBAGENTS_MODEL,
     'subagents.max_iterations': SUBAGENTS_MAX_ITERATIONS,
     'subagents.max_output': SUBAGENTS_MAX_OUTPUT,
     'subagents.system_prompt': SUBAGENTS_SYSTEM_PROMPT,
@@ -3133,7 +3174,9 @@ DEFAULT_CONFIG = {
     'chat.context_compaction.enable': ENABLE_CONTEXT_COMPACTION,
     'chat.context_compaction.token_threshold': CONTEXT_COMPACTION_TOKEN_THRESHOLD,
     'chat.context_compaction.token_cap': CONTEXT_COMPACTION_TOKEN_CAP,
-    'chat.context_compaction.retention_percentage': CONTEXT_COMPACTION_RETENTION_PERCENTAGE,
+    'chat.context_compaction.buffer': CONTEXT_COMPACTION_BUFFER,
+    'chat.context_compaction.keep_tokens': CONTEXT_COMPACTION_KEEP_TOKENS,
+    'chat.context_compaction.auto': CONTEXT_COMPACTION_AUTO,
     'chat.context_compaction.prompt_template': CONTEXT_COMPACTION_PROMPT_TEMPLATE,
     'chat.tool_permissions.enable': ENABLE_TOOL_PERMISSIONS,
     'task.title.prompt_template': TITLE_GENERATION_PROMPT_TEMPLATE,

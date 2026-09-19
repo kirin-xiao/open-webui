@@ -1,3 +1,8 @@
+// Curated set of wheels that are downloaded and vendored into static/pyodide/
+// for offline use. Only list packages that exist in the Pyodide distribution
+// (or in `pypiPackages` below); `seaborn`/`openpyxl` are intentionally absent
+// because the Pyodide lock does not contain them (and openpyxl also needs
+// `et_xmlfile`). The runtime resolves such packages from PyPI on demand.
 const packages = [
 	'micropip',
 	'packaging',
@@ -43,9 +48,33 @@ const pypiDepends = {
 	'python-docx': ['lxml', 'typing-extensions']
 };
 
+// Fonts vendored into static/pyodide/fonts/ so matplotlib can render non-Latin
+// labels. The bundled DejaVu/STIX/Computer Modern faces have no CJK coverage, so
+// Chinese, Japanese, and Korean text would otherwise render as missing-glyph
+// boxes ("tofu"). matplotlib's AGG backend can only use fonts registered with
+// its own FontManager -- there is no browser font fallback inside wasm -- so the
+// file must be present locally.
+//
+// Noto Sans SC covers Simplified Chinese, Traditional Chinese, and Japanese.
+// It contains no Hangul, so Korean is not covered; use the full pan-CJK face
+// (Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf) if that is needed.
+const fonts = [
+	{
+		name: 'NotoSansSC-Regular.otf',
+		// Pinned tag: jsDelivr resolves this tag even though `main` also works.
+		url: 'https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf'
+	}
+];
+const fontsDir = 'static/pyodide/fonts';
+
 import { loadPyodide } from 'pyodide';
 import { setGlobalDispatcher, ProxyAgent } from 'undici';
 import { writeFile, readFile, copyFile, readdir, rmdir, access, mkdir, rm } from 'fs/promises';
+import {
+	applyCdnFallback,
+	findMissingCurated,
+	findUnresolvedPackages
+} from './pyodide-lock-utils.js';
 
 /**
  * Loading network proxy configurations from the environment variables.
@@ -213,29 +242,75 @@ async function downloadPyPIWheels() {
 	console.log('Updated pyodide-lock.json with PyPI packages');
 }
 
-// A package with no bundled wheel is installed from PyPI in the user's browser instead.
-async function verifyBundledWheels() {
+/**
+ * Download the vendored matplotlib fonts into static/pyodide/fonts/.
+ *
+ * Best-effort: a failed download warns and continues, so a network hiccup never
+ * breaks a build. The runtime treats the font as optional too.
+ */
+async function downloadFonts() {
+	await mkdir(fontsDir, { recursive: true });
+
+	for (const font of fonts) {
+		const dest = `${fontsDir}/${font.name}`;
+		try {
+			await access(dest);
+			console.log(`  Already exists: ${font.name}`);
+			continue;
+		} catch {
+			// Not cached yet; fall through to the download.
+		}
+
+		console.log(`  Downloading: ${font.name}`);
+		try {
+			const res = await fetch(font.url);
+			if (!res.ok) {
+				console.warn(
+					`  Failed to download ${font.name}: ${res.status}; CJK plot labels will render as boxes`
+				);
+				continue;
+			}
+			const buffer = Buffer.from(await res.arrayBuffer());
+			await writeFile(dest, buffer);
+			console.log(`  Saved: ${dest} (${buffer.length} bytes)`);
+		} catch (err) {
+			console.warn(
+				`  Failed to download ${font.name}: ${err}; CJK plot labels will render as boxes`
+			);
+		}
+	}
+}
+
+/**
+ * Make every lock entry resolvable in the default (non-slim) build: wheels that
+ * were not vendored into static/pyodide/ are served from the jsDelivr CDN
+ * instead of 404-ing against the local mount. Also reports curated packages
+ * that are missing from the lock entirely.
+ */
+async function finalizeLockWithCdnFallback() {
+	const { version } = JSON.parse(await readFile('node_modules/pyodide/package.json', 'utf-8'));
 	const lockPath = 'static/pyodide/pyodide-lock.json';
 	const lockData = JSON.parse(await readFile(lockPath, 'utf-8'));
-	const missing = [];
+	const presentFileNames = await readdir('static/pyodide');
 
-	for (const pkg of new Set([...packages, ...pypiPackages, ...Object.values(pypiDepends).flat()])) {
-		const entry = lockData.packages[pkg.toLowerCase().replace(/[-_.]+/g, '-')];
-		if (!entry) {
-			missing.push(pkg);
-			continue;
-		}
-		try {
-			await access(`static/pyodide/${entry.file_name}`);
-		} catch {
-			missing.push(pkg);
-		}
+	const { rewritten } = applyCdnFallback(lockData, presentFileNames, version);
+	const missingCurated = findMissingCurated(lockData, packages);
+	if (missingCurated.length > 0) {
+		console.warn(
+			`[pyodide] curated packages missing from the lockfile (will be resolved from PyPI on demand): ${missingCurated.join(', ')}`
+		);
+	}
+	const unresolved = findUnresolvedPackages(lockData, presentFileNames);
+	if (unresolved.length > 0) {
+		console.warn(
+			`[pyodide] lock entries still unresolvable after CDN fallback: ${unresolved.join(', ')}`
+		);
 	}
 
-	if (missing.length) {
-		throw new Error(`No wheel bundled for: ${missing.join(', ')}`);
-	}
-	console.log('All listed packages are bundled');
+	await writeFile(lockPath, JSON.stringify(lockData, null, 2));
+	console.log(
+		`[pyodide] rewrote ${rewritten} non-vendored lock entries to the jsDelivr CDN (${presentFileNames.length} local files present)`
+	);
 }
 
 initNetworkProxyFromEnv();
@@ -259,5 +334,8 @@ if (process.env.USE_SLIM === 'true') {
 	await downloadPackages();
 	await copyPyodide();
 	await downloadPyPIWheels();
-	await verifyBundledWheels();
+	await finalizeLockWithCdnFallback();
+	// After downloadPackages(), whose version-mismatch cleanup removes the whole
+	// static/pyodide directory (fonts included).
+	await downloadFonts();
 }

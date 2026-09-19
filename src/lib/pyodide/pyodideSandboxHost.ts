@@ -1,9 +1,95 @@
+import {
+	findLiteralDynamicImports,
+	parseMissingModule,
+	resolveImportToPackage,
+	summarizeInstallFailure
+} from './pyodidePackages';
+
 type MessageListener = (event: MessageEvent) => void;
 type ErrorListener = (event: Event) => void;
 type QueuedMessage = { message: unknown; transfer: Transferable[] };
 
-const sandboxScript = String.raw`
+// Inline the shared pure helpers into the sandboxed script so the iframe and
+// the worker cannot drift. They are self-contained by design (see
+// pyodidePackages.ts).
+//
+// Production builds minify the imported bindings (esbuild renames them), so
+// `fn.toString()` alone would declare a mangled function name while the
+// sandbox body below still calls the original literal name. Assigning each
+// function to a `const` with its original name via the object keys (which are
+// string literals and never mangled) keeps the call sites valid in every build.
+
+// Python run to prepare matplotlib inside the sandbox: force the AGG backend,
+// register any vendored fonts, and patch show() to emit a base64 PNG.
+//
+// Exported as a constant so the source of truth for the emitted Python is
+// testable; the sandbox script itself is a string that nothing type-checks.
+//
+// `\t` escapes are intentional: the JS engine turns them into real tab
+// characters when building the array, which is what Python indentation needs.
+export const matplotlibPatchPython = [
+	'import base64',
+	'import os',
+	'from io import BytesIO',
+	'os.environ["MPLBACKEND"] = "AGG"',
+	'import matplotlib',
+	'import matplotlib.pyplot',
+	// Register vendored font files so non-Latin (e.g. CJK) labels render instead
+	// of missing-glyph boxes. matplotlib's AGG backend can only use fonts in its
+	// own FontManager -- there is no browser font fallback inside wasm. The
+	// family is appended to the existing list rather than replacing it, so Latin
+	// text keeps its default typography and matplotlib falls back per character.
+	'from matplotlib import font_manager as _fm',
+	// Register once per interpreter: runtimes are pooled per chat, and
+	// FontManager.addfont appends unconditionally, so without this guard every
+	// matplotlib run would re-parse the (multi-MB) font and add a duplicate
+	// entry. The flag is latched only when a font actually registered, so a run
+	// that happens before the download lands still retries.
+	'if not getattr(matplotlib, "_openwebui_fonts_registered", False):',
+	'\t_font_dir = "/tmp/mpl-fonts"',
+	'\t_added = []',
+	'\tif os.path.isdir(_font_dir):',
+	'\t\tfor _name in sorted(os.listdir(_font_dir)):',
+	'\t\t\t_path = os.path.join(_font_dir, _name)',
+	'\t\t\ttry:',
+	'\t\t\t\t_fm.fontManager.addfont(_path)',
+	'\t\t\t\t_added.append(_fm.FontProperties(fname=_path).get_name())',
+	'\t\t\texcept Exception:',
+	'\t\t\t\tpass',
+	'\tif _added:',
+	'\t\t_families = list(matplotlib.rcParams.get("font.family", []))',
+	'\t\tfor _family in _added:',
+	'\t\t\tif _family and _family not in _families:',
+	'\t\t\t\t_families.append(_family)',
+	'\t\tmatplotlib.rcParams["font.family"] = _families',
+	'\t\tmatplotlib.rcParams["axes.unicode_minus"] = False',
+	'\t\tmatplotlib._openwebui_fonts_registered = True',
+	'_old_show = matplotlib.pyplot.show',
+	'assert _old_show, "matplotlib.pyplot.show"',
+	'def show(*, block=None):',
+	'\tbuf = BytesIO()',
+	'\tmatplotlib.pyplot.savefig(buf, format="png")',
+	'\tbuf.seek(0)',
+	'\timg_str = base64.b64encode(buf.read()).decode("utf-8")',
+	'\tmatplotlib.pyplot.clf()',
+	'\tbuf.close()',
+	'\tprint(f"data:image/png;base64,{img_str}")',
+	'matplotlib.pyplot.show = show'
+].join('\n');
+
+const packageHelperSource = Object.entries({
+	parseMissingModule,
+	resolveImportToPackage,
+	findLiteralDynamicImports,
+	summarizeInstallFailure
+})
+	.map(([name, fn]) => `const ${name} = ${fn.toString()};`)
+	.join('\n\n');
+
+export const sandboxScript = String.raw`
 (function () {
+${packageHelperSource}
+
 	let pyodide = null;
 	let pyodideReady = null;
 	let stdout = null;
@@ -86,6 +172,37 @@ const sandboxScript = String.raw`
 		} catch {}
 	}
 
+	function tree(path) {
+		const entries = [];
+		function walk(dir) {
+			let names;
+			try {
+				names = pyodide.FS.readdir(dir).filter(function (name) {
+					return name !== '.' && name !== '..';
+				});
+			} catch {
+				return;
+			}
+			for (const name of names) {
+				const full = dir + '/' + name;
+				let stat;
+				try {
+					stat = pyodide.FS.stat(full);
+				} catch {
+					continue;
+				}
+				if (pyodide.FS.isDir(stat.mode)) {
+					entries.push({ path: full, type: 'directory', mtime: stat.mtime });
+					walk(full);
+				} else {
+					entries.push({ path: full, type: 'file', size: stat.size, mtime: stat.mtime });
+				}
+			}
+		}
+		walk(path);
+		return entries;
+	}
+
 	function clean(value) {
 		try {
 			if (value == null) return null;
@@ -106,26 +223,92 @@ const sandboxScript = String.raw`
 		}
 	}
 
+	async function installMatplotlibFonts() {
+		const urls = (self.__MATPLOTLIB_FONT_URLS__ || []).filter(Boolean);
+		if (urls.length === 0) return;
+		const dir = '/tmp/mpl-fonts';
+		ensureDir(dir);
+		for (let i = 0; i < urls.length; i++) {
+			const url = urls[i];
+			const name = url.split('/').pop().split('?')[0] || 'font-' + i;
+			const dest = dir + '/' + name;
+			try {
+				pyodide.FS.stat(dest);
+				continue;
+			} catch {
+				// Not cached in this runtime yet; fetch it below.
+			}
+			try {
+				const res = await fetch(url);
+				if (!res.ok) continue;
+				pyodide.FS.writeFile(dest, new Uint8Array(await res.arrayBuffer()));
+			} catch {
+				// Optional asset: a failed fetch must never preempt user code.
+			}
+		}
+	}
+
 	async function patchMatplotlib() {
-		await pyodide.runPythonAsync([
-			'import base64',
-			'import os',
-			'from io import BytesIO',
-			'os.environ["MPLBACKEND"] = "AGG"',
-			'import matplotlib.pyplot',
-			'_old_show = matplotlib.pyplot.show',
-			'assert _old_show, "matplotlib.pyplot.show"',
-			'def show(*, block=None):',
-			// String.raw keeps \t as-is; the sandbox's JS parser turns it into a real tab
-			'\tbuf = BytesIO()',
-			'\tmatplotlib.pyplot.savefig(buf, format="png")',
-			'\tbuf.seek(0)',
-			'\timg_str = base64.b64encode(buf.read()).decode("utf-8")',
-			'\tmatplotlib.pyplot.clf()',
-			'\tbuf.close()',
-			'\tprint(f"data:image/png;base64,{img_str}")',
-			'matplotlib.pyplot.show = show'
-		].join('\n'));
+		await pyodide.runPythonAsync(${JSON.stringify(matplotlibPatchPython)});
+	}
+
+	async function loadPackagesForCode(code) {
+		const loadErrors = [];
+		const dynamicImports = findLiteralDynamicImports(code);
+		if (dynamicImports.length > 0) {
+			const synthetic = dynamicImports
+				.map(function (name) {
+					return 'import ' + name;
+				})
+				.join('\n');
+			try {
+				await pyodide.loadPackagesFromImports(synthetic);
+			} catch (error) {
+				loadErrors.push(error && error.message ? error.message : String(error));
+			}
+		}
+		try {
+			await pyodide.loadPackagesFromImports(code, {
+				errorCallback: function (message) {
+					loadErrors.push(message);
+				}
+			});
+		} catch (error) {
+			loadErrors.push(error && error.message ? error.message : String(error));
+		}
+		return loadErrors;
+	}
+
+	async function runUserCode(id, code, loadErrors) {
+		try {
+			return await pyodide.runPythonAsync(code);
+		} catch (error) {
+			const message = error && error.message ? error.message : String(error);
+			const missing = parseMissingModule(message);
+			if (!missing) throw error;
+			const lockPackages = pyodide.lockfile ? pyodide.lockfile.packages : null;
+			const pkg = resolveImportToPackage(missing, lockPackages);
+			// Lock-listed packages resolve from the local/CDN index; anything
+			// else is a best-effort PyPI install by its import name.
+			const pkgToInstall = pkg || missing;
+			try {
+				post({ id: id, type: 'status', phase: 'packages' });
+				await pyodide.pyimport('micropip').install(pkgToInstall);
+				stdout =
+					(stdout ? stdout : '') +
+					"[open-webui] installed missing package '" +
+					pkgToInstall +
+					"' for module '" +
+					missing +
+					"' and retrying\n";
+				post({ id: id, type: 'status', phase: 'executing' });
+				return await pyodide.runPythonAsync(code);
+			} catch (installError) {
+				const detail =
+					installError && installError.message ? installError.message : String(installError);
+				throw new Error(summarizeInstallFailure(missing, pkgToInstall, detail, loadErrors));
+			}
+		}
 	}
 
 	async function execute(id, code, files) {
@@ -134,8 +317,16 @@ const sandboxScript = String.raw`
 		let result = null;
 		if (files && files.length > 0) upload(files);
 		try {
-			if (code.includes('matplotlib') && 'matplotlib' in pyodide.loadedPackages) await patchMatplotlib();
-			result = clean(await pyodide.runPythonAsync(code));
+			post({ id: id, type: 'status', phase: 'loading' });
+			const loadErrors = await loadPackagesForCode(code);
+			if (code.includes('matplotlib')) {
+				try {
+					await installMatplotlibFonts();
+					await patchMatplotlib();
+				} catch (e) {}
+			}
+			post({ id: id, type: 'status', phase: 'executing' });
+			result = clean(await runUserCode(id, code, loadErrors));
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
 		}
@@ -180,6 +371,9 @@ const sandboxScript = String.raw`
 				case 'fs:sync':
 					post({ id: id, type: data.type, success: true });
 					break;
+				case 'fs:tree':
+					post({ id: id, type: data.type, entries: tree(data.path) });
+					break;
 			}
 		} catch (error) {
 			post({ id: id, stderr: error && error.message ? error.message : String(error) });
@@ -191,7 +385,11 @@ const sandboxScript = String.raw`
 // indexURL must be absolute because about:srcdoc can't be a base URL
 const pyodideIndexURL = `${globalThis.location?.origin ?? ''}/pyodide/`;
 
-const sandboxHtml = `<!doctype html><html><head><meta charset="utf-8"><script>window.__PYODIDE_INDEX_URL__=${JSON.stringify(pyodideIndexURL)}</script></head><body><script src="${pyodideIndexURL}pyodide.js"></script><script>${sandboxScript}</script></body></html>`;
+// Fonts vendored next to the Pyodide assets (see scripts/prepare-pyodide.js).
+// Resolved against the same absolute base because about:srcdoc has no base URL.
+const matplotlibFontURLs = [`${pyodideIndexURL}fonts/NotoSansSC-Regular.otf`];
+
+export const sandboxHtml = `<!doctype html><html><head><meta charset="utf-8"><script>window.__PYODIDE_INDEX_URL__=${JSON.stringify(pyodideIndexURL)};window.__MATPLOTLIB_FONT_URLS__=${JSON.stringify(matplotlibFontURLs)}</script></head><body><script src="${pyodideIndexURL}pyodide.js"></script><script>${sandboxScript}</script></body></html>`;
 
 export class PyodideSandboxHost {
 	onmessage: MessageListener | null = null;

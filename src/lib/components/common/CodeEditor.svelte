@@ -127,6 +127,7 @@ print("${endTag}")
 			function handleMessage(event) {
 				const { id: eventId, stdout, stderr } = event.data;
 				if (eventId !== id) return; // Only handle our message
+				if (event.data?.type === 'status') return; // Progress, not a result
 				clearTimeout(timeout);
 				worker.removeEventListener('message', handleMessage);
 				worker.removeEventListener('error', handleError);

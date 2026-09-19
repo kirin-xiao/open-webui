@@ -98,9 +98,6 @@ export const adminFeedbackCount: Writable<number | null> = writable(null);
 export const toolServers = writable([]);
 export const terminalServers: Writable<any[] | null> = writable(null);
 
-// Persistent Pyodide worker for code interpreter FS
-export const pyodideWorker: Writable<Worker | null> = writable(null);
-
 export const banners: Writable<Banner[]> = writable([]);
 
 export const settings: Writable<Settings> = writable({});
@@ -356,6 +353,9 @@ type Config = {
 		enable_admin_chat_access: boolean;
 		enable_admin_analytics: boolean;
 		enable_context_compaction?: boolean;
+		context_compaction_buffer?: number;
+		context_compaction_keep_tokens?: number;
+		context_compaction_auto?: boolean;
 		enable_tool_permissions?: boolean;
 		enable_community_sharing: boolean;
 		enable_memories: boolean;

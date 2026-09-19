@@ -246,8 +246,9 @@ from open_webui.utils.middleware import (
     drain_approved_tool_calls,
     process_chat_payload,
     process_chat_response,
+    run_with_overflow_recovery,
 )
-from open_webui.utils.misc import get_response_error_detail, merge_model_params
+from open_webui.utils.misc import get_response_error_detail, merge_model_params, resolve_branch_flags
 from open_webui.utils.model_ids import strip_provider_model_prefix
 from open_webui.utils.models import (
     check_model_access,
@@ -314,6 +315,14 @@ class CORSStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
         response = await super().get_response(path, scope)
         response.headers['Access-Control-Allow-Origin'] = '*'
+        # Pyodide wheels are versioned by filename and never change in place, so
+        # they can be cached indefinitely. Core runtime files and the lockfile
+        # reuse stable names across builds, so revalidate them via ETag instead
+        # of letting a stale copy survive a Pyodide upgrade.
+        if path.endswith('.whl'):
+            response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        else:
+            response.headers['Cache-Control'] = 'no-cache'
         return response
 
 
@@ -1281,6 +1290,9 @@ async def chat_completion(
             'chat_variables': chat_variables,
             'model': model,
             'direct': model_item.get('direct', False),
+            # Carried on approval-resume payloads; falsy for every other request.
+            'compare_mode': form_data.pop('compare_mode', False) is True,
+            'is_primary_branch': form_data.pop('is_primary_branch', False) is True,
             'params': {
                 'stream_delta_chunk_size': stream_delta_chunk_size,
                 'reasoning_tags': reasoning_tags,
@@ -1652,7 +1664,14 @@ async def chat_completion(
             if await drain_approved_tool_calls(request, form_data, user, model, metadata):
                 return {'status': True, 'chat_id': metadata.get('chat_id'), 'paused': True}
 
-            response = await chat_completion_handler(request, form_data, user)
+            response = await run_with_overflow_recovery(
+                request,
+                form_data,
+                user,
+                model,
+                metadata,
+                lambda: chat_completion_handler(request, form_data, user),
+            )
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion
@@ -1803,18 +1822,30 @@ async def chat_completion(
         subagent_results = []
         is_internal = getattr(request.state, 'internal', False) is True
         chat_id = metadata['chat_id']
+        # Compare mode = more than one concurrent branch. Memory writers and
+        # chat-level background tasks are shared resources, so branches need to
+        # know whether they are part of a fan-out (#30238).
+        # A resumed tool-approval branch arrives as a single-entry `message_ids`
+        # but carries its compare context on the payload; trust that over size.
+        resumed = metadata.get('compare_mode') is True
+        is_compare, primary_branch_id = resolve_branch_flags(message_ids, metadata)
 
-        for idx, entry in enumerate(message_ids):
+        for entry in message_ids:
             target_model_id = entry['model_id']
             assistant_message_id = entry['message_id']
             if not assistant_message_id:
                 continue
 
             # Per-model metadata: own message_id + model
+            is_primary = (
+                metadata.get('is_primary_branch') is True if resumed else assistant_message_id == primary_branch_id
+            )
             per_model_metadata = {
                 **metadata,
                 'message_id': assistant_message_id,
                 'task_id': str(uuid4()),
+                'compare_mode': is_compare,
+                'is_primary_branch': is_primary,
             }
 
             # Per-model form_data: own model
@@ -1827,8 +1858,10 @@ async def chat_completion(
             # Resolve the model object for this specific model
             resolved_model = request.app.state.MODELS.get(target_model_id, model)
 
-            # Only the first model runs chat-level background tasks;
-            # subsequent models only run follow-ups.
+            # Only the primary branch runs chat-level background tasks;
+            # subsequent models only run follow-ups. Keying off `is_primary`
+            # (not `idx == 0`) keeps task ownership aligned with the branch that
+            # owns the memory review when entry 0 has no message id.
             process = process_chat(
                 request,
                 model_form_data,
@@ -1836,7 +1869,7 @@ async def chat_completion(
                 per_model_metadata,
                 resolved_model,
                 tasks
-                if idx == 0
+                if is_primary
                 else {
                     k: v for k, v in (tasks or {}).items() if k not in (TASKS.TITLE_GENERATION, TASKS.TAGS_GENERATION)
                 }
@@ -2268,6 +2301,9 @@ async def get_app_config(request: Request):
         'automations.enable',
         'notes.enable',
         'chat.context_compaction.enable',
+        'chat.context_compaction.buffer',
+        'chat.context_compaction.keep_tokens',
+        'chat.context_compaction.auto',
         'chat.tool_permissions.enable',
         'web.search.enable',
         'web.search.confirmation.enable',
@@ -2356,6 +2392,9 @@ async def get_app_config(request: Request):
                     'enable_automations': config.get('automations.enable'),
                     'enable_notes': config.get('notes.enable'),
                     'enable_context_compaction': config.get('chat.context_compaction.enable'),
+                    'context_compaction_buffer': config.get('chat.context_compaction.buffer'),
+                    'context_compaction_keep_tokens': config.get('chat.context_compaction.keep_tokens'),
+                    'context_compaction_auto': config.get('chat.context_compaction.auto'),
                     'enable_tool_permissions': config.get('chat.tool_permissions.enable'),
                     'enable_web_search': config.get('web.search.enable'),
                     'enable_web_search_confirmation': config.get('web.search.confirmation.enable'),

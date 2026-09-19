@@ -4,8 +4,8 @@
 
 <script lang="ts">
 	import { getContext, onMount, onDestroy, tick } from 'svelte';
-	import { pyodideWorker } from '$lib/stores';
-	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { getPyodideRuntime } from '$lib/pyodide/pyodideRuntimePool';
+	import { flushPyodideFiles } from '$lib/pyodide/pyodideFileSync';
 	import type { FileEntry } from '$lib/apis/terminal';
 
 	import FileNavToolbar from './FileNav/FileNavToolbar.svelte';
@@ -19,6 +19,7 @@
 	const i18n = getContext('i18n');
 
 	export let overlay = false;
+	export let chatId: string | null = '';
 
 	// ── State ─────────────────────────────────────────────────────────────
 	let currentPath = savedPyodidePath;
@@ -97,35 +98,69 @@
 
 	// ── Worker management ─────────────────────────────────────────────────
 
-	function ensureWorker(): Worker {
-		let worker = $pyodideWorker;
-		if (!worker) {
-			worker = createPyodideWorker();
-			pyodideWorker.set(worker);
-		}
-		return worker;
-	}
-
 	function sendWorkerMessage(msg: any): Promise<any> {
-		const worker = ensureWorker();
+		const runtime = getPyodideRuntime(chatId);
+		const worker = runtime.worker;
 		const id = `fs-${++_reqId}`;
-		return new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				worker.removeEventListener('message', handler);
-				reject('Timeout');
-			}, 30000);
 
-			function handler(event: MessageEvent) {
-				if (event.data?.id !== id) return;
-				clearTimeout(timeout);
-				worker.removeEventListener('message', handler);
-				resolve(event.data);
-			}
+		// Wait for hydration so a pre-hydration list/read is not empty and a
+		// write cannot land before persisted files are restored.
+		return runtime.ready.then(
+			() =>
+				new Promise((resolve, reject) => {
+					runtime.acquire();
+					let released = false;
+					const release = () => {
+						if (released) return;
+						released = true;
+						runtime.release();
+					};
 
-			worker.addEventListener('message', handler);
-			worker.postMessage({ ...msg, id });
-		});
+					const timeout = setTimeout(() => {
+						worker.removeEventListener('message', handler);
+						release();
+						reject('Timeout');
+					}, 30000);
+
+					function handler(event: MessageEvent) {
+						if (event.data?.id !== id) return;
+						if (event.data?.type === 'status') return;
+						clearTimeout(timeout);
+						worker.removeEventListener('message', handler);
+						release();
+						resolve(event.data);
+					}
+
+					try {
+						worker.addEventListener('message', handler);
+						worker.postMessage({ ...msg, id });
+					} catch (e) {
+						clearTimeout(timeout);
+						worker.removeEventListener('message', handler);
+						release();
+						reject(e);
+					}
+				})
+		);
 	}
+
+	/**
+	 * Run a FS mutation and persist the result. Hydration already ran, so a
+	 * snapshot exists and the flush records exactly this runtime's changes.
+	 * The runtime is held busy across both steps so LRU eviction cannot
+	 * terminate it (losing the mutation) between the write and the flush.
+	 */
+	const mutateAndFlush = async (msg: Record<string, unknown>) => {
+		const runtime = getPyodideRuntime(chatId);
+		runtime.acquire();
+		try {
+			const res = await sendWorkerMessage(msg);
+			await flushPyodideFiles(runtime);
+			return res;
+		} finally {
+			runtime.release();
+		}
+	};
 
 	// ── Breadcrumbs ───────────────────────────────────────────────────────
 
@@ -236,7 +271,7 @@
 
 	const doDelete = async () => {
 		try {
-			await sendWorkerMessage({ type: 'fs:delete', path: deletePath });
+			await mutateAndFlush({ type: 'fs:delete', path: deletePath });
 			if (selectedFile === deletePath) {
 				selectedFile = null;
 				clearPreview();
@@ -261,7 +296,7 @@
 		if (!name) return;
 		const folderPath = `${currentPath}${name}`.replace(/\/$/, '');
 		try {
-			await sendWorkerMessage({ type: 'fs:mkdir', path: folderPath });
+			await mutateAndFlush({ type: 'fs:mkdir', path: folderPath });
 			await loadDir(currentPath);
 		} catch (e) {
 			console.error('Failed to create folder:', e);
@@ -281,7 +316,7 @@
 		newFileName = '';
 		if (!name) return;
 		try {
-			await sendWorkerMessage({
+			await mutateAndFlush({
 				type: 'fs:upload',
 				files: [{ name, data: new ArrayBuffer(0) }],
 				dir: currentPath.replace(/\/$/, '') || '/'
@@ -298,7 +333,7 @@
 			payloads.push({ name: file.name, data: await file.arrayBuffer() });
 		}
 		try {
-			await sendWorkerMessage({
+			await mutateAndFlush({
 				type: 'fs:upload',
 				files: payloads,
 				dir: currentPath.replace(/\/$/, '') || '/'
@@ -338,7 +373,6 @@
 	};
 
 	onMount(() => {
-		ensureWorker();
 		loadDir(currentPath);
 		window.addEventListener('pyodide:files', onFilesChanged);
 	});

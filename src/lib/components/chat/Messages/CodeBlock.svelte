@@ -1,12 +1,13 @@
 <script lang="ts">
 	import hljs from 'highlight.js';
 	import { toast } from 'svelte-sonner';
-	import { getContext, onMount, tick, onDestroy } from 'svelte';
+	import { getContext, onMount, tick } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { config, pyodideWorker as pyodideWorkerStore } from '$lib/stores';
+	import { config } from '$lib/stores';
 
-	import { createPyodideWorker } from '$lib/pyodide/createPyodideWorker';
+	import { getPyodideRuntime } from '$lib/pyodide/pyodideRuntimePool';
+	import { flushPyodideFiles } from '$lib/pyodide/pyodideFileSync';
 	import { executeCode } from '$lib/apis/utils';
 	import {
 		copyToClipboard,
@@ -33,6 +34,7 @@
 
 	export let id = '';
 	export let edit = true;
+	export let chatId = '';
 
 	export let onSave = (e) => {};
 	export let onUpdate = (e, codeBlockId = '') => {};
@@ -51,8 +53,6 @@
 	export let className = '';
 	export let editorClassName = '';
 	export let stickyButtonsClassName = 'top-0';
-
-	let localPyodideWorker = null;
 
 	let _code = '';
 	$: _code = code;
@@ -219,63 +219,110 @@
 		}
 	};
 
+	const LOAD_TIMEOUT_MS = 300000;
+	const EXECUTION_TIMEOUT_MS = 60000;
+
 	const executePythonAsWorker = async (code) => {
-		let packages = [
-			/\bimport\s+requests\b|\bfrom\s+requests\b/.test(code) ? 'requests' : null,
-			/\bimport\s+bs4\b|\bfrom\s+bs4\b/.test(code) ? 'beautifulsoup4' : null,
-			/\bimport\s+numpy\b|\bfrom\s+numpy\b/.test(code) ? 'numpy' : null,
-			/\bimport\s+pandas\b|\bfrom\s+pandas\b/.test(code) ? 'pandas' : null,
-			/\bimport\s+matplotlib\b|\bfrom\s+matplotlib\b/.test(code) ? 'matplotlib' : null,
-			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
-			/\bimport\s+sklearn\b|\bfrom\s+sklearn\b/.test(code) ? 'scikit-learn' : null,
-			/\bimport\s+scipy\b|\bfrom\s+scipy\b/.test(code) ? 'scipy' : null,
-			/\bimport\s+re\b|\bfrom\s+re\b/.test(code) ? 'regex' : null,
-			/\bimport\s+seaborn\b|\bfrom\s+seaborn\b/.test(code) ? 'seaborn' : null,
-			/\bimport\s+sympy\b|\bfrom\s+sympy\b/.test(code) ? 'sympy' : null,
-			/\bimport\s+tiktoken\b|\bfrom\s+tiktoken\b/.test(code) ? 'tiktoken' : null,
-			/\bimport\s+pytz\b|\bfrom\s+pytz\b/.test(code) ? 'pytz' : null,
-			/\bimport\s+openpyxl\b|\bfrom\s+openpyxl\b/.test(code) ? 'openpyxl' : null,
-			/\.(read|to)_excel\(|\.Excel(Writer|File)\(/.test(code) ? 'openpyxl' : null,
-			/\bimport\s+pptx\b|\bfrom\s+pptx\b/.test(code) ? 'python-pptx' : null,
-			/\bimport\s+docx\b|\bfrom\s+docx\b/.test(code) ? 'python-docx' : null
-		].filter(Boolean);
+		// Packages are resolved by the worker from `pyodide-lock.json` via
+		// loadPackagesFromImports, so no hardcoded import->package list is needed.
 
-		console.log(packages);
+		// Each chat gets its own interpreter so module state cannot leak across
+		// chats. The runtime is pooled and reused within the chat, so files
+		// written here remain visible in PyodideFileNav.
+		const runtime = getPyodideRuntime(chatId);
+		const worker = runtime.worker;
 
-		// Reuse the shared Pyodide worker when code interpreter is active,
-		// so files written here are immediately visible in PyodideFileNav.
-		// Otherwise fall back to a throwaway worker.
-		const sharedWorker = $pyodideWorkerStore;
-		const isShared = !!sharedWorker;
-		const worker = sharedWorker ?? createPyodideWorker();
+		// Wait for persisted files before the first run. `ready` never rejects
+		// or hangs.
+		await runtime.ready;
 
-		if (!isShared) {
-			localPyodideWorker = worker;
-		}
+		runtime.acquire();
 
-		worker.postMessage({
-			id: id,
-			code: code,
-			packages: packages
-		});
+		let settled = false;
+		let loadTimeoutId = null;
+		let executionTimeoutId = null;
 
-		const timeoutId = setTimeout(() => {
-			if (executing) {
-				executing = false;
-				stderr = 'Execution Time Limit Exceeded';
-				if (!isShared) {
-					worker.terminate();
-					localPyodideWorker = null;
-				}
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			worker.removeEventListener('message', handler);
+			worker.removeEventListener('error', onError);
+			runtime.release();
+
+			if (error) {
+				stderr = error;
 			}
-		}, 60000);
+
+			executing = false;
+		};
+
+		// Persist files written by the run, then release. Flushing before release
+		// keeps the runtime from being LRU-evicted mid-flush.
+		let completing = false;
+		const complete = async () => {
+			if (settled || completing) return;
+			completing = true;
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			await flushPyodideFiles(runtime);
+			finish();
+			// Signal PyodideFileNav to auto-refresh after execution
+			window.dispatchEvent(new Event('pyodide:files'));
+		};
+
+		// A timed-out run cannot be interrupted in-process, so drop the exact
+		// interpreter that hung (not by chat id, which could now resolve to a
+		// different runtime). Files flushed by earlier runs remain in IndexedDB;
+		// a fresh interpreter hydrates them on the next run.
+		const terminateWorker = () => {
+			runtime.reset();
+		};
+
+		// Loading (Pyodide init + package downloads) gets its own generous budget
+		// so cold-cache installs are not misreported as an execution timeout. The
+		// execution limit is only started once user code actually begins to run.
+		const armLoadTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = null;
+			loadTimeoutId = setTimeout(() => {
+				finish('Package Loading Time Limit Exceeded');
+				terminateWorker();
+			}, LOAD_TIMEOUT_MS);
+		};
+
+		const armExecutionTimeout = () => {
+			clearTimeout(loadTimeoutId);
+			loadTimeoutId = null;
+			clearTimeout(executionTimeoutId);
+			executionTimeoutId = setTimeout(() => {
+				finish('Execution Time Limit Exceeded');
+				terminateWorker();
+			}, EXECUTION_TIMEOUT_MS);
+		};
 
 		const handler = (event) => {
 			// Ignore messages from other requests on the shared worker
 			if (event.data?.id !== id) return;
 
-			console.log('pyodideWorker.onmessage', event);
 			const { id: _id, ...data } = event.data;
+
+			// Status/progress messages are not completion. `executing` starts the
+			// execution limit; `loading`/`packages` (e.g. an install-retry) fall
+			// back to the load budget.
+			if (data.type === 'status') {
+				if (data.phase === 'executing') {
+					armExecutionTimeout();
+				} else {
+					armLoadTimeout();
+				}
+				return;
+			}
+
+			console.log('pyodideWorker.onmessage', event);
 
 			console.log(_id, data);
 
@@ -340,22 +387,31 @@
 			data['stderr'] && (stderr = data['stderr']);
 			data['result'] && (result = data['result']);
 
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
+			complete();
+		};
 
-			// Signal PyodideFileNav to auto-refresh after execution
-			window.dispatchEvent(new Event('pyodide:files'));
+		const onError = (event) => {
+			console.log('pyodideWorker.onerror', event);
+			finish();
 		};
 
 		worker.addEventListener('message', handler);
+		worker.addEventListener('error', onError);
 
-		worker.onerror = (event) => {
-			console.log('pyodideWorker.onerror', event);
-			clearTimeout(timeoutId);
-			worker.removeEventListener('message', handler);
-			executing = false;
-		};
+		try {
+			worker.postMessage({
+				id: id,
+				code: code
+			});
+		} catch (e) {
+			// A throwing postMessage (e.g. DataCloneError) would otherwise skip
+			// finish() and pin the runtime's busy counter forever.
+			console.error('Failed to post execution to Pyodide runtime:', e);
+			finish(e instanceof Error ? e.message : String(e));
+			return;
+		}
+
+		armLoadTimeout();
 	};
 
 	let mermaid = null;
@@ -424,13 +480,6 @@
 	onMount(async () => {
 		if (token) {
 			onUpdate(token, id);
-		}
-	});
-
-	onDestroy(() => {
-		if (localPyodideWorker) {
-			localPyodideWorker.terminate();
-			localPyodideWorker = null;
 		}
 	});
 </script>
