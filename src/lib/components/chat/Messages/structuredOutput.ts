@@ -97,6 +97,9 @@ const OPENAI_TOOL_NAMES: Record<string, string> = {
 	computer_call: 'Computer Use'
 };
 
+// Canonical sub-agent tool name plus the aliases persisted by older chats.
+const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'delegate_task', 'task']);
+
 function getTextFromParts(parts: OutputContentPart[] = []): string {
 	return parts
 		.map((part) => {
@@ -199,15 +202,21 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 	const isDone = !!resultItem || status === 'failed' || status === 'incomplete';
 	const isExecuting = !isDone && status === 'completed';
 	let name = item.name ?? '';
-	if (name === 'delegate_task') {
+	if (SUBAGENT_TOOL_NAMES.has(name)) {
 		try {
 			const args =
 				typeof item.arguments === 'string'
 					? JSON.parse(item.arguments || '{}')
 					: (item.arguments ?? {});
-			const task = typeof args.task === 'string' && args.task ? args.task : '?';
-			const label = args.background ? 'Background sub-agent' : 'Sub-agent';
-			name = `${label}: "${task.length > 60 ? `${task.slice(0, 60)}...` : task}"`;
+			// `description` is the current argument; `task` is the persisted old shape.
+			const description =
+				typeof args.description === 'string' && args.description
+					? args.description
+					: typeof args.task === 'string' && args.task
+						? args.task
+						: '?';
+			const label = args.background === true ? 'Background sub-agent' : 'Sub-agent';
+			name = `${label}: "${description.length > 60 ? `${description.slice(0, 60)}...` : description}"`;
 		} catch {
 			name = 'Sub-agent';
 		}
@@ -261,7 +270,7 @@ function buildCodeInterpreterToken(item: OutputItem, isLastItem: boolean) {
 	const lang = item.lang ?? 'python';
 
 	return {
-		summary: isDone ? 'Analyzed' : 'Analyzing...',
+		summary: isDone ? 'Ran Python code' : 'Running Python code…',
 		text: code ? `\`\`\`${lang}\n${code}\n\`\`\`` : '',
 		attributes: {
 			type: 'code_interpreter',

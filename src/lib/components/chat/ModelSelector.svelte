@@ -13,6 +13,7 @@
 	export let disabled = false;
 
 	export let showSetDefault = true;
+	export let showModelIcon = false;
 	export let triggerClassName = 'text-lg';
 	export let className = undefined;
 	export let placement: 'top' | 'bottom' | 'auto' = 'bottom';
@@ -79,6 +80,7 @@
 					{placement}
 					{align}
 					{showSetDefault}
+					{showModelIcon}
 					onSetDefault={saveDefaultModel}
 					multipleEnabled={$user?.role === 'admin' ||
 						($user?.permissions?.chat?.multiple_models ?? true)}

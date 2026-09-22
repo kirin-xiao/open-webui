@@ -113,9 +113,9 @@
 						{/if}
 					{:else if attributes?.type === 'code_interpreter'}
 						{#if attributes?.done === 'true' || messageDone}
-							{$i18n.t('Analyzed')}
+							{$i18n.t('Ran Python code')}
 						{:else}
-							{$i18n.t('Analyzing...')}
+							{$i18n.t('Running Python code…')}
 						{/if}
 					{:else}
 						{title}

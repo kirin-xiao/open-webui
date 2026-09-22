@@ -15,6 +15,7 @@
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 
 	import { settings } from '$lib/stores';
+	import { formatToolLabel, getToolGroupSummary, isKeyLabel } from '$lib/utils/toolLabels.js';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
@@ -117,8 +118,6 @@
 				(t?.attributes?.done === 'true' && isToolResultError(decode(t?.text ?? ''))))
 	);
 
-	$: codeInterpreterCount = tokens.filter((t) => t?.attributes?.type === 'code_interpreter').length;
-
 	// Collect all embeds from tool_calls tokens
 	$: allEmbeds = (() => {
 		if (!allowEmbeds) return [];
@@ -143,38 +142,30 @@
 		return result;
 	})();
 
+	$: summaryParts = getToolGroupSummary(
+		tokens.map((t) =>
+			t?.attributes?.type === 'tool_calls'
+				? { attributes: { ...t.attributes, arguments: decode(t.attributes?.arguments ?? '') } }
+				: t
+		),
+		hasActiveToolCalls
+	);
+
 	$: summaryText = (() => {
-		const parts = [];
-
-		if (toolCallCount > 0) {
-			// Group by tool name and show counts
-			const nameCounts: Record<string, number> = {};
-			tokens
-				.filter((t) => t?.attributes?.type === 'tool_calls')
-				.forEach((t) => {
-					const name = t?.attributes?.name ?? 'tool';
-					nameCounts[name] = (nameCounts[name] || 0) + 1;
-				});
-
-			const toolParts = Object.entries(nameCounts).map(([name, count]) =>
-				count > 1 ? `${count} ${name}` : name
-			);
-			parts.push(...toolParts);
-		}
-
-		if (codeInterpreterCount > 0) {
-			if (codeInterpreterCount === 1) {
-				parts.push($i18n.t('Ran {{COUNT}} analysis', { COUNT: codeInterpreterCount }));
-			} else {
-				parts.push($i18n.t('Ran {{COUNT}} analyses', { COUNT: codeInterpreterCount }));
-			}
-		}
-
-		const detail = parts.join(', ');
-		return detail;
+		const rendered = summaryParts.map((part) => formatToolLabel(part, $i18n)).join(', ');
+		// Capitalise the first phrase only when it is a generated label. A raw tool
+		// name (e.g. `mcp_tool`) keeps its original casing.
+		if (!rendered || !isKeyLabel(summaryParts[0])) return rendered;
+		return rendered.charAt(0).toUpperCase() + rendered.slice(1);
 	})();
 
-	$: prefixText = hasActiveToolCalls ? $i18n.t('Exploring') : $i18n.t('Explored');
+	// Fall back to the generic prefix only when no part describes what happened
+	// (e.g. a group made up solely of reasoning tokens).
+	$: prefixText = summaryText
+		? ''
+		: hasActiveToolCalls
+			? $i18n.t('Exploring')
+			: $i18n.t('Explored');
 </script>
 
 <div {id} class="w-full min-w-0">
@@ -222,12 +213,17 @@
 				{/if}
 
 				<!-- Summary text -->
-				<div class="flex-1 line-clamp-1">
-					<span class="text-gray-600 dark:text-gray-300 {hasActiveToolCalls ? 'shimmer' : ''}"
-						>{prefixText}</span
-					>
+				<!-- `truncate`, not `line-clamp-1`: a summary can be a single unbroken token
+				     (an unknown/MCP tool name), which clamps without an ellipsis. -->
+				<div class="flex-1 min-w-0 truncate">
 					{#if summaryText}
-						<span class="text-gray-400 dark:text-gray-500">{summaryText}</span>
+						<span class="text-gray-600 dark:text-gray-300 {hasActiveToolCalls ? 'shimmer' : ''}"
+							>{summaryText}</span
+						>
+					{:else}
+						<span class="text-gray-600 dark:text-gray-300 {hasActiveToolCalls ? 'shimmer' : ''}"
+							>{prefixText}</span
+						>
 					{/if}
 				</div>
 

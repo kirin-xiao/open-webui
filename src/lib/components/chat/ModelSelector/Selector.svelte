@@ -40,6 +40,7 @@
 		resolveLocalizedModelName
 	} from '$lib/utils/localizedContent';
 	import { getModels } from '$lib/apis';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import Check from '$lib/components/icons/Check.svelte';
@@ -81,6 +82,7 @@
 	export let placement: 'top' | 'bottom' | 'auto' = 'bottom';
 	export let align: 'start' | 'end' = 'start';
 	export let showSetDefault = false;
+	export let showModelIcon = false;
 	export let onSetDefault: () => Promise<void> | void = () => {};
 
 	export let pinModelHandler: (modelId: string) => void = () => {};
@@ -184,7 +186,7 @@
 
 	let tags = [];
 
-	let selectedModel = '';
+	let selectedModel: (typeof items)[number] | '' = '';
 	$: selectedValues = values ?? (value ? [value] : []);
 	$: primaryValue = selectedValues[0] ?? value ?? '';
 	$: selectedModel = items.find((item) => item.value === primaryValue) ?? '';
@@ -933,6 +935,21 @@
 				);
 			}}
 		>
+			{#if showModelIcon && selectedModel && selectedModel.model?.id}
+				<img
+					src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${selectedModel.model.id}&lang=${$i18n.language}`}
+					alt=""
+					aria-hidden="true"
+					class="mr-1.5 size-4 shrink-0 self-center rounded-full"
+					loading="lazy"
+					on:error={(e) => {
+						// LICENSE covers this Open WebUI fallback logo.
+						// Do not alter, remove, obscure, or replace it except as LICENSE permits:
+						// https://docs.openwebui.com/license.
+						e.currentTarget.src = '/favicon.png';
+					}}
+				/>
+			{/if}
 			<span class="min-w-0 flex-1 truncate">{triggerLabel}</span>
 			<ChevronDown className="ml-1 size-2.5 shrink-0 self-center" strokeWidth="2.5" />
 		</div>

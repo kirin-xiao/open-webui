@@ -18,7 +18,14 @@
 	import XMark from '../icons/XMark.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
+	import ToolOutputDisplay from '../chat/Messages/ToolOutputDisplay.svelte';
 	import { settings } from '$lib/stores';
+	import {
+		formatToolArguments,
+		formatToolLabel,
+		getToolLabel,
+		parseToolArguments
+	} from '$lib/utils/toolLabels.js';
 
 	export let id: string = '';
 	export let attributes: {
@@ -41,10 +48,6 @@
 	export let resolving = false;
 	export let onResolve: (approved: boolean) => void = () => {};
 
-	const RESULT_PREVIEW_LIMIT = 10000;
-	let expandedResult = false;
-
-	$: if (!open) expandedResult = false;
 	export let buttonClassName =
 		'py-1 text-[0.9375rem] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition';
 
@@ -157,7 +160,18 @@
 	$: isError = attributes?.status === 'failed' || (isDone && isToolResultError(result));
 
 	$: parsedArgs = parseArguments(args);
-	$: parsedResult = parseJSONString(result);
+	// Argument rendering is name-dependent (`execute_code` prints a code block,
+	// `ask_user` prints question/option blocks), so derive kind-tagged rows from the
+	// same parsed arguments the Input section gates on.
+	$: argumentRows = formatToolArguments(attributes?.name ?? '', parsedArgs);
+
+	// Labels must describe the call even when the card is collapsed, so parse the raw
+	// arguments independently of the `args` gate above.
+	$: labelArgs = parseToolArguments(decode(attributes?.arguments ?? ''));
+	$: toolLabelText = (() => {
+		const { active, done } = getToolLabel(attributes?.name ?? '', labelArgs);
+		return formatToolLabel(isDone ? done : active, $i18n);
+	})();
 
 	const toggleOpen = () => {
 		open = !open;
@@ -231,25 +245,26 @@
 				{/if}
 
 				<!-- Label -->
-				<div class="flex-1 min-w-0 line-clamp-1">
-					<!-- Short label (below md) -->
-					<span class="@md:hidden text-black dark:text-white">{attributes.name}</span>
-					<!-- Full label (md and above) -->
-					<span class="hidden @md:inline font-normal">
-						{#if isRejected}
+				<!-- `truncate`, not `line-clamp-1`: labels like `Read example.com/path` have
+				     their only break opportunity after the leading word, so wrapping would
+				     strand the host on a clamped-away second line and render as `Read...`. -->
+				<div class="flex-1 min-w-0 truncate">
+					{#if isRejected}
+						<span class="text-black dark:text-white">
 							{$i18n.t('Denied {{NAME}}', { NAME: attributes.name })}
-						{:else if isDone}
-							{$i18n.t('View Result from {{NAME}}', { NAME: attributes.name })}
-						{:else if needsInput}
-							{$i18n.t('Input needed')}
-						{:else if needsApproval}
+						</span>
+					{:else if needsInput}
+						<span class="text-black dark:text-white">{$i18n.t('Input needed')}</span>
+					{:else if needsApproval}
+						<span class="text-black dark:text-white">
 							{$i18n.t('Allow {{NAME}}?', { NAME: attributes.name })}
-						{:else if isPreparing}
-							{$i18n.t('Preparing {{NAME}}...', { NAME: attributes.name })}
-						{:else}
-							{$i18n.t('Executing {{NAME}}...', { NAME: attributes.name })}
-						{/if}
-					</span>
+						</span>
+					{:else}
+						<!-- Short label (below md) -->
+						<span class="@md:hidden text-black dark:text-white">{toolLabelText}</span>
+						<!-- Full label (md and above) -->
+						<span class="hidden @md:inline font-normal">{toolLabelText}</span>
+					{/if}
 				</div>
 
 				{#if needsApproval && !isAskUser}
@@ -298,17 +313,80 @@
 								{$i18n.t('Input')}
 							</div>
 
-							{#if parsedArgs}
-								<div class="px-1 space-y-0.5">
-									{#each Object.entries(parsedArgs) as [key, value]}
-										<div class="flex gap-2 text-xs py-0.5">
-											<span class="font-normal text-gray-600 dark:text-gray-400 shrink-0"
-												>{key}</span
-											>
-											<span class="text-gray-800 dark:text-gray-200 break-all"
-												>{typeof value === 'object' ? JSON.stringify(value) : value}</span
-											>
-										</div>
+							{#if argumentRows}
+								<div class="px-1 space-y-1.5">
+									{#each argumentRows as row}
+										{#if row.kind === 'scalar'}
+											<div class="flex gap-2 text-xs py-0.5">
+												<span class="font-normal text-gray-600 dark:text-gray-400 shrink-0"
+													>{row.key}</span
+												>
+												<span class="text-gray-800 dark:text-gray-200 break-all">{row.text}</span>
+											</div>
+										{:else}
+											<div class="space-y-1">
+												<div class="text-[0.6875rem] text-gray-500 dark:text-gray-400">
+													{#if row.kind === 'code' && row.lang}
+														{row.lang}
+													{:else}
+														{row.key}
+													{/if}
+												</div>
+												{#if row.kind === 'text'}
+													<pre
+														class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">{row.text}</pre>
+												{:else if row.kind === 'code'}
+													<div class="tool-call-body w-full max-w-none!">
+														<pre
+															class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono bg-gray-50 dark:bg-gray-900 rounded-lg p-2">{row.text}</pre>
+													</div>
+												{:else if row.kind === 'json'}
+													<pre
+														class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre font-mono bg-gray-50 dark:bg-gray-900 rounded-lg p-2 overflow-x-auto">{row.text}</pre>
+												{:else if row.kind === 'questions'}
+													<div class="space-y-2">
+														{#each row.questions ?? [] as question}
+															<div
+																class="space-y-0.5 border-l-2 border-gray-100 pl-2 dark:border-gray-850/50"
+															>
+																{#if question.header}
+																	<div class="text-xs font-medium text-gray-800 dark:text-gray-200">
+																		{question.header}
+																	</div>
+																{/if}
+																{#if question.question}
+																	<div class="text-xs text-gray-600 dark:text-gray-300">
+																		{question.question}
+																	</div>
+																{/if}
+																{#each question.options as option}
+																	<div class="flex gap-2 text-xs py-0.5">
+																		<span
+																			class="shrink-0 font-normal text-gray-700 dark:text-gray-300"
+																			>{option.label}</span
+																		>
+																		{#if option.description}
+																			<span class="text-gray-500 dark:text-gray-400"
+																				>{option.description}</span
+																			>
+																		{/if}
+																	</div>
+																{/each}
+																{#if question.allowOther}
+																	<div class="text-xs text-gray-400 dark:text-gray-500">
+																		{$i18n.t('Other')}
+																	</div>
+																{/if}
+															</div>
+														{/each}
+													</div>
+												{:else}
+													<div class="text-xs text-gray-500 dark:text-gray-400 break-all">
+														{row.text}
+													</div>
+												{/if}
+											</div>
+										{/if}
 									{/each}
 								</div>
 							{:else}
@@ -331,33 +409,12 @@
 								{$i18n.t('Output')}
 							</div>
 							<div class="w-full max-w-none!">
-								{#if typeof parsedResult === 'object' && parsedResult !== null}
-									<pre
-										class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre font-mono bg-gray-50 dark:bg-gray-900 rounded-lg p-2 overflow-x-auto">{JSON.stringify(
-											parsedResult,
-											null,
-											2
-										)}</pre>
-								{:else}
-									{@const resultStr = String(parsedResult)}
-									{@const isTruncated = resultStr.length > RESULT_PREVIEW_LIMIT && !expandedResult}
-									<pre
-										class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">{isTruncated
-											? resultStr.slice(0, RESULT_PREVIEW_LIMIT)
-											: resultStr}</pre>
-									{#if isTruncated}
-										<button
-											class="mt-1 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition"
-											on:click|stopPropagation={() => {
-												expandedResult = true;
-											}}
-										>
-											{$i18n.t('Show all ({{COUNT}} characters)', {
-												COUNT: resultStr.length.toLocaleString()
-											})}
-										</button>
-									{/if}
-								{/if}
+								<ToolOutputDisplay
+									id={`${componentId}-tool-output`}
+									name={attributes?.name ?? ''}
+									{result}
+									args={parsedArgs}
+								/>
 							</div>
 						</div>
 					{/if}

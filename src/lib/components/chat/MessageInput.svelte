@@ -61,6 +61,7 @@
 		getWeekday,
 		isRasterImageContentType
 	} from '$lib/utils';
+	import { getMessageCheckpoint } from '$lib/utils/contextCompaction';
 	import { uploadFile } from '$lib/apis/files';
 	import { getCwd, uploadNewFileToTerminal } from '$lib/apis/terminal';
 	import { generateAutoCompletion } from '$lib/apis';
@@ -140,6 +141,7 @@
 	export let forkHandler: Function = () => {};
 	export let chatId = '';
 	export let contextUsage = null;
+	export let contextUsageSource: string | null = null;
 	export let contextCompactionEnabled = false;
 	export let embedded = false;
 
@@ -489,9 +491,9 @@
 		let summary = '';
 		let startIdx = 0;
 		for (let idx = 0; idx < messages.length; idx += 1) {
-			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
-			if (typeof value === 'string' && value.trim()) {
-				summary = value;
+			const checkpoint = getMessageCheckpoint(messages[idx]);
+			if (checkpoint) {
+				summary = checkpoint.summary;
 				startIdx = idx;
 			}
 		}
@@ -546,6 +548,11 @@
 			: `${contextTokens} ${$i18n.t('tokens')}`
 		: $i18n.t('unknown');
 	$: contextBarPercent = contextHasThreshold ? Math.min(contextPercent, 100) : 0;
+	// Whether the ring numbers come from the server `context_usage` payload or the
+	// mirrored local fallback (shown before the chat payload has loaded).
+	$: contextBudgetSource = statusContextUsage
+		? (contextUsageSource ?? (contextUsage ? 'server' : 'estimated'))
+		: null;
 
 	const getCommand = () => {
 		const chatInput = document.getElementById('chat-input');
@@ -1471,6 +1478,7 @@
 					hasChatContent: hasChatContent,
 					temporaryEnabled: () => $temporaryChatEnabled === true,
 					contextUsage: () => statusContextUsage,
+					contextSource: () => contextBudgetSource,
 					onCompact: compactHandler,
 					onStatus: statusHandler,
 					onFork: forkHandler,
@@ -1851,6 +1859,14 @@
 													class="h-full rounded-full bg-gray-300 dark:bg-white/20"
 													style={`width: ${contextBarPercent}%`}
 												></div>
+											</div>
+										{/if}
+										{#if contextBudgetSource}
+											<div class="mt-0.5 text-[0.625rem] text-gray-400 dark:text-gray-600">
+												{$i18n.t('Budget source')}:
+												{contextBudgetSource === 'server'
+													? $i18n.t('Server')
+													: $i18n.t('Estimated')}
 											</div>
 										{/if}
 									</div>
@@ -2578,6 +2594,7 @@
 											bind:this={modelSelector}
 											bind:selectedModels
 											showSetDefault={!history?.currentId}
+											showModelIcon
 											placement="auto"
 											align="end"
 											triggerClassName="items-center gap-1.5 rounded-lg pl-2 pr-1.5 py-1 text-[0.8125rem] font-normal text-gray-600 transition-colors duration-100 hover:bg-gray-50/40 hover:text-gray-700 dark:text-gray-300 dark:hover:bg-gray-800/40 dark:hover:text-gray-200"
