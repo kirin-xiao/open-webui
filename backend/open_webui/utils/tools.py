@@ -51,7 +51,6 @@ from open_webui.tools.builtin import (
     create_automation,
     create_calendar_event,
     create_tasks,
-    delegate_task,
     delete_automation,
     delete_calendar_event,
     delete_memory,
@@ -85,6 +84,7 @@ from open_webui.tools.builtin import (
     search_memories,
     search_notes,
     search_web,
+    subagent,
     timer,
     toggle_automation,
     update_automation,
@@ -517,6 +517,33 @@ def get_attached_knowledge(model: dict, metadata: dict) -> list[dict]:
     return knowledge
 
 
+def disable_mutating_memory_tools(tools_dict: dict[str, dict]) -> None:
+    """In-place disable mutating memory tools for a compare-mode branch (#30238).
+
+    The tools stay advertised with their original spec so the model's tool
+    schema is unchanged, but each callable returns a fixed error instead of
+    writing. This keeps compare branches from racing on the memory store.
+    """
+    from open_webui.utils.subagents import (
+        COMPARE_MODE_MEMORY_WRITE_DISABLED_MESSAGE,
+        MUTATING_MEMORY_TOOLS,
+    )
+
+    async def disabled_tool(*args, **kwargs) -> str:
+        return JSONCodec.dumps({'error': COMPARE_MODE_MEMORY_WRITE_DISABLED_MESSAGE}, ensure_ascii=False)
+
+    for name in MUTATING_MEMORY_TOOLS:
+        entry = tools_dict.get(name)
+        # Match builtins only: a user-defined DB tool can share a memory tool's
+        # name, and it must not be disabled by a compare-mode branch (#30238).
+        if entry is not None and entry.get('type') == 'builtin':
+            entry['callable'] = disabled_tool
+
+    # TODO: replace the tool-level error with an advisory system-role message
+    # injected once per compare turn, so the model knows up front that memory
+    # writes are unavailable instead of discovering it on the first call.
+
+
 async def get_builtin_tools(
     request: Request, extra_params: dict, features: dict = None, model: dict = None, is_note_chat: bool = False
 ) -> dict[str, dict]:
@@ -553,7 +580,6 @@ async def get_builtin_tools(
         'calendar.enable',
         'ui.enable_user_webhooks',
         'subagents.enable',
-        'subagents.background_enabled',
     )
 
     async def has_user_permission(feature_key: str) -> bool:
@@ -650,8 +676,9 @@ async def get_builtin_tools(
         and config.get('subagents.enable')
         and getattr(request.state, 'internal', False) is not True
         and getattr(request.state, 'direct', False) is not True
+        and await has_user_permission('subagents')
     ):
-        builtin_functions.extend([delegate_task, timer])
+        builtin_functions.extend([subagent, timer])
 
     # Add memory tools when memory is enabled and the model allows this builtin category.
     if (
@@ -786,11 +813,6 @@ async def get_builtin_tools(
         )
 
         spec = get_builtin_tool_spec(func)
-        if func.__name__ == 'delegate_task' and not config.get('subagents.background_enabled'):
-            parameters = spec.get('parameters', {})
-            parameters.get('properties', {}).pop('background', None)
-            if isinstance(parameters.get('required'), list):
-                parameters['required'] = [name for name in parameters['required'] if name != 'background']
 
         tools_dict[func.__name__] = {
             'tool_id': f'builtin:{func.__name__}',
@@ -798,6 +820,12 @@ async def get_builtin_tools(
             'spec': spec,
             'type': 'builtin',
         }
+
+    # Compare mode fans out one concurrent task per model; memory writes from
+    # several branches race on the store, so disable the writers on every
+    # branch while keeping them advertised (#30238).
+    if metadata.get('compare_mode'):
+        disable_mutating_memory_tools(tools_dict)
 
     return tools_dict
 

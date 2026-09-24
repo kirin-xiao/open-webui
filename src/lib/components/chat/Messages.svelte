@@ -7,9 +7,16 @@
 
 	import { toast } from 'svelte-sonner';
 	import { deleteChatMessageById, updateChatById } from '$lib/apis/chats';
-	import { copyToClipboard, extractCurlyBraceWords, getDeepestChildId } from '$lib/utils';
+	import {
+		copyToClipboard,
+		createMessagesList,
+		extractCurlyBraceWords,
+		getDeepestChildId
+	} from '$lib/utils';
+	import { getMessageCheckpoint } from '$lib/utils/contextCompaction';
 
 	import Message from './Messages/Message.svelte';
+	import ContextCheckpoint from './Messages/ContextCheckpoint.svelte';
 	import Loader from '../common/Loader.svelte';
 	import Spinner from '../common/Spinner.svelte';
 
@@ -27,7 +34,7 @@
 	export let selectedModels;
 	export let atSelectedModel;
 
-	let messages = [];
+	let messages: any[] = [];
 
 	export let setInputText: Function = () => {};
 
@@ -47,6 +54,12 @@
 	export let allowDelete = true;
 	export let compactPreview = false;
 	export let editCodeBlock = true;
+
+	export let contextUsage: any = null;
+	export let contextCompaction: any = null;
+	export let contextCompactionEnabled = false;
+	export let onUndoCheckpoint: (messageId: string) => void = () => {};
+	export let onRegenerateCheckpoint: () => void = () => {};
 
 	export let topPadding = false;
 	export let bottomPadding = false;
@@ -134,6 +147,33 @@
 	};
 
 	$: handleHistoryChange(history.currentId, history.messages);
+
+	// Newest checkpoint on the active branch, if any. Used to render the
+	// compaction timeline row right before the boundary message that carries it.
+	const findCheckpoint = (list: any[]) => {
+		let found: { idx: number; messageId: string; record: any } | null = null;
+		for (let idx = 0; idx < list.length; idx += 1) {
+			const record = getMessageCheckpoint(list[idx]);
+			if (record) {
+				found = { idx, messageId: list[idx].id, record };
+			}
+		}
+		return found;
+	};
+
+	$: compactionStatus = contextCompaction?.status ?? null;
+	$: compactionRunning = compactionStatus === 'running';
+	$: visibleCheckpoint = findCheckpoint(messages);
+	// Only walk the full branch when the boundary is outside the loaded window.
+	$: fullCheckpoint =
+		visibleCheckpoint === null && (history as any)?.currentId
+			? findCheckpoint(createMessagesList(history, (history as any).currentId))
+			: null;
+	$: globalCheckpoint = visibleCheckpoint ?? fullCheckpoint;
+	// Show the row at the top of the list only when the boundary message itself is
+	// outside the loaded window (or a failure has no checkpoint to attach to).
+	$: showCheckpointHeader =
+		visibleCheckpoint === null && (globalCheckpoint !== null || compactionStatus === 'failed');
 
 	$: if (autoScroll && bottomPadding) {
 		(async () => {
@@ -495,7 +535,33 @@
 						</Loader>
 					{/if}
 					<ul role="log" aria-live="polite" aria-relevant="additions" aria-atomic="false">
+						{#if compactionRunning}
+							<ContextCheckpoint status="running" usage={contextUsage} disabled={true} />
+						{:else if showCheckpointHeader}
+							<ContextCheckpoint
+								checkpoint={globalCheckpoint?.record}
+								status={compactionStatus}
+								usage={contextUsage}
+								messageId={globalCheckpoint?.messageId}
+								model={globalCheckpoint?.record?.model}
+								disabled={!contextCompactionEnabled || compactionRunning}
+								onUndo={onUndoCheckpoint}
+								onRegenerate={onRegenerateCheckpoint}
+							/>
+						{/if}
 						{#each messages as message, messageIdx (message.id)}
+							{#if !compactionRunning && visibleCheckpoint?.idx === messageIdx}
+								<ContextCheckpoint
+									checkpoint={visibleCheckpoint.record}
+									status={compactionStatus}
+									usage={contextUsage}
+									messageId={visibleCheckpoint.messageId}
+									model={visibleCheckpoint.record?.model}
+									disabled={!contextCompactionEnabled || compactionRunning}
+									onUndo={onUndoCheckpoint}
+									onRegenerate={onRegenerateCheckpoint}
+								/>
+							{/if}
 							<Message
 								{chatId}
 								bind:history

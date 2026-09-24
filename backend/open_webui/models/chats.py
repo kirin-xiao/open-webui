@@ -13,7 +13,7 @@ from open_webui.env import ENABLE_ADMIN_CHAT_ACCESS
 from open_webui.internal.db import Base, JSONField, get_async_db_context
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.automations import AutomationRun
-from open_webui.models.chat_messages import ChatMessage, ChatMessages
+from open_webui.models.chat_messages import ChatMessage, ChatMessages, normalize_context_summary
 from open_webui.models.folders import Folders
 from open_webui.models.tags import Tag, TagModel, Tags
 from open_webui.utils.misc import get_output_text, sanitize_data_for_db, sanitize_text_for_db
@@ -774,6 +774,26 @@ class ChatTable:
         except Exception:
             return None
 
+    async def update_chat_meta_by_id(self, id: str, meta: dict, db: AsyncSession | None = None) -> bool:
+        """Merge keys into a chat's meta column without touching the chat blob.
+
+        Meta-only writes cannot clobber messages, so this is safe to call from
+        request middleware while a chat is being edited elsewhere.
+        """
+        if not meta:
+            return False
+        try:
+            async with get_async_db_context(db) as session:
+                row = (await session.execute(select(Chat.meta).filter_by(id=id))).one_or_none()
+                if row is None:
+                    return False
+                current = row[0] or {}
+                await session.execute(update(Chat).filter_by(id=id).values(meta={**current, **meta}))
+                await session.commit()
+                return True
+        except Exception:
+            return False
+
     async def update_chat_last_read_at_by_id(
         self, id: str, user_id: str, db: AsyncSession | None = None
     ) -> tuple[int, bool] | None:
@@ -1146,6 +1166,14 @@ class ChatTable:
             output_text = get_output_text(message.get('output'))
             if output_text:
                 message['content'] = output_text
+
+        # Store the checkpoint record under the canonical camelCase key as a JSON
+        # string, so the embedded history and the chat_message row agree.
+        if 'contextSummary' in message or 'context_summary' in message:
+            message['contextSummary'] = normalize_context_summary(
+                message.get('context_summary') or message.get('contextSummary')
+            )
+            message.pop('context_summary', None)
 
         message = self._clean_null_bytes(message)
         message_id = self._clean_null_bytes(message_id)

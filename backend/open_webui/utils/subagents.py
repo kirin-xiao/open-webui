@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import logging
 import time
 from datetime import timedelta
 from uuid import uuid4
@@ -19,6 +21,8 @@ from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from sqlalchemy import select
 from starlette.datastructures import Headers
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SUBAGENT_SYSTEM_PROMPT = """You are a sub-agent working on a specific task assigned by the lead agent.
 
@@ -38,10 +42,76 @@ MUTATING_MEMORY_TOOLS = {
     'update_memory',
 }
 
-_background_active: set[str] = set()
-_background_lock = asyncio.Lock()
-_foreground_semaphore: asyncio.Semaphore | None = None
+# Returned by mutating memory tools when a compare-mode fan-out disables them.
+# Compare mode runs one concurrent task per model; concurrent read-modify-write
+# on the memory store duplicates rows and clobbers replaces (#30238).
+COMPARE_MODE_MEMORY_WRITE_DISABLED_MESSAGE = (
+    'Error: memory writes are disabled in model compare mode; nothing was saved. '
+    'This state persists until the next user message.'
+)
+
+# How long `process_pending_internal_messages` waits for sibling tasks to drain
+# before giving up. A stale Redis task entry must not hang finalization (W7).
+PENDING_ACTIVE_TASK_WAIT_TIMEOUT = 30.0
+
+# The only serializer for the parent-history write. Kept (not concurrency-limit
+# machinery) and popped once drained so it does not grow without bound (W3).
 _parent_locks: dict[str, asyncio.Lock] = {}
+
+
+@contextlib.asynccontextmanager
+async def _parent_lock_scope(chat_id: str):
+    """Serialize parent-history writes for `chat_id`, then drop the lock.
+
+    The lock is dropped only when no task holds it and no task is waiting, so a
+    concurrent writer either shares the lock or acquires the next one. The
+    check-and-pop is synchronous, so the event loop cannot interleave a new
+    waiter between them.
+    """
+    lock = _parent_locks.setdefault(chat_id, asyncio.Lock())
+    try:
+        async with lock:
+            yield
+    finally:
+        if not lock.locked() and not getattr(lock, '_waiters', None):
+            _parent_locks.pop(chat_id, None)
+
+
+async def _wait_for_active_tasks(redis, chat_id: str, timeout: float = PENDING_ACTIVE_TASK_WAIT_TIMEOUT) -> None:
+    """Bounded drain wait. Returns (instead of hanging) once `timeout` elapses."""
+    deadline = time.monotonic() + timeout
+    while await has_active_tasks(redis, chat_id):
+        if time.monotonic() >= deadline:
+            log.warning('Timed out waiting for active tasks on chat %s; proceeding with pending results.', chat_id)
+            return
+        await asyncio.sleep(0.25)
+
+
+async def _subagent_chain_depth(chat_id: str) -> int:
+    """Count sub-agent links between `chat_id` and the root chat.
+
+    Walks the persisted internal linkage (`meta.type == 'subagent'` and
+    `meta.parent_chat_id`) rather than an in-memory counter, so it is correct
+    across processes and restarts. A root chat has depth 0; a chat spawned by
+    the root has depth 1.
+    """
+    depth = 0
+    seen: set[str] = set()
+    current = chat_id
+    while current and current not in seen:
+        seen.add(current)
+        chat = await Chats.get_chat_by_id(current)
+        if not chat:
+            break
+        meta = chat.meta or {}
+        if meta.get('internal') is not True or meta.get('type') != 'subagent':
+            break
+        parent = meta.get('parent_chat_id')
+        if not parent:
+            break
+        depth += 1
+        current = parent
+    return depth
 
 
 def _build_request(source: Request, user_id: str, *, internal: bool) -> Request:
@@ -75,11 +145,9 @@ async def process_pending_internal_messages(
     user_id: str,
     run: dict,
 ) -> None:
-    lock = _parent_locks.setdefault(parent_chat_id, asyncio.Lock())
-    while await has_active_tasks(source_request.app.state.redis, parent_chat_id):
-        await asyncio.sleep(0.25)
+    await _wait_for_active_tasks(source_request.app.state.redis, parent_chat_id)
 
-    async with lock:
+    async with _parent_lock_scope(parent_chat_id):
         if await has_active_tasks(source_request.app.state.redis, parent_chat_id):
             return
 
@@ -160,7 +228,18 @@ async def process_pending_internal_messages(
                     for message in batch
                     if (message.get('meta') or {}).get('subagent_chat_id')
                 ]
-                combined_meta = {'internal': True, 'type': 'subagent'}
+                child_ids = [
+                    (message.get('meta') or {}).get('childID') or (message.get('meta') or {}).get('subagent_chat_id')
+                    for message in batch
+                    if (message.get('meta') or {}).get('childID') or (message.get('meta') or {}).get('subagent_chat_id')
+                ]
+                states = [message['meta']['state'] for message in batch if (message.get('meta') or {}).get('state')]
+                descriptions = [
+                    message['meta']['description']
+                    for message in batch
+                    if (message.get('meta') or {}).get('description')
+                ]
+                combined_meta = {'internal': True, 'type': 'subagent', 'source': 'subagent'}
                 if len(delegation_ids) == 1:
                     combined_meta['delegation_id'] = delegation_ids[0]
                 elif delegation_ids:
@@ -169,6 +248,14 @@ async def process_pending_internal_messages(
                     combined_meta['subagent_chat_id'] = subagent_chat_ids[0]
                 elif subagent_chat_ids:
                     combined_meta['subagent_chat_ids'] = subagent_chat_ids
+                if len(child_ids) == 1:
+                    combined_meta['childID'] = child_ids[0]
+                elif child_ids:
+                    combined_meta['childIDs'] = child_ids
+                if len(states) == 1:
+                    combined_meta['state'] = states[0]
+                if len(descriptions) == 1:
+                    combined_meta['description'] = descriptions[0]
 
             reuse_message = len(batch) == 1 and (first.get('meta') or {}).get('status') != 'pending'
             user_message_id = first['id'] if reuse_message else str(uuid4())
@@ -227,85 +314,87 @@ async def process_pending_internal_messages(
         await ChatMessages.upsert_message(user_message_id, parent_chat_id, user_id, user_message)
         await ChatMessages.upsert_message(assistant_message_id, parent_chat_id, user_id, assistant_message)
 
-        from open_webui.socket.main import sio
+    # Release the parent-history lock before the synthesis turn. The synthesis
+    # request is internal, so `CHAT_COMPLETION_HANDLER` awaits the whole turn
+    # inline; holding the lock across it would delay a concurrent timer or the
+    # next drain. This matches the timer path, which also releases first.
+    from open_webui.socket.main import sio
 
-        await sio.emit(
-            'events',
-            {
-                'chat_id': parent_chat_id,
-                'message_id': assistant_message_id,
-                'data': {'type': 'chat:reload'},
-            },
-            room=f'user:{user.id}',
-        )
-
-        form_data = {
-            'model': model_id,
-            'messages': [
-                *([{'role': 'system', 'content': system_prompt}] if system_prompt else []),
-                *message_list,
-                {'role': 'user', 'content': combined_content},
-            ],
-            'stream': True,
+    await sio.emit(
+        'events',
+        {
             'chat_id': parent_chat_id,
-            'id': assistant_message_id,
-            'parent_id': parent_id,
-            'user_message': user_message,
-            'session_id': run.get('session_id') or f'{kind}-result:{parent_chat_id}',
-            'background_tasks': {},
-            'tool_ids': run.get('tool_ids') or [],
-            'skill_ids': run.get('skill_ids') or [],
-            'filter_ids': run.get('filter_ids') or [],
-            'features': run.get('features') or {},
-            'files': run.get('files') or [],
-            'variables': run.get('variables') or {},
-        }
-        if run.get('terminal_id'):
-            form_data['terminal_id'] = run['terminal_id']
+            'message_id': assistant_message_id,
+            'data': {'type': 'chat:reload'},
+        },
+        room=f'user:{user.id}',
+    )
 
-        request = _build_request(source_request, user.id, internal=False)
-        await source_request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
+    form_data = {
+        'model': model_id,
+        'messages': [
+            *([{'role': 'system', 'content': system_prompt}] if system_prompt else []),
+            *message_list,
+            {'role': 'user', 'content': combined_content},
+        ],
+        'stream': True,
+        'chat_id': parent_chat_id,
+        'id': assistant_message_id,
+        'parent_id': parent_id,
+        'user_message': user_message,
+        'session_id': run.get('session_id') or f'{kind}-result:{parent_chat_id}',
+        'background_tasks': {},
+        'tool_ids': run.get('tool_ids') or [],
+        'skill_ids': run.get('skill_ids') or [],
+        'filter_ids': run.get('filter_ids') or [],
+        'features': run.get('features') or {},
+        'files': run.get('files') or [],
+        'variables': run.get('variables') or {},
+    }
+    if run.get('terminal_id'):
+        form_data['terminal_id'] = run['terminal_id']
+
+    # The result-synthesis turn is internal: it must not advertise the
+    # sub-agent tool, so a background result can never re-spawn a delegation
+    # (W10). Internal runs also skip the pending-message reprocessing hook.
+    request = _build_request(source_request, user.id, internal=True)
+    await source_request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
 
 
 async def delegate(
-    task: str,
+    description: str,
+    prompt: str,
     context: str,
     background: bool,
     *,
     file_ids: list[str] | None = None,
+    session_id: str | None = None,
+    model: str | None = None,
     request: Request,
     user_data: dict,
     metadata: dict,
     parent_chat_id: str,
     parent_message_id: str | None,
 ) -> str:
-    global _foreground_semaphore
-
-    task = task.strip()
-    if not task:
-        return 'Error: task must not be empty.'
+    prompt = (prompt or '').strip()
+    description = (description or '').strip()
+    if not prompt:
+        return 'Error: prompt must not be empty.'
     if not parent_chat_id or not user_data.get('id'):
         return 'Error: chat and user context are required.'
 
     config = await Config.get_many(
-        'subagents.background_enabled',
-        'subagents.max_concurrent',
-        'subagents.max_async',
+        'subagents.depth',
+        'subagents.model',
         'subagents.max_iterations',
         'subagents.max_output',
         'subagents.system_prompt',
     )
-    max_concurrent = int(config.get('subagents.max_concurrent') or 20)
-    max_async = int(config.get('subagents.max_async') or 20)
+    raw_depth = config.get('subagents.depth')
+    depth_limit = 1 if raw_depth is None else int(raw_depth)
     max_iterations = int(config.get('subagents.max_iterations') or 30)
     max_output = int(config.get('subagents.max_output') or 30_000)
-    if max_concurrent != -1:
-        max_concurrent = max(1, max_concurrent)
-    if max_async != -1:
-        max_async = max(1, max_async)
-
-    if background and not config.get('subagents.background_enabled'):
-        return 'Error: background sub-agents are disabled in settings.'
+    admin_model = str(config.get('subagents.model') or '').strip()
 
     features = copy.deepcopy(metadata.get('features') or {})
     if (
@@ -314,8 +403,17 @@ async def delegate(
         and await Config.get('code_interpreter.engine', 'pyodide') != 'jupyter'
     ):
         features.pop('code_interpreter')
+
+    # Model precedence: explicit per-call > admin default > parent chat model.
+    parent_model = metadata.get('model_id') or (metadata.get('model') or {}).get('id')
+    requested_model = (model or '').strip()
+    available_models = getattr(request.app.state, 'MODELS', None)
+    if requested_model and available_models and requested_model not in available_models:
+        return f'Error: model "{requested_model}" is not available.'
+    effective_model = requested_model or admin_model or parent_model
+
     run = {
-        'model_id': metadata.get('model_id') or (metadata.get('model') or {}).get('id'),
+        'model_id': effective_model,
         'session_id': metadata.get('session_id'),
         'tool_ids': copy.deepcopy(metadata.get('tool_ids') or []),
         'skill_ids': copy.deepcopy(metadata.get('skill_ids') or []),
@@ -332,6 +430,17 @@ async def delegate(
         return 'Error: model context is required.'
     if run.get('direct'):
         return 'Error: sub-agents are unavailable for direct connections.'
+
+    # Depth cap (opencode `experimental.subagent_depth`, default 1). A negative
+    # limit disables the cap. Checked before any child chat is created or reused.
+    if depth_limit >= 0:
+        depth = await _subagent_chain_depth(parent_chat_id)
+        if depth >= depth_limit:
+            return (
+                f'Error: sub-agent depth limit reached ({depth_limit}). '
+                'Sub-agents cannot spawn nested sub-agents; increase subagents.depth to allow it.'
+            )
+
     if file_ids:
         requested_file_ids = {str(file_id) for file_id in file_ids if file_id}
         run['files'] = [
@@ -357,98 +466,160 @@ async def delegate(
     else:
         run['files'] = []
 
+    user = UserModel(**user_data)
     delegation_id = f'deleg_{uuid4().hex[:8]}'
-    foreground_semaphore = None
-    if background:
-        async with _background_lock:
-            if max_async != -1 and len(_background_active) >= max_async:
-                return (
-                    f'Error: Async subagent capacity reached ({max_async} running). '
-                    'Wait for one to finish or increase subagents.max_async.'
-                )
-            _background_active.add(delegation_id)
-    elif max_concurrent != -1:
-        if _foreground_semaphore is None:
-            _foreground_semaphore = asyncio.Semaphore(max_concurrent)
-        foreground_semaphore = _foreground_semaphore
-        await foreground_semaphore.acquire()
+    prompt_text = f'{prompt}\n\n## Context\n{context}' if context else prompt
 
-    mode = 'background' if background else 'foreground'
+    # Continuation: reuse a child chat owned by this user whose internal meta
+    # links it to this caller. Anything else is rejected rather than silently
+    # creating a new chat.
+    existing_chat = None
+    existing_messages: dict = {}
+    continuation_tip_id = None
+    if session_id:
+        existing_chat = await Chats.get_chat_by_id(session_id)
+        if not existing_chat or existing_chat.user_id != user.id:
+            return f'Error: sessionID "{session_id}" was not found.'
+        existing_meta = existing_chat.meta or {}
+        if existing_meta.get('internal') is not True or existing_meta.get('type') != 'subagent':
+            return f'Error: sessionID "{session_id}" is not a sub-agent session.'
+        if existing_meta.get('parent_chat_id') != parent_chat_id:
+            return f'Error: sessionID "{session_id}" does not belong to this chat.'
+
+        existing_messages = copy.deepcopy((existing_chat.chat or {}).get('history', {}).get('messages') or {})
+        continuation_tip_id = (existing_chat.chat or {}).get('history', {}).get('currentId')
+        if continuation_tip_id not in existing_messages:
+            continuation_tip_id = None
+        if continuation_tip_id is None and existing_messages:
+            continuation_tip_id = max(existing_messages.values(), key=lambda message: message.get('timestamp', 0)).get(
+                'id'
+            )
+
+        # A child that is still producing a turn has an unfinished assistant tip.
+        # Continuing it now would race that turn's history writes, so reject until
+        # it finishes (the background handle is returned while the child runs).
+        tip = existing_messages.get(continuation_tip_id) if continuation_tip_id else None
+        if tip and tip.get('role') == 'assistant' and tip.get('done') is False:
+            return f'Error: sessionID "{session_id}" is still running; wait for it to finish before continuing.'
+
+        # A continued turn keeps the child's workspace unless the caller selects
+        # files explicitly: it inherits the files on the child's most recent user
+        # message, otherwise the per-call `file_ids` selection above applies.
+        if not file_ids:
+            latest_user_with_files = max(
+                (
+                    message
+                    for message in existing_messages.values()
+                    if message.get('role') == 'user' and message.get('files')
+                ),
+                key=lambda message: message.get('timestamp', 0),
+                default=None,
+            )
+            if latest_user_with_files:
+                run['files'] = copy.deepcopy(latest_user_with_files.get('files') or [])
+
+    prompt_files = copy.deepcopy(run.get('files') or [])
+    child_message_list: list[dict] = []
+
     try:
-        user = UserModel(**user_data)
-        chat_id = str(uuid4())
-        user_message_id = str(uuid4())
-        assistant_message_id = str(uuid4())
-        prompt = f'{task}\n\n## Context\n{context}' if context else task
-        prompt_files = copy.deepcopy(run.get('files') or [])
-        user_message = {
-            'id': user_message_id,
-            'parentId': None,
-            'childrenIds': [assistant_message_id],
-            'role': 'user',
-            'content': prompt,
-            'timestamp': int(time.time()),
-            'models': [run['model_id']],
-            **({'files': prompt_files} if prompt_files else {}),
-        }
-        chat = await Chats.insert_new_chat(
-            chat_id,
-            user.id,
-            ChatForm(
-                chat={
-                    'id': chat_id,
-                    'title': f'Sub-agent: {task[:60]}',
-                    'models': [run['model_id']],
-                    'history': {
-                        'currentId': assistant_message_id,
-                        'messages': {
-                            user_message_id: user_message,
-                            assistant_message_id: {
-                                'id': assistant_message_id,
-                                'parentId': user_message_id,
-                                'childrenIds': [],
-                                'role': 'assistant',
-                                'content': '',
-                                'done': False,
-                                'model': run['model_id'],
-                                'timestamp': int(time.time()),
+        if existing_chat is not None:
+            chat_id = existing_chat.id
+            user_message_id = str(uuid4())
+            assistant_message_id = str(uuid4())
+            user_message = {
+                'id': user_message_id,
+                'parentId': continuation_tip_id,
+                'childrenIds': [assistant_message_id],
+                'role': 'user',
+                'content': prompt_text,
+                'timestamp': int(time.time()),
+                'models': [run['model_id']],
+                **({'files': prompt_files} if prompt_files else {}),
+            }
+            assistant_message = {
+                'id': assistant_message_id,
+                'parentId': user_message_id,
+                'childrenIds': [],
+                'role': 'assistant',
+                'content': '',
+                'done': False,
+                'model': run['model_id'],
+                'timestamp': int(time.time()),
+            }
+            # Maintain parentId/childrenIds/currentId through the model helper.
+            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, user_message_id, user_message)
+            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, assistant_message_id, assistant_message)
+            child_message_list = get_message_list(existing_messages, continuation_tip_id)
+        else:
+            chat_id = str(uuid4())
+            user_message_id = str(uuid4())
+            assistant_message_id = str(uuid4())
+            user_message = {
+                'id': user_message_id,
+                'parentId': None,
+                'childrenIds': [assistant_message_id],
+                'role': 'user',
+                'content': prompt_text,
+                'timestamp': int(time.time()),
+                'models': [run['model_id']],
+                **({'files': prompt_files} if prompt_files else {}),
+            }
+            chat = await Chats.insert_new_chat(
+                chat_id,
+                user.id,
+                ChatForm(
+                    chat={
+                        'id': chat_id,
+                        'title': f'Sub-agent: {(description or prompt)[:60]}',
+                        'models': [run['model_id']],
+                        'history': {
+                            'currentId': assistant_message_id,
+                            'messages': {
+                                user_message_id: user_message,
+                                assistant_message_id: {
+                                    'id': assistant_message_id,
+                                    'parentId': user_message_id,
+                                    'childrenIds': [],
+                                    'role': 'assistant',
+                                    'content': '',
+                                    'done': False,
+                                    'model': run['model_id'],
+                                    'timestamp': int(time.time()),
+                                },
                             },
                         },
-                    },
-                    'messages': [
-                        {
-                            'role': 'user',
-                            'content': prompt,
-                            **({'files': prompt_files} if prompt_files else {}),
-                        }
-                    ],
-                    'files': prompt_files,
-                }
-            ),
-            internal_meta={
-                'internal': True,
-                'type': 'subagent',
-                'parent_chat_id': parent_chat_id,
-                'parent_message_id': parent_message_id,
-                'delegation_id': delegation_id,
-                'mode': mode,
-            },
-        )
-        if not chat:
-            raise RuntimeError('Failed to create sub-agent chat')
+                        'messages': [
+                            {
+                                'role': 'user',
+                                'content': prompt_text,
+                                **({'files': prompt_files} if prompt_files else {}),
+                            }
+                        ],
+                        'files': prompt_files,
+                    }
+                ),
+                internal_meta={
+                    'internal': True,
+                    'type': 'subagent',
+                    'parent_chat_id': parent_chat_id,
+                    'parent_message_id': parent_message_id,
+                    'delegation_id': delegation_id,
+                    'description': description,
+                    'model': run['model_id'],
+                    'mode': 'background' if background else 'foreground',
+                },
+            )
+            if not chat:
+                raise RuntimeError('Failed to create sub-agent chat')
     except Exception as exc:
-        if background:
-            async with _background_lock:
-                _background_active.discard(delegation_id)
-        elif foreground_semaphore:
-            foreground_semaphore.release()
         prefix = 'background ' if background else ''
         return f'Error: failed to create {prefix}sub-agent: {exc}'
 
     async def run_reserved() -> dict:
         try:
             child_request = _build_request(request, user.id, internal=True)
-            child_request.state.max_tool_call_iterations = max_iterations
+            # W5: `-1` means unlimited, matching CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS.
+            child_request.state.max_tool_call_iterations = None if max_iterations == -1 else max_iterations
             parent_system_prompt = run.get('system_prompt') or ''
             subagent_system_prompt = (
                 str(config.get('subagents.system_prompt') or '').strip() or DEFAULT_SUBAGENT_SYSTEM_PROMPT
@@ -464,12 +635,17 @@ async def delegate(
                             else subagent_system_prompt
                         ),
                     },
-                    {'role': 'user', 'content': prompt},
+                    *child_message_list,
+                    {
+                        'role': 'user',
+                        'content': prompt_text,
+                        **({'files': prompt_files} if prompt_files else {}),
+                    },
                 ],
                 'stream': True,
                 'chat_id': chat_id,
                 'id': assistant_message_id,
-                'parent_id': None,
+                'parent_id': user_message.get('parentId'),
                 'user_message': user_message,
                 'session_id': run.get('session_id') or f'subagent:{chat_id}',
                 'background_tasks': {},
@@ -530,15 +706,8 @@ async def delegate(
                 {'done': True, 'error': {'content': str(exc)}},
             )
             raise
-        finally:
-            if background:
-                async with _background_lock:
-                    _background_active.discard(delegation_id)
-            elif foreground_semaphore:
-                foreground_semaphore.release()
 
     async def run_background() -> dict:
-        started_at = time.time()
         cancelled = False
         try:
             result = await run_reserved()
@@ -548,42 +717,32 @@ async def delegate(
         except Exception as exc:
             result = {'status': 'error', 'summary': '', 'error': str(exc)}
 
-        duration = f'{time.time() - started_at:.1f}s'
-        lines = [
-            f'[ASYNC SUBAGENT COMPLETE - {delegation_id}]',
-            (
-                'A background subagent you dispatched earlier has finished. '
-                'The original task source is included so you can decide whether '
-                'to use the result or continue without it.'
-            ),
-            '',
-            f'Original task: {task}',
-        ]
-        if context:
-            lines.append(f'Context provided: {context}')
-        lines.extend(
-            [
-                f'Subagent chat: {chat_id}',
-                f'Status: {result.get("status", "completed")}   Duration: {duration}',
-                '--- RESULT ---',
-            ]
-        )
-        if result.get('status') == 'completed':
-            lines.append(result.get('summary') or 'Subagent completed without a final summary.')
-        elif result.get('status') == 'interrupted':
-            lines.append('The subagent was interrupted before completing.')
-            if result.get('summary'):
-                lines.extend(['Partial output:', result['summary']])
-        else:
+        state = result.get('status') or 'completed'
+        summary = result.get('summary') or ''
+        if state == 'interrupted':
+            body = 'The sub-agent was interrupted before completing.'
+            if summary:
+                body = f'{body}\n\nPartial output:\n{summary}'
+        elif state == 'error':
             detail = f' {result.get("error")}' if result.get('error') else ''
-            lines.append(f'The subagent did not complete successfully.{detail}')
-            if result.get('summary'):
-                lines.extend(['Partial output:', result['summary']])
+            body = f'The sub-agent did not complete successfully.{detail}'
+            if summary:
+                body = f'{body}\n\nPartial output:\n{summary}'
+        else:
+            body = summary or 'Sub-agent completed without a final summary.'
+        envelope = f'<subagent sessionID="{chat_id}" state="{state}">\n{body}\n</subagent>'
 
         pending_message_id = str(uuid4())
         pending_meta = {
             'internal': True,
             'type': 'subagent',
+            'source': 'subagent',
+            'childID': chat_id,
+            'state': state,
+            # opencode carries the label through to the parent result so the UI
+            # can show it instead of the first line of the output.
+            'description': description,
+            # Persisted for legacy chats that still key off the old handle.
             'delegation_id': delegation_id,
             'subagent_chat_id': chat_id,
         }
@@ -592,14 +751,13 @@ async def delegate(
             'parentId': None,
             'childrenIds': [],
             'role': 'user',
-            'content': '\n'.join(lines),
+            'content': envelope,
             'model': run['model_id'],
             'meta': pending_meta,
             'timestamp': int(time.time()),
         }
 
-        lock = _parent_locks.setdefault(parent_chat_id, asyncio.Lock())
-        async with lock:
+        async with _parent_lock_scope(parent_chat_id):
             async with get_async_db() as db:
                 stmt = select(Chat).where(Chat.id == parent_chat_id, Chat.user_id == user.id)
                 if db.bind.dialect.name == 'postgresql':
@@ -669,21 +827,17 @@ async def delegate(
             id=chat_id,
         )
     except Exception as exc:
-        if background:
-            async with _background_lock:
-                _background_active.discard(delegation_id)
-        elif foreground_semaphore:
-            foreground_semaphore.release()
         return f'Error: {exc}'
 
     if background:
         return JSONCodec.dumps(
             {
-                'status': 'dispatched',
-                'delegation_id': delegation_id,
-                'subagent_chat_id': chat_id,
-                'mode': 'background',
-                'task': task,
+                'sessionID': chat_id,
+                'status': 'running',
+                'output': (
+                    f'The sub-agent is working in the background (sessionID: {chat_id}). '
+                    'You will be notified when it finishes. DO NOT sleep, poll, or duplicate its work.'
+                ),
             },
             ensure_ascii=False,
         )
@@ -699,4 +853,5 @@ async def delegate(
 
     if result.get('status') != 'completed':
         return f'Error: {result.get("error") or "sub-agent failed."}'
-    return result.get('summary') or 'Sub-agent produced no output.'
+    summary = result.get('summary') or 'Sub-agent produced no output.'
+    return f'<subagent sessionID="{chat_id}" state="completed">\n{summary}\n</subagent>'

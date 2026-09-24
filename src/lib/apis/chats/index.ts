@@ -1321,14 +1321,21 @@ export const compactChatById = async (token: string, id: string, model?: string 
 		body: JSON.stringify({ model })
 	})
 		.then(async (res) => {
-			if (!res.ok) throw await res.json();
+			if (!res.ok) {
+				const body = await res.json().catch(() => ({}));
+				const detail = getErrorDetail(body);
+				// Preserve the HTTP status (409 = a compaction already holds the
+				// per-chat lease) alongside the human-readable detail so the UI can
+				// show a clear "already in progress" message.
+				const err: any = new Error(typeof detail === 'string' ? detail : `HTTP ${res.status}`);
+				err.status = res.status;
+				err.detail = detail;
+				throw err;
+			}
 			return res.json();
 		})
-		.then((json) => {
-			return json;
-		})
 		.catch((err) => {
-			error = getErrorDetail(err);
+			error = err;
 
 			console.error(err);
 			return null;

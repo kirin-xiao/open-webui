@@ -69,6 +69,7 @@
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import { getMessageCheckpoint } from '$lib/utils/contextCompaction';
 	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
 
 	import {
@@ -194,8 +195,11 @@
 	} else {
 		selectedModelIds = selectedModels;
 	}
-	let serverContextUsage = null;
-	let contextUsage = null;
+	let serverContextUsage: any = null;
+	let contextUsage: any = null;
+	// Lifecycle ledger mirrored from `chat.meta.context_compaction` and updated by
+	// the `context_compaction` socket event.
+	let contextCompaction: any = null;
 
 	const getAvailableModelIds = () =>
 		$models.filter((m) => !(m?.info?.meta?.hidden ?? false)).map((m) => m.id);
@@ -275,15 +279,16 @@
 		return Number.isFinite(threshold) && threshold > 0 ? threshold : null;
 	};
 
-	const getContextUsage = () => {
+	// Secondary fallback used only before the server `context_usage` payload has
+	// loaded. Mirrors the server math (same threshold ceiling, same checkpoint
+	// read shim, same CJK-agnostic char/4 estimate) so it cannot diverge wildly.
+	const getLocalContextUsage = () => {
 		if (!history?.currentId) {
 			return null;
 		}
 
 		const messages = createMessagesList(history, history.currentId);
-		const threshold = contextCompactionEnabled
-			? (getContextThreshold() ?? serverContextUsage?.threshold ?? null)
-			: null;
+		const threshold = getContextThreshold() ?? serverContextUsage?.threshold ?? null;
 		const systemTokens = estimateTokens($settings?.system ?? '');
 		let estimatedTokens = systemTokens;
 		let hasUsageCheckpoint = false;
@@ -291,9 +296,9 @@
 		let startIdx = 0;
 
 		for (let idx = 0; idx < messages.length; idx += 1) {
-			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
-			if (typeof value === 'string' && value.trim()) {
-				summary = value;
+			const checkpoint = getMessageCheckpoint(messages[idx]);
+			if (checkpoint) {
+				summary = checkpoint.summary;
 				startIdx = idx;
 			}
 		}
@@ -323,7 +328,16 @@
 		};
 	};
 
-	$: contextUsage = getContextUsage() ?? (contextCompactionEnabled ? serverContextUsage : null);
+	// Server-authoritative: `get_chat_context_usage` runs the same budget walk as
+	// the trigger, so prefer its `threshold`/`percent`; fall back to the mirrored
+	// local estimate only when the server payload is unavailable.
+	$: contextUsage = contextCompactionEnabled
+		? (serverContextUsage ?? getLocalContextUsage())
+		: null;
+	// Distinguishes the server payload from the mirrored local fallback for the
+	// ring's budget-source indicator. Gate on the usage actually in effect so a
+	// stale/disabled server payload can never label the local fallback as server.
+	$: contextUsageSource = contextUsage && serverContextUsage ? 'server' : 'estimated';
 	$: embeddedHeaderTitle = embeddedTitle || $chatTitle || $i18n.t('Chat');
 
 	let selectedToolIds: string[] = [];
@@ -383,7 +397,7 @@
 	let generating = false;
 	let dragged = false;
 	let generationController = null;
-	let contextCompactionToastId = null;
+	let contextCompactionToastId: any = null;
 
 	let chat = null;
 	let tags = [];
@@ -892,6 +906,7 @@
 		taskIds = null;
 		chatTasks = [];
 		serverContextUsage = null;
+		contextCompaction = null;
 		history = {
 			messages: {},
 			currentId: null
@@ -1207,12 +1222,38 @@
 		}
 	};
 
-	const handleContextCompactionStatus = (status) => {
+	// Re-read the server-authoritative usage after a compaction settles so the
+	// ring and the checkpoint row reflect the newly dropped/kept history.
+	const refreshContextUsage = async () => {
+		if (!$chatId || $temporaryChatEnabled) {
+			return;
+		}
+		try {
+			const chat = await getChatById(localStorage.token, $chatId);
+			if (chat) {
+				serverContextUsage = chat?.context_usage ?? serverContextUsage;
+				contextCompaction = chat?.meta?.context_compaction ?? contextCompaction;
+			}
+		} catch (error) {
+			console.error(error);
+		}
+	};
+
+	const handleContextCompactionStatus = async (status) => {
 		if (status?.action !== 'context_compaction') {
 			return;
 		}
 
+		const now = Math.floor(Date.now() / 1000);
+
 		if (status?.done) {
+			contextCompaction = {
+				...contextCompaction,
+				status: status?.error ? 'failed' : 'completed',
+				updated_at: now,
+				...(status?.error ? { error: 'Context compaction failed' } : {})
+			};
+
 			if (contextCompactionToastId !== null) {
 				if (status?.error) {
 					toast.error($i18n.t('Context compaction failed'), {
@@ -1227,8 +1268,18 @@
 				}
 				contextCompactionToastId = null;
 			}
+
+			if (!status?.error) {
+				await refreshContextUsage();
+			}
 			return;
 		}
+
+		contextCompaction = {
+			...contextCompaction,
+			status: 'running',
+			updated_at: now
+		};
 
 		if (contextCompactionToastId === null) {
 			contextCompactionToastId = toast.loading($i18n.t('Compacting context'), {
@@ -1262,7 +1313,7 @@
 						message.statusHistory = [data];
 					}
 				} else if (type === 'context_compaction') {
-					handleContextCompactionStatus(data);
+					await handleContextCompactionStatus(data);
 				} else if (type === 'chat:active') {
 					if (!data?.active) {
 						taskIds = null;
@@ -2396,6 +2447,7 @@
 				// Load tasks from chat-level DB field
 				chatTasks = chat?.tasks ?? [];
 				serverContextUsage = chat?.context_usage ?? null;
+				contextCompaction = chat?.meta?.context_compaction ?? null;
 
 				autoScroll = true;
 				await tick();
@@ -3030,6 +3082,13 @@
 		const model = atSelectedModel?.id ?? selectedModels.find((modelId) => modelId);
 		const toastId = toast.loading($i18n.t('Compacting context...'));
 
+		contextCompaction = {
+			...(contextCompaction ?? {}),
+			status: 'running',
+			manual: true,
+			updated_at: Math.floor(Date.now() / 1000)
+		};
+
 		try {
 			const result = await compactChatById(localStorage.token, $chatId, model);
 			serverContextUsage = result?.context_usage ?? serverContextUsage;
@@ -3049,11 +3108,72 @@
 			}
 
 			await loadChat();
-		} catch (error) {
-			const message = error?.detail ?? error?.message ?? $i18n.t('Context compaction failed');
-			toast.error(message, { id: toastId });
+		} catch (error: any) {
+			if (error?.status === 409) {
+				// A concurrent auto/manual compaction already holds the per-chat lease.
+				// Leave the lifecycle status alone: the in-flight run owns it and will
+				// publish its own completion, so a 409 must not mislabel it as failed.
+				toast.warning($i18n.t('Compaction already in progress'), { id: toastId });
+			} else {
+				const message = error?.detail ?? error?.message ?? $i18n.t('Context compaction failed');
+				toast.error(message, { id: toastId });
+				contextCompaction = {
+					...(contextCompaction ?? {}),
+					status: 'failed',
+					updated_at: Math.floor(Date.now() / 1000),
+					error: error?.detail ?? error?.message ?? $i18n.t('Context compaction failed')
+				};
+			}
 		} finally {
 			messageInput?.focus({ preventScroll: true });
+		}
+	};
+
+	// Undo a checkpoint: clear the structured record on the boundary message so
+	// the full history projects again. The row disappears; the dropped messages
+	// were never deleted.
+	const handleUndoCheckpoint = async (messageId: string) => {
+		if (!contextCompactionEnabled) {
+			toast.message($i18n.t('Context compaction is disabled'));
+			return;
+		}
+		const currentHistory: any = history;
+		if (!$chatId || !messageId || !currentHistory?.messages?.[messageId]) {
+			toast.message($i18n.t('No chat to compact'));
+			return;
+		}
+
+		const toastId = toast.loading($i18n.t('Removing checkpoint...'));
+		try {
+			const nextHistory: any = structuredClone(currentHistory);
+			// Clear every checkpoint, not just the clicked one. Each compaction
+			// writes its record onto a boundary message and leaves any earlier
+			// record in the summarized-away prefix, so clearing only the newest
+			// would let the read shim fall back to an older checkpoint instead of
+			// restoring the full history. Empty string (not a missing key) is
+			// required: the backend only clears the stored column when the field
+			// is present.
+			for (const message of Object.values(nextHistory.messages ?? {}) as any[]) {
+				if ('contextSummary' in message || 'context_summary' in message) {
+					message.contextSummary = '';
+					delete message.context_summary;
+				}
+			}
+
+			await updateChatById(localStorage.token, $chatId, { history: nextHistory });
+
+			for (const message of Object.values(currentHistory.messages ?? {}) as any[]) {
+				delete message.contextSummary;
+				delete message.context_summary;
+			}
+			history = history;
+
+			toast.success($i18n.t('Context checkpoint removed'), { id: toastId });
+			await loadChat();
+		} catch (error: any) {
+			const message =
+				error?.detail ?? error?.message ?? $i18n.t('Failed to remove context checkpoint');
+			toast.error(message, { id: toastId });
 		}
 	};
 
@@ -4477,6 +4597,11 @@
 										forkHandler={handleForkChat}
 										topPadding={!embedded}
 										bottomPadding={files.length > 0}
+										{contextUsage}
+										{contextCompaction}
+										{contextCompactionEnabled}
+										onUndoCheckpoint={handleUndoCheckpoint}
+										onRegenerateCheckpoint={handleManualCompact}
 										{onSelect}
 										{onInsertToNote}
 									/>
@@ -4516,6 +4641,7 @@
 										dropzoneId={messageInputDropzoneId}
 										chatId={$chatId}
 										{contextUsage}
+										{contextUsageSource}
 										{contextCompactionEnabled}
 										{embedded}
 										compactHandler={handleManualCompact}
@@ -4608,6 +4734,7 @@
 										dropzoneId={messageInputDropzoneId}
 										chatId={$chatId}
 										{contextUsage}
+										{contextUsageSource}
 										{contextCompactionEnabled}
 										{embedded}
 										compactHandler={handleManualCompact}

@@ -48,7 +48,9 @@
 		ENABLE_CONTEXT_COMPACTION: false,
 		CONTEXT_COMPACTION_TOKEN_THRESHOLD: 80000,
 		CONTEXT_COMPACTION_TOKEN_CAP: 80000,
-		CONTEXT_COMPACTION_RETENTION_PERCENTAGE: 40,
+		CONTEXT_COMPACTION_BUFFER: 20000,
+		CONTEXT_COMPACTION_KEEP_TOKENS: 15000,
+		CONTEXT_COMPACTION_AUTO: true,
 		CONTEXT_COMPACTION_PROMPT_TEMPLATE: '',
 		ENABLE_TOOL_PERMISSIONS: false
 	};
@@ -277,6 +279,14 @@
 				</AdminSettingRow>
 
 				{#if chatConfig.ENABLE_CONTEXT_COMPACTION}
+					<AdminSettingRow
+						label={$i18n.t('settings.admin.interface.contextCompactionAuto.label')}
+						description={$i18n.t('settings.admin.interface.contextCompactionAuto.description')}
+						let:labelId
+					>
+						<Switch bind:state={chatConfig.CONTEXT_COMPACTION_AUTO} ariaLabelledbyId={labelId} />
+					</AdminSettingRow>
+
 					<AdminSettingField
 						label={$i18n.t('settings.admin.interface.contextCompactionModel.label')}
 						description={$i18n.t('settings.admin.interface.contextCompactionModel.description')}
@@ -328,16 +338,30 @@
 					</AdminSettingField>
 
 					<AdminSettingField
-						label={$i18n.t('settings.admin.interface.retainedMessages.label')}
-						description={$i18n.t('settings.admin.interface.retainedMessages.description')}
+						label={$i18n.t('settings.admin.interface.contextCompactionBuffer.label')}
+						description={$i18n.t('settings.admin.interface.contextCompactionBuffer.description')}
 					>
 						<input
 							type="number"
-							min="10"
-							max="50"
+							min="1"
 							step="1"
 							class={inputClass}
-							bind:value={chatConfig.CONTEXT_COMPACTION_RETENTION_PERCENTAGE}
+							bind:value={chatConfig.CONTEXT_COMPACTION_BUFFER}
+						/>
+					</AdminSettingField>
+
+					<AdminSettingField
+						label={$i18n.t('settings.admin.interface.contextCompactionKeepTokens.label')}
+						description={$i18n.t(
+							'settings.admin.interface.contextCompactionKeepTokens.description'
+						)}
+					>
+						<input
+							type="number"
+							min="1"
+							step="1"
+							class={inputClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_KEEP_TOKENS}
 						/>
 					</AdminSettingField>
 

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select, delete, func, cast, Integer, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 from open_webui.internal.db import Base, get_async_db_context
+from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.response import merge_usage, normalize_usage
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
@@ -64,6 +65,26 @@ def get_usage(data: dict) -> Optional[dict]:
     """Extract and normalize usage from message data."""
     usage = data.get('usage') or (data.get('info') or {}).get('usage')
     return normalize_usage(usage) if usage else None
+
+
+def normalize_context_summary(value: Any) -> Optional[str]:
+    """Normalize a checkpoint value for the ``context_summary`` Text column.
+
+    The column stores the structured record as a JSON string; legacy chats carry
+    a bare summary string. Both round-trip unchanged. A dict/list (a structured
+    record handed straight through) is JSON-encoded so the DB column never gets
+    a Python object.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, (dict, list)):
+        try:
+            return JSONCodec.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 def _token_columns(dialect: str):
@@ -235,7 +256,9 @@ class ChatMessageTable:
         if 'error' in data:
             message.error = data.get('error')
         if 'context_summary' in data or 'contextSummary' in data:
-            message.context_summary = data.get('context_summary') or data.get('contextSummary')
+            message.context_summary = normalize_context_summary(
+                data.get('context_summary') or data.get('contextSummary')
+            )
 
         usage = get_usage(data)
         if usage:
@@ -262,7 +285,7 @@ class ChatMessageTable:
             status_history=data.get('status_history') or data.get('statusHistory'),
             error=data.get('error'),
             usage=get_usage(data),
-            context_summary=data.get('context_summary') or data.get('contextSummary'),
+            context_summary=normalize_context_summary(data.get('context_summary') or data.get('contextSummary')),
             created_at=data.get('timestamp', now),
             updated_at=now,
         )

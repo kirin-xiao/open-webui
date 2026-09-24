@@ -37,6 +37,7 @@
 	export let hasChatContent = false;
 	export let contextPercent = 0;
 	export let contextHasThreshold = false;
+	export let contextSource = null;
 
 	let selectedIdx = 0;
 	export let filteredItems = [];
@@ -49,6 +50,10 @@
 		? Math.min(Math.max(0, Math.round(contextPercent)), 100)
 		: 0;
 	$: contextCircleOffset = 50.27 * (1 - contextCirclePercent / 100);
+	$: compactTooltip =
+		contextHasThreshold && contextSource
+			? `${$i18n.t('Shorten older messages so this chat can keep going.')} · ${$i18n.t('Budget source')}: ${contextSource === 'server' ? $i18n.t('Server') : $i18n.t('Estimated')}`
+			: $i18n.t('Shorten older messages so this chat can keep going.');
 
 	$: commandItems = [
 		...(canTemporary && 'temporary'.startsWith(query.toLowerCase())
@@ -210,10 +215,7 @@
 				</button>
 			</Tooltip>
 		{:else if item.data.id === 'compact'}
-			<Tooltip
-				content={$i18n.t('Shorten older messages so this chat can keep going.')}
-				placement="top"
-			>
+			<Tooltip content={compactTooltip} placement="top">
 				<button
 					type="button"
 					aria-label={$i18n.t('Compact: shorten older messages so this chat can keep going.')}

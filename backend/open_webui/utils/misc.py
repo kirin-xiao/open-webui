@@ -606,6 +606,24 @@ def get_last_assistant_message_item(messages: list[dict]) -> dict | None:
     return None
 
 
+def resolve_branch_flags(message_ids: list[dict], metadata: dict) -> tuple[bool, str | None]:
+    """Return ``(is_compare, primary_message_id)`` for a chat fan-out.
+
+    ``message_ids`` is the list of ``{model_id, message_id}`` entries a compare
+    request fans out to. A tool-approval resume arrives as a single-entry list
+    but carries its compare context on ``metadata``, so that wins over size.
+    The primary branch is the first entry that actually produces a message,
+    which is not necessarily entry 0.
+    """
+    resumed = metadata.get('compare_mode') is True
+    is_compare = len(message_ids) > 1 or resumed
+    primary_message_id = next(
+        (entry.get('message_id') for entry in message_ids if entry.get('message_id')),
+        None,
+    )
+    return is_compare, primary_message_id
+
+
 def get_last_assistant_message(messages: list[dict]) -> str | None:
     for message in reversed(messages):
         if message['role'] == 'assistant':
@@ -636,6 +654,15 @@ def merge_system_messages(messages: list[dict]) -> list[dict]:
     message at the start.  Multiple pipeline stages may each
     insert their own system message; this function consolidates
     them.
+
+    TODO (optional, deferred): preserve *non-leading* system messages in
+    chronological position and lower them per provider (OpenAI Chat: keep;
+    Anthropic: only on models that support it, else wrapped user text;
+    Gemini: fold into ``systemInstruction``; Ollama: template-dependent).
+    This is P2-3 of ``issues/system-prompt-analysis-and-improvement-plan.md``
+    and is not required for prompt-cache stability — the tail deltas already
+    travel as user text and the ledger/freeze do not depend on native
+    system-role fidelity. Revisit only for authoring-fidelity reasons.
     """
     system_contents: list[str] = []
     other_messages: list[dict] = []
@@ -653,6 +680,21 @@ def merge_system_messages(messages: list[dict]) -> list[dict]:
 
     merged = {'role': 'system', 'content': '\n'.join(system_contents)}
     return [merged, *other_messages]
+
+
+def message_contains_text(message: dict, text: str) -> bool:
+    """Whether a message's text content already contains ``text``.
+
+    Used by idempotent injection replay/splice so a block is never applied twice.
+    """
+    if not text:
+        return False
+    content = message.get('content')
+    if isinstance(content, str):
+        return text in content
+    if isinstance(content, list):
+        return any(item.get('type') == 'text' and text in item.get('text', '') for item in content)
+    return False
 
 
 def update_message_content(message: dict, content: str, append: bool = True) -> dict:

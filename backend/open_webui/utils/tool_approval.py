@@ -183,4 +183,7 @@ async def build_tool_approval_resume_payload(chat_id: str, message_id: str, chat
         'parent_id': user_message.get('parentId'),
         'user_message': user_message,
         'assistant_message_id': message_id,
+        # Re-arm compare-mode gating for the resumed branch (#30238).
+        'compare_mode': message_meta.get('compare_mode') or False,
+        'is_primary_branch': message_meta.get('is_primary_branch') or False,
     }

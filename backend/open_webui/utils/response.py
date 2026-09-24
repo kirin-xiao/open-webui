@@ -1,3 +1,4 @@
+import logging
 from numbers import Number
 from uuid import uuid4
 
@@ -6,6 +7,8 @@ from open_webui.utils.misc import (
     openai_chat_chunk_message_template,
     openai_chat_completion_message_template,
 )
+
+log = logging.getLogger(__name__)
 
 
 # An honest ledger is worth more than a flattering one.
@@ -141,6 +144,93 @@ def merge_usage(current: dict | None, incoming: dict | None) -> dict:
     )
 
     return result
+
+
+# Provider prompt-cache counters the fork routes through. Top-level names cover
+# Anthropic (cache_read/creation_input_tokens) and Gemini/OpenRouter
+# (total_cached_tokens); OpenAI reports cached_tokens nested under
+# prompt_tokens_details.
+CACHE_USAGE_KEYS = (
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens',
+    'cached_tokens',
+    'cache_write_tokens',
+    'total_cached_tokens',
+    'prompt_cache_hit_tokens',
+    'prompt_cache_miss_tokens',
+)
+
+CACHE_USAGE_DETAIL_KEYS = (
+    'cached_tokens',
+    'cache_write_tokens',
+    'total_cached_tokens',
+)
+
+CACHE_USAGE_DETAIL_CONTAINERS = (
+    'prompt_tokens_details',
+    'input_tokens_details',
+    'cache_details',
+)
+
+
+def extract_cache_usage(usage: dict | None) -> dict:
+    """Best-effort extraction of provider prompt-cache counters from a usage payload.
+
+    Covers the providers the fork actually routes:
+    - Anthropic: ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+    - OpenAI: ``cached_tokens`` / ``cache_write_tokens`` (top level or nested
+      under ``prompt_tokens_details``)
+    - Gemini (OpenAI-compatible): ``total_cached_tokens``
+
+    Returns only counters that are actually present, coerced to int. Never
+    raises, so it is safe to call on any provider usage blob.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return {}
+
+    counters: dict[str, int] = {}
+
+    def record(key: str, value) -> None:
+        if isinstance(value, bool) or not isinstance(value, Number):
+            return
+        # ``Number`` also covers complex and non-finite floats/Decimals, whose
+        # ``int()`` conversion raises. The docstring promises this never raises,
+        # and a malformed provider usage blob must not abort a chat turn.
+        try:
+            counters[key] = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return
+
+    for key in CACHE_USAGE_KEYS:
+        record(key, usage.get(key))
+
+    for container_key in CACHE_USAGE_DETAIL_CONTAINERS:
+        details = usage.get(container_key)
+        if isinstance(details, dict):
+            for key in CACHE_USAGE_DETAIL_KEYS:
+                record(key, details.get(key))
+
+    return counters
+
+
+def log_cache_usage(usage: dict | None, *, source: str = '', model: str = '') -> dict:
+    """Log the prompt-cache counters reported by one provider response.
+
+    Emits a single parseable ``cache_usage`` record and returns the extracted
+    counters (empty dict when the provider reported none). This is the
+    guardrail for the frozen-baseline design: if reads stay zero on a stable
+    chat, something above the cache breakpoint is churning.
+    """
+    counters = extract_cache_usage(usage)
+    if not counters:
+        return {}
+    log.info(
+        'cache_usage source=%s model=%s %s',
+        source or '-',
+        model or '-',
+        JSONCodec.dumps(counters, sort_keys=True),
+    )
+    return counters
 
 
 def convert_ollama_tool_call_to_openai(tool_calls: list) -> list:
