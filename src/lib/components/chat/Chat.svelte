@@ -46,7 +46,9 @@
 		showFileNavPath,
 		showFileNavDir,
 		chatRequestQueues,
-		desktopEvent
+		desktopEvent,
+		subagentCompletions,
+		subagentSessions
 	} from '$lib/stores';
 	import { refreshChatList, refreshFolderChatLists } from '$lib/stores/chatList';
 
@@ -70,7 +72,7 @@
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
 	import { getMessageCheckpoint } from '$lib/utils/contextCompaction';
-	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
+	import { applyResponseStreamEvent, collectCompletedSubagentIds, getOutputText } from './Messages/structuredOutput';
 
 	import {
 		archiveChatById,
@@ -399,7 +401,7 @@
 	let generationController = null;
 	let contextCompactionToastId: any = null;
 
-	let chat = null;
+	let chat: any = null;
 	let tags = [];
 
 	// Read-only when viewing someone else's chat (e.g. via shared folder access)
@@ -1301,6 +1303,26 @@
 			if (type === 'chat:list') {
 				return;
 			}
+			if (type === 'subagent:created') {
+				// A tool call reported the child it spawned. Record it against the
+				// call so its row can link into the child immediately, before the
+				// run's `<subagent sessionID=...>` result exists. Handled before the
+				// message lookup below: the row renders reactively from the store and
+				// must not depend on the message being loaded yet.
+				const data = event?.data?.data ?? null;
+				const callId = data?.call_id;
+				const childId = data?.sessionID;
+				if (callId && childId) {
+					const key = `${data?.message_id ?? event.message_id}:${callId}`;
+					subagentSessions.update((map) => {
+						if (map.get(key) === childId) return map;
+						const next = new Map(map);
+						next.set(key, childId);
+						return next;
+					});
+				}
+				return;
+			}
 			let message = history.messages[event.message_id];
 
 			if (message) {
@@ -1999,6 +2021,30 @@
 	};
 
 	$: onHistoryChange(history);
+
+	// Feed the renderer the set of child chats whose background run has finished,
+	// so a still-running dispatch row keeps its spinner instead of flipping to
+	// "done" as soon as the immediate `running` handle lands in history.
+	let subagentCompletionKey = '';
+	$: {
+		const completed = collectCompletedSubagentIds(history?.messages ?? {});
+		const key = [...completed].sort().join('\n');
+		if (key !== subagentCompletionKey) {
+			subagentCompletionKey = key;
+			subagentCompletions.set(completed);
+		}
+	}
+
+	// A child subagent chat gets a slim banner back to the chat it was spawned
+	// from. Derived here so the template does not reach into the loosely-typed
+	// `chat` object directly.
+	$: isSubagentChat =
+		chat?.meta?.internal === true &&
+		chat?.meta?.type === 'subagent' &&
+		!!chat?.meta?.parent_chat_id;
+	$: subagentParentChatId = isSubagentChat ? String(chat.meta.parent_chat_id) : '';
+	$: subagentDescription =
+		isSubagentChat && typeof chat.meta.description === 'string' ? chat.meta.description : '';
 
 	const dispatchCallOverlayAudio = (message, final = false) => {
 		if (!$showCallOverlay) {
@@ -4494,6 +4540,24 @@
 							</Tooltip>
 						</div>
 					{:else}
+						{#if isSubagentChat}
+							<div
+								class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-gray-50/80 px-3 py-1.5 text-xs text-gray-500 dark:border-gray-850/40 dark:text-gray-400"
+							>
+								<span class="font-normal">{$i18n.t('Subagent chat for')}</span>
+								<a
+									href={`/c/${subagentParentChatId}`}
+									class="font-normal text-gray-700 transition hover:text-gray-900 hover:underline dark:text-gray-200 dark:hover:text-white"
+								>
+									{$i18n.t('Back to parent chat')}
+								</a>
+								{#if subagentDescription}
+									<span class="min-w-0 truncate text-gray-400 dark:text-gray-500">
+										{subagentDescription}
+									</span>
+								{/if}
+							</div>
+						{/if}
 						<Navbar
 							bind:this={navbarElement}
 							{readOnly}

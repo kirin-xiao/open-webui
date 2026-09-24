@@ -18,13 +18,13 @@ from open_webui.models.users import UserModel, Users
 from open_webui.tasks import create_task, has_active_tasks
 from open_webui.utils.auth import create_token
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import get_message_list
+from open_webui.utils.misc import get_message_list, is_pending_internal_message, resolve_history_tip
 from sqlalchemy import select
 from starlette.datastructures import Headers
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SUBAGENT_SYSTEM_PROMPT = """You are a sub-agent working on a specific task assigned by the lead agent.
+DEFAULT_SUBAGENT_SYSTEM_PROMPT = """You are a subagent working on a specific task assigned by the lead agent.
 
 You have full access to the workspace — you can read, write, edit files, and run commands.
 Focus exclusively on your assigned task. Do NOT work on anything outside your scope.
@@ -88,7 +88,7 @@ async def _wait_for_active_tasks(redis, chat_id: str, timeout: float = PENDING_A
 
 
 async def _subagent_chain_depth(chat_id: str) -> int:
-    """Count sub-agent links between `chat_id` and the root chat.
+    """Count subagent links between `chat_id` and the root chat.
 
     Walks the persisted internal linkage (`meta.type == 'subagent'` and
     `meta.parent_chat_id`) rather than an in-memory counter, so it is correct
@@ -112,6 +112,60 @@ async def _subagent_chain_depth(chat_id: str) -> int:
         depth += 1
         current = parent
     return depth
+
+
+def _session_is_live(session_id: str | None, user_id: str) -> bool:
+    """True when `session_id` is a live socket session owned by `user_id`.
+
+    The pyodide code interpreter executes in the user's browser through this
+    inherited socket session; when the session is gone the event call returns an
+    immediate error. Missing Redis/socket wiring is treated as "not live".
+    """
+    try:
+        from open_webui.socket.main import SESSION_POOL
+
+        session = SESSION_POOL.get(session_id) if session_id else None
+        return bool(session) and session.get('id') == user_id
+    except Exception:
+        return False
+
+
+def _extract_summary(message: dict) -> str:
+    """Best-effort final answer for a finished subagent turn.
+
+    Prefers the last output item of type ``message`` (the final round). ``content``
+    is only a fallback: it concatenates every tool-loop round, so it leaks interim
+    narration ("I've made substantial progress...") ahead of the final answer.
+    The whole-content join is the legacy fallback when no message item exists.
+    """
+    output = message.get('output') or []
+    last_message = next((item for item in reversed(output) if item.get('type') == 'message'), None)
+    if last_message is not None:
+        summary = ''.join(
+            str(part.get('text', ''))
+            for part in last_message.get('content') or []
+            if isinstance(part, dict) and part.get('text') is not None
+        )
+        if summary:
+            return summary
+
+    summary = message.get('content') or ''
+    if isinstance(summary, list):
+        summary = ''.join(
+            str(item.get('text', ''))
+            for item in summary
+            if isinstance(item, dict) and item.get('type') == 'text'
+        )
+    if summary:
+        return summary
+
+    return ''.join(
+        str(part.get('text', ''))
+        for item in output
+        if item.get('type') == 'message'
+        for part in item.get('content') or []
+        if isinstance(part, dict) and part.get('text') is not None
+    )
 
 
 def _build_request(source: Request, user_id: str, *, internal: bool) -> Request:
@@ -146,6 +200,9 @@ async def process_pending_internal_messages(
     run: dict,
 ) -> None:
     await _wait_for_active_tasks(source_request.app.state.redis, parent_chat_id)
+
+    # Imported here (not at module load) to avoid a circular import at startup.
+    from open_webui.socket.main import sio
 
     async with _parent_lock_scope(parent_chat_id):
         if await has_active_tasks(source_request.app.state.redis, parent_chat_id):
@@ -187,7 +244,9 @@ async def process_pending_internal_messages(
             first = pending[0]
             first_meta = first.get('meta') or {}
             kind = 'timer' if first_meta.get('internal') is True and first_meta.get('type') == 'timer' else 'subagent'
-            parent_id = first.get('parentId')
+            # The enqueue-time anchor. Re-resolved below, before the synthesis turn
+            # is built, because the tip may have advanced since this was written.
+            stored_parent_id = first.get('parentId')
             if kind == 'timer' and first_meta.get('timer_id'):
                 timer = await Chats.get_chat_by_id(first_meta['timer_id'])
                 run = {**run, **(((timer.meta or {}).get('run') if timer else None) or {})}
@@ -199,7 +258,7 @@ async def process_pending_internal_messages(
                     message
                     for message in pending
                     for meta in [message.get('meta') or {}]
-                    if message.get('parentId') == parent_id
+                    if message.get('parentId') == stored_parent_id
                     and (message.get('model') or model_id) == model_id
                     and (
                         meta.get('internal') is True
@@ -264,12 +323,38 @@ async def process_pending_internal_messages(
                 removed_ids = {message['id'] for message in batch}
                 for message_id in removed_ids:
                     messages.pop(message_id, None)
-                if parent_id and parent_id in messages:
-                    messages[parent_id]['childrenIds'] = [
+                if stored_parent_id and stored_parent_id in messages:
+                    messages[stored_parent_id]['childrenIds'] = [
                         child_id
-                        for child_id in messages[parent_id].get('childrenIds', [])
+                        for child_id in messages[stored_parent_id].get('childrenIds', [])
                         if child_id not in removed_ids
                     ]
+
+                # Re-resolve the anchor against the freshly-read history. A result
+                # enqueued mid-turn carries the tip from enqueue time; the user's
+                # turn may have advanced (or, in the fork bug, the enqueue-time
+                # anchor was a completed sibling) since then. Appending at the
+                # current tip at *delivery* time mirrors opencode's promote step
+                # (its pending completion is promoted at the session tip, never at
+                # the spawn point). The batch nodes are already removed above, so
+                # the walk cannot land on a to-be-discarded result.
+                #
+                # TODO(future): carry a background response as a steer message —
+                # an admission/queue promoted at the next step boundary — instead
+                # of a parentId-anchored history write. This mirrors opencode's
+                # `session.synthetic(delivery: "steer")` and would remove the
+                # anchor/tree coupling entirely.
+                tip_seed = history.get('currentId') if history.get('currentId') in messages else stored_parent_id
+                parent_id = resolve_history_tip(
+                    messages,
+                    tip_seed,
+                    stored_parent_id if stored_parent_id in messages else None,
+                    blocked=is_pending_internal_message,
+                )
+            else:
+                # A reused (already-delivered, non-pending) result keeps its
+                # original anchor; there is nothing to re-resolve.
+                parent_id = stored_parent_id
 
             assistant_message_id = str(uuid4())
             message_list = get_message_list(messages, parent_id)
@@ -306,6 +391,11 @@ async def process_pending_internal_messages(
             history['messages'] = messages
             history['currentId'] = assistant_message_id
             chat.chat = {**(chat.chat or {}), 'history': history}
+            # Keep the denormalized tip column in step with the in-JSON tip. The
+            # read path trusts the column when present (and `loadChat` overrides
+            # the loaded history with it), so a stale column would hide the
+            # synthesis stream until the next save advanced it.
+            chat.current_message_id = assistant_message_id
             chat.updated_at = int(time.time())
             await db.commit()
 
@@ -314,12 +404,71 @@ async def process_pending_internal_messages(
         await ChatMessages.upsert_message(user_message_id, parent_chat_id, user_id, user_message)
         await ChatMessages.upsert_message(assistant_message_id, parent_chat_id, user_id, assistant_message)
 
-    # Release the parent-history lock before the synthesis turn. The synthesis
-    # request is internal, so `CHAT_COMPLETION_HANDLER` awaits the whole turn
-    # inline; holding the lock across it would delay a concurrent timer or the
-    # next drain. This matches the timer path, which also releases first.
-    from open_webui.socket.main import sio
+        # Build and register the synthesis while still holding the parent lock.
+        # `run_background` checks `has_active_tasks` under this same lock before
+        # deciding to defer, so registering here (rather than after release)
+        # guarantees a child that finishes during this window sees the task and
+        # defers (`status: pending`) instead of launching a parallel synthesis.
+        form_data = {
+            'model': model_id,
+            'messages': [
+                *([{'role': 'system', 'content': system_prompt}] if system_prompt else []),
+                *message_list,
+                {'role': 'user', 'content': combined_content},
+            ],
+            'stream': True,
+            'chat_id': parent_chat_id,
+            'id': assistant_message_id,
+            'parent_id': parent_id,
+            'user_message': user_message,
+            'session_id': run.get('session_id') or f'{kind}-result:{parent_chat_id}',
+            'background_tasks': {},
+            'tool_ids': run.get('tool_ids') or [],
+            'skill_ids': run.get('skill_ids') or [],
+            'filter_ids': run.get('filter_ids') or [],
+            'features': run.get('features') or {},
+            'files': run.get('files') or [],
+            'variables': run.get('variables') or {},
+        }
+        if run.get('terminal_id'):
+            form_data['terminal_id'] = run['terminal_id']
 
+        # The result-synthesis turn is internal: it must not advertise the
+        # subagent tool, so a background result can never re-spawn a delegation
+        # (W10). Internal runs also skip the pending-message reprocessing hook.
+        request = _build_request(source_request, user.id, internal=True)
+        folder_id = await Chats.get_chat_folder_id(parent_chat_id, user.id)
+
+        async def run_synthesis() -> None:
+            # Mark the parent chat active before the turn streams so the client
+            # keeps the just-reloaded assistant leaf alive instead of
+            # force-marking it done. Register before the reload so the client
+            # sees the task when it reconciles the reloaded history.
+            await sio.emit(
+                'events',
+                {
+                    'chat_id': parent_chat_id,
+                    'message_id': assistant_message_id,
+                    'data': {
+                        'type': 'chat:active',
+                        'data': {'active': True, 'folder_id': folder_id},
+                    },
+                },
+                room=f'user:{user.id}',
+            )
+            await source_request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
+
+        _, synthesis_task = await create_task(
+            source_request.app.state.redis,
+            run_synthesis(),
+            id=parent_chat_id,
+        )
+
+    # Release the parent-history lock now that the synthesis is registered. The
+    # synthesis request is internal, so `CHAT_COMPLETION_HANDLER` would otherwise
+    # await the whole turn inline; holding the lock across it would delay a
+    # concurrent timer or the next drain. This matches the timer path, which also
+    # releases first.
     await sio.emit(
         'events',
         {
@@ -330,35 +479,27 @@ async def process_pending_internal_messages(
         room=f'user:{user.id}',
     )
 
-    form_data = {
-        'model': model_id,
-        'messages': [
-            *([{'role': 'system', 'content': system_prompt}] if system_prompt else []),
-            *message_list,
-            {'role': 'user', 'content': combined_content},
-        ],
-        'stream': True,
-        'chat_id': parent_chat_id,
-        'id': assistant_message_id,
-        'parent_id': parent_id,
-        'user_message': user_message,
-        'session_id': run.get('session_id') or f'{kind}-result:{parent_chat_id}',
-        'background_tasks': {},
-        'tool_ids': run.get('tool_ids') or [],
-        'skill_ids': run.get('skill_ids') or [],
-        'filter_ids': run.get('filter_ids') or [],
-        'features': run.get('features') or {},
-        'files': run.get('files') or [],
-        'variables': run.get('variables') or {},
-    }
-    if run.get('terminal_id'):
-        form_data['terminal_id'] = run['terminal_id']
+    async def _after_synthesis() -> None:
+        # Drain any result that deferred while this synthesis was running. The
+        # drain waits for this just-finished task to clear via `_wait_for_active_tasks`.
+        try:
+            await process_pending_internal_messages(source_request, parent_chat_id, user.id, run)
+        except Exception:
+            log.exception('Failed to drain pending internal messages for chat %s', parent_chat_id)
+        if not await has_active_tasks(source_request.app.state.redis, parent_chat_id):
+            await sio.emit(
+                'events',
+                {
+                    'chat_id': parent_chat_id,
+                    'message_id': assistant_message_id,
+                    'data': {'type': 'chat:active', 'data': {'active': False}},
+                },
+                room=f'user:{user.id}',
+            )
 
-    # The result-synthesis turn is internal: it must not advertise the
-    # sub-agent tool, so a background result can never re-spawn a delegation
-    # (W10). Internal runs also skip the pending-message reprocessing hook.
-    request = _build_request(source_request, user.id, internal=True)
-    await source_request.app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
+    # Do not emit active:false from `run_synthesis`: the task is still registered
+    # then. Flip it off only after the drain and once nothing else is active.
+    synthesis_task.add_done_callback(lambda _task: asyncio.create_task(_after_synthesis()))
 
 
 async def delegate(
@@ -375,6 +516,7 @@ async def delegate(
     metadata: dict,
     parent_chat_id: str,
     parent_message_id: str | None,
+    tool_call_id: str | None = None,
 ) -> str:
     prompt = (prompt or '').strip()
     description = (description or '').strip()
@@ -397,12 +539,6 @@ async def delegate(
     admin_model = str(config.get('subagents.model') or '').strip()
 
     features = copy.deepcopy(metadata.get('features') or {})
-    if (
-        background
-        and features.get('code_interpreter')
-        and await Config.get('code_interpreter.engine', 'pyodide') != 'jupyter'
-    ):
-        features.pop('code_interpreter')
 
     # Model precedence: explicit per-call > admin default > parent chat model.
     parent_model = metadata.get('model_id') or (metadata.get('model') or {}).get('id')
@@ -418,6 +554,9 @@ async def delegate(
         'tool_ids': copy.deepcopy(metadata.get('tool_ids') or []),
         'skill_ids': copy.deepcopy(metadata.get('skill_ids') or []),
         'system_prompt': metadata.get('system_prompt'),
+        # TODO: tool_servers are dropped for background runs because their MCP
+        # transport is tied to the caller's live socket session; revisit with the
+        # same liveness gating as code_interpreter below.
         'tool_servers': [] if background else copy.deepcopy(metadata.get('tool_servers') or []),
         'filter_ids': copy.deepcopy(metadata.get('filter_ids') or []),
         'terminal_id': metadata.get('terminal_id'),
@@ -429,7 +568,7 @@ async def delegate(
     if not run.get('model_id'):
         return 'Error: model context is required.'
     if run.get('direct'):
-        return 'Error: sub-agents are unavailable for direct connections.'
+        return 'Error: subagents are unavailable for direct connections.'
 
     # Depth cap (opencode `experimental.subagent_depth`, default 1). A negative
     # limit disables the cap. Checked before any child chat is created or reused.
@@ -437,8 +576,8 @@ async def delegate(
         depth = await _subagent_chain_depth(parent_chat_id)
         if depth >= depth_limit:
             return (
-                f'Error: sub-agent depth limit reached ({depth_limit}). '
-                'Sub-agents cannot spawn nested sub-agents; increase subagents.depth to allow it.'
+                f'Error: subagent depth limit reached ({depth_limit}). '
+                'Subagents cannot spawn nested subagents; increase subagents.depth to allow it.'
             )
 
     if file_ids:
@@ -467,6 +606,21 @@ async def delegate(
         run['files'] = []
 
     user = UserModel(**user_data)
+
+    # pyodide executes in the user's browser via the inherited socket session;
+    # when the session is gone the event call returns an immediate error and the
+    # subagent continues without code, so dropping it is safe. A live, owned
+    # session keeps it. (Jupyter runs server-side, independent of the session.)
+    # TODO: bound concurrent code-exec-capable background children / consider
+    # keying the pyodide runtime by parent chat id.
+    if (
+        background
+        and features.get('code_interpreter')
+        and await Config.get('code_interpreter.engine', 'pyodide') != 'jupyter'
+        and not _session_is_live(run.get('session_id'), user.id)
+    ):
+        features.pop('code_interpreter')
+
     delegation_id = f'deleg_{uuid4().hex[:8]}'
     prompt_text = f'{prompt}\n\n## Context\n{context}' if context else prompt
 
@@ -482,7 +636,7 @@ async def delegate(
             return f'Error: sessionID "{session_id}" was not found.'
         existing_meta = existing_chat.meta or {}
         if existing_meta.get('internal') is not True or existing_meta.get('type') != 'subagent':
-            return f'Error: sessionID "{session_id}" is not a sub-agent session.'
+            return f'Error: sessionID "{session_id}" is not a subagent session.'
         if existing_meta.get('parent_chat_id') != parent_chat_id:
             return f'Error: sessionID "{session_id}" does not belong to this chat.'
 
@@ -570,7 +724,7 @@ async def delegate(
                 ChatForm(
                     chat={
                         'id': chat_id,
-                        'title': f'Sub-agent: {(description or prompt)[:60]}',
+                        'title': f'Subagent: {(description or prompt)[:60]}',
                         'models': [run['model_id']],
                         'history': {
                             'currentId': assistant_message_id,
@@ -607,13 +761,45 @@ async def delegate(
                     'description': description,
                     'model': run['model_id'],
                     'mode': 'background' if background else 'foreground',
+                    **({'tool_call_id': tool_call_id} if tool_call_id else {}),
                 },
             )
             if not chat:
-                raise RuntimeError('Failed to create sub-agent chat')
+                raise RuntimeError('Failed to create subagent chat')
     except Exception as exc:
         prefix = 'background ' if background else ''
-        return f'Error: failed to create {prefix}sub-agent: {exc}'
+        return f'Error: failed to create {prefix}subagent: {exc}'
+
+    # Continuations reuse the existing child chat, so seed the call linkage on its
+    # meta as well; the creation path already carries it via `internal_meta`. This
+    # is the durable seed a later reader can use to rebuild the call -> child map.
+    if existing_chat is not None and tool_call_id:
+        await Chats.update_chat_meta_by_id(chat_id, {'tool_call_id': tool_call_id})
+
+    # Tell the parent chat which child this exact tool call spawned, so its row can
+    # link into the child while the run is still in progress (the `<subagent ...>`
+    # result envelope only exists once the child finishes). Best-effort: a failed
+    # emit must never break the delegation.
+    if tool_call_id:
+        try:
+            from open_webui.socket.main import get_event_emitter
+
+            event_emitter = await get_event_emitter(metadata)
+            if event_emitter:
+                await event_emitter(
+                    {
+                        'type': 'subagent:created',
+                        'data': {
+                            'call_id': tool_call_id,
+                            'sessionID': chat_id,
+                            'message_id': metadata.get('message_id'),
+                            'description': description,
+                            'background': background,
+                        },
+                    }
+                )
+        except Exception:
+            log.exception('Failed to emit subagent:created for child %s', chat_id)
 
     async def run_reserved() -> dict:
         try:
@@ -666,37 +852,23 @@ async def delegate(
                 return {
                     'status': 'error',
                     'summary': '',
-                    'error': 'Sub-agent chat or completion message no longer exists.',
+                    'error': 'Subagent chat or completion message no longer exists.',
                 }
 
-            summary = message.get('content') or ''
-            if isinstance(summary, list):
-                summary = ''.join(
-                    str(item.get('text', ''))
-                    for item in summary
-                    if isinstance(item, dict) and item.get('type') == 'text'
-                )
-            if not summary:
-                summary = ''.join(
-                    str(part.get('text', ''))
-                    for item in message.get('output') or []
-                    if item.get('type') == 'message'
-                    for part in item.get('content') or []
-                    if part.get('type') == 'output_text'
-                )
+            summary = _extract_summary(message)
             if len(summary) > max_output:
                 summary = f'{summary[:max_output]}\n\n[output truncated]'
             error = message.get('error')
             return {
                 'status': 'error' if error else 'completed',
-                'summary': summary or ('Sub-agent produced no output.' if not error else ''),
+                'summary': summary or ('Subagent produced no output.' if not error else ''),
                 'error': error,
             }
         except asyncio.CancelledError:
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 chat_id,
                 assistant_message_id,
-                {'done': True, 'error': {'content': 'Sub-agent cancelled.'}},
+                {'done': True, 'error': {'content': 'Subagent cancelled.'}},
             )
             raise
         except Exception as exc:
@@ -720,16 +892,16 @@ async def delegate(
         state = result.get('status') or 'completed'
         summary = result.get('summary') or ''
         if state == 'interrupted':
-            body = 'The sub-agent was interrupted before completing.'
+            body = 'The subagent was interrupted before completing.'
             if summary:
                 body = f'{body}\n\nPartial output:\n{summary}'
         elif state == 'error':
             detail = f' {result.get("error")}' if result.get('error') else ''
-            body = f'The sub-agent did not complete successfully.{detail}'
+            body = f'The subagent did not complete successfully.{detail}'
             if summary:
                 body = f'{body}\n\nPartial output:\n{summary}'
         else:
-            body = summary or 'Sub-agent completed without a final summary.'
+            body = summary or 'Subagent completed without a final summary.'
         envelope = f'<subagent sessionID="{chat_id}" state="{state}">\n{body}\n</subagent>'
 
         pending_message_id = str(uuid4())
@@ -758,10 +930,12 @@ async def delegate(
         }
 
         async with _parent_lock_scope(parent_chat_id):
+            # Read the parent (ownership-checked) just to resolve the anchor. The
+            # session is closed before the merge write: the write opens its own
+            # session, and holding a `FOR UPDATE` row lock across it would
+            # self-deadlock on Postgres.
             async with get_async_db() as db:
                 stmt = select(Chat).where(Chat.id == parent_chat_id, Chat.user_id == user.id)
-                if db.bind.dialect.name == 'postgresql':
-                    stmt = stmt.with_for_update()
                 result_row = await db.execute(stmt)
                 parent = result_row.scalar_one_or_none()
                 if not parent:
@@ -769,31 +943,35 @@ async def delegate(
                         raise asyncio.CancelledError
                     return result
 
-                updated_chat = copy.deepcopy(parent.chat or {})
-                updated_history = updated_chat.setdefault('history', {})
-                updated_messages = updated_history.setdefault('messages', {})
-                done_assistants = [
-                    message
-                    for message in updated_messages.values()
-                    if message.get('role') == 'assistant' and message.get('done') is not False
-                ]
-                result_parent_id = (
-                    max(done_assistants, key=lambda message: message.get('timestamp', 0)).get('id')
-                    if done_assistants
-                    else parent_message_id
+                parent_history = (parent.chat or {}).get('history') or {}
+                updated_messages = parent_history.get('messages') or {}
+                # Anchor the result at the chat's current branch tip, never at the
+                # "newest completed assistant". A live turn is persisted with
+                # `done: False`, so a timestamp scan skips it and forks the result
+                # off an earlier turn — orphaning the user's in-flight message.
+                # opencode's promote step appends a background completion at the
+                # session tip, so mirror that here. Prefer the denormalized tip
+                # column, falling back to the in-JSON tip for older rows.
+                result_parent_id = resolve_history_tip(
+                    updated_messages,
+                    parent.current_message_id or parent_history.get('currentId'),
+                    parent_message_id,
+                    blocked=is_pending_internal_message,
                 )
                 pending_message['parentId'] = result_parent_id
                 if await has_active_tasks(request.app.state.redis, parent_chat_id):
                     pending_message['meta']['status'] = 'pending'
-                updated_messages[pending_message_id] = pending_message
-                if result_parent_id and result_parent_id in updated_messages:
-                    children = updated_messages[result_parent_id].setdefault('childrenIds', [])
-                    if pending_message_id not in children:
-                        children.append(pending_message_id)
-                updated_history['messages'] = updated_messages
-                parent.chat = {**(parent.chat or {}), **updated_chat, 'history': updated_history}
-                parent.updated_at = int(time.time())
-                await db.commit()
+
+            # Merge only this node instead of overwriting the whole history blob.
+            # `update_chat_by_id` re-reads the row and runs `merge_history`, so a
+            # normal turn that wrote since our read is preserved. `currentId` is
+            # intentionally omitted: merge_history keeps the stored tip, and this
+            # node must not steal it (it may still be `pending`, and the drain
+            # advances the tip when the synthesis lands).
+            await Chats.update_chat_by_id(
+                parent_chat_id,
+                {'history': {'messages': {pending_message_id: pending_message}}},
+            )
 
             await ChatMessages.upsert_message(
                 message_id=pending_message_id,
@@ -834,9 +1012,15 @@ async def delegate(
             {
                 'sessionID': chat_id,
                 'status': 'running',
-                'output': (
-                    f'The sub-agent is working in the background (sessionID: {chat_id}). '
-                    'You will be notified when it finishes. DO NOT sleep, poll, or duplicate its work.'
+                'output': '\n\n'.join(
+                    [
+                        f'The subagent is working in the background (sessionID: {chat_id}). '
+                        'You will be notified automatically when it finishes.',
+                        'DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this '
+                        "subagent's work; avoid working with the same files or topics it is using.",
+                        'Work on non-overlapping tasks, or briefly tell the user what you launched and end your '
+                        'response.',
+                    ]
                 ),
             },
             ensure_ascii=False,
@@ -847,11 +1031,11 @@ async def delegate(
     except asyncio.CancelledError:
         if asyncio.current_task() and asyncio.current_task().cancelling():
             raise
-        return 'Error: sub-agent was cancelled.'
+        return 'Error: subagent was cancelled.'
     except Exception as exc:
         return f'Error: {exc}'
 
     if result.get('status') != 'completed':
-        return f'Error: {result.get("error") or "sub-agent failed."}'
-    summary = result.get('summary') or 'Sub-agent produced no output.'
+        return f'Error: {result.get("error") or "subagent failed."}'
+    summary = result.get('summary') or 'Subagent produced no output.'
     return f'<subagent sessionID="{chat_id}" state="completed">\n{summary}\n</subagent>'

@@ -2,29 +2,39 @@
 	import { getContext, onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
+	import { getModels } from '$lib/apis';
 	import { getSubagentsConfig, setSubagentsConfig } from '$lib/apis/configs';
+	import { getBaseModels } from '$lib/apis/models';
+	import SettingsSelect from '$lib/components/common/SettingsSelect.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
 
 	const i18n = getContext('i18n');
 
+	type ModelOption = {
+		id: string;
+		name: string;
+		connection_type?: string;
+	};
+
 	let loading = true;
 	let saving = false;
 	let enabled = false;
-	let backgroundEnabled = false;
-	let maxConcurrent = 20;
-	let maxAsync = 20;
+	let model = '';
 	let maxIterations = 30;
 	let maxOutput = 30000;
 	let systemPrompt = '';
+
+	let workspaceModels: ModelOption[] = [];
+	let baseModels: ModelOption[] = [];
+	let models: ModelOption[] | null = null;
+	$: modelOptions = models ?? [];
 
 	onMount(async () => {
 		try {
 			const config = await getSubagentsConfig(localStorage.token);
 			enabled = config?.ENABLE_SUBAGENTS ?? false;
-			backgroundEnabled = config?.SUBAGENTS_BACKGROUND_ENABLED ?? false;
-			maxConcurrent = Number(config?.SUBAGENTS_MAX_CONCURRENT) || 20;
-			maxAsync = Number(config?.SUBAGENTS_MAX_ASYNC) || 20;
+			model = config?.SUBAGENTS_MODEL ?? '';
 			maxIterations = Number(config?.SUBAGENTS_MAX_ITERATIONS) || 30;
 			maxOutput = Number(config?.SUBAGENTS_MAX_OUTPUT) || 30000;
 			systemPrompt = config?.SUBAGENTS_SYSTEM_PROMPT ?? '';
@@ -33,6 +43,27 @@
 		} finally {
 			loading = false;
 		}
+
+		try {
+			workspaceModels = (await getBaseModels(localStorage.token)) ?? [];
+			baseModels = (await getModels(localStorage.token, null, false)) ?? [];
+
+			models = baseModels.map((m) => {
+				const workspaceModel = workspaceModels.find((wm) => wm.id === m.id);
+
+				if (workspaceModel) {
+					return {
+						...m,
+						...workspaceModel
+					};
+				} else {
+					return m;
+				}
+			});
+		} catch (error) {
+			console.error('Failed to load subagent models:', error);
+			models = [];
+		}
 	});
 
 	const save = async () => {
@@ -40,9 +71,7 @@
 		try {
 			await setSubagentsConfig(localStorage.token, {
 				ENABLE_SUBAGENTS: enabled,
-				SUBAGENTS_BACKGROUND_ENABLED: backgroundEnabled,
-				SUBAGENTS_MAX_CONCURRENT: maxConcurrent,
-				SUBAGENTS_MAX_ASYNC: maxAsync,
+				SUBAGENTS_MODEL: model,
 				SUBAGENTS_MAX_ITERATIONS: maxIterations,
 				SUBAGENTS_MAX_OUTPUT: maxOutput,
 				SUBAGENTS_SYSTEM_PROMPT: systemPrompt
@@ -74,60 +103,32 @@
 				</label>
 				<p class="-mt-1 text-[0.6875rem] text-gray-400 dark:text-gray-600">
 					{$i18n.t(
-						'Allow the AI to delegate tasks to sub-agents. Each sub-agent creates a real chat with full tool access. Uses additional LLM calls.'
+						'Allow the AI to delegate tasks to subagents. Each subagent creates a real chat with full tool access. Uses additional LLM calls.'
 					)}
 				</p>
 
 				{#if enabled}
 					<div>
-						<label class="text-xs text-gray-600 dark:text-gray-400" for="sa-concurrent">
-							{$i18n.t('settings.admin.subagents.maxConcurrent.label')}
+						<label class="text-xs text-gray-600 dark:text-gray-400" for="sa-model">
+							{$i18n.t('settings.admin.subagents.model.label')}
 						</label>
-						<div class="mt-1 flex items-center gap-1.5">
-							<input
-								id="sa-concurrent"
-								type="number"
-								bind:value={maxConcurrent}
-								min="-1"
-								class="h-7 w-16 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden transition-colors focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:focus:border-blue-500"
-							/>
-							<span class="text-[0.6875rem] text-gray-400 dark:text-gray-600">
-								{$i18n.t('simultaneous sub-agents')}
-							</span>
+						<div class="mt-1">
+							<SettingsSelect
+								id="sa-model"
+								bind:value={model}
+								className="w-full"
+								placeholder={$i18n.t('Select a model')}
+							>
+								<option value="" selected>{$i18n.t('Current Model')}</option>
+								{#each modelOptions as m}
+									<option value={m.id} class="bg-gray-100 dark:bg-gray-700">
+										{m.name}
+										{m?.connection_type === 'local' ? `(${$i18n.t('Local')})` : ''}
+									</option>
+								{/each}
+							</SettingsSelect>
 						</div>
 					</div>
-
-					<div>
-						<label class="flex cursor-pointer items-center justify-between">
-							<span class="text-xs text-gray-600 dark:text-gray-400">
-								{$i18n.t('settings.admin.subagents.enableBackgroundSubAgents.label')}
-							</span>
-							<Switch bind:state={backgroundEnabled} />
-						</label>
-						<p class="mt-1 text-[0.6875rem] text-gray-400 dark:text-gray-600">
-							{$i18n.t('settings.admin.subagents.enableBackgroundSubAgents.description')}
-						</p>
-					</div>
-
-					{#if backgroundEnabled}
-						<div>
-							<label class="text-xs text-gray-600 dark:text-gray-400" for="sa-async">
-								{$i18n.t('settings.admin.subagents.maxBackground.label')}
-							</label>
-							<div class="mt-1 flex items-center gap-1.5">
-								<input
-									id="sa-async"
-									type="number"
-									bind:value={maxAsync}
-									min="-1"
-									class="h-7 w-16 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden transition-colors focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:focus:border-blue-500"
-								/>
-								<span class="text-[0.6875rem] text-gray-400 dark:text-gray-600">
-									{$i18n.t('background sub-agents')}
-								</span>
-							</div>
-						</div>
-					{/if}
 
 					<div>
 						<label class="text-xs text-gray-600 dark:text-gray-400" for="sa-iterations">
@@ -143,7 +144,7 @@
 								class="h-7 w-16 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden transition-colors focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:focus:border-blue-500"
 							/>
 							<span class="text-[0.6875rem] text-gray-400 dark:text-gray-600">
-								{$i18n.t('tool loops per sub-agent')}
+								{$i18n.t('tool loops per subagent')}
 							</span>
 						</div>
 					</div>
@@ -174,7 +175,7 @@
 							id="sa-prompt"
 							bind:value={systemPrompt}
 							rows="4"
-							placeholder={$i18n.t('You are a sub-agent...')}
+							placeholder={$i18n.t('You are a subagent...')}
 							class="mt-1 w-full resize-y rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 py-1.5 font-mono text-xs text-gray-700 outline-hidden transition-colors focus:border-blue-400 dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300 dark:focus:border-blue-500"
 						></textarea>
 						<p class="mt-0.5 text-[0.6875rem] text-gray-400 dark:text-gray-600">

@@ -19,7 +19,7 @@ from open_webui.models.users import UserModel, Users
 from open_webui.tasks import has_active_tasks
 from open_webui.utils.auth import VERIFIED_USER_ROLES
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import get_message_list
+from open_webui.utils.misc import get_message_list, is_pending_internal_message, resolve_history_tip
 from sqlalchemy import select
 from starlette.datastructures import Headers
 
@@ -231,7 +231,7 @@ async def execute_due_timer(app, timer_id: str, claim_id: str | None = None) -> 
     lock = _timer_locks.setdefault(timer_id, asyncio.Lock())
     async with lock:
         from open_webui.socket.main import sio
-        from open_webui.utils.subagents import _parent_locks
+        from open_webui.utils.subagents import _parent_lock_scope
 
         timer = await Chats.get_chat_by_id(timer_id)
         if not timer:
@@ -281,8 +281,7 @@ async def execute_due_timer(app, timer_id: str, claim_id: str | None = None) -> 
         user_message = None
         assistant_message = None
         message_list = []
-        parent_lock = _parent_locks.setdefault(parent_chat_id, asyncio.Lock())
-        async with parent_lock:
+        async with _parent_lock_scope(parent_chat_id):
             async with get_async_db() as db:
                 stmt = select(Chat).where(Chat.id == parent_chat_id, Chat.user_id == timer.user_id)
                 if db.bind.dialect.name == 'postgresql':
@@ -310,15 +309,15 @@ async def execute_due_timer(app, timer_id: str, claim_id: str | None = None) -> 
                 parent_chat = copy.deepcopy(parent.chat or {})
                 history = parent_chat.setdefault('history', {})
                 messages = history.setdefault('messages', {})
-                done_assistants = [
-                    message
-                    for message in messages.values()
-                    if message.get('role') == 'assistant' and message.get('done') is not False
-                ]
-                parent_id = (
-                    max(done_assistants, key=lambda message: message.get('timestamp', 0)).get('id')
-                    if done_assistants
-                    else meta.get('parent_message_id')
+                # Anchor at the current branch tip, not the newest completed
+                # assistant: a live turn carries `done: False`, so the timestamp
+                # scan would skip it and fork the timer result off an earlier
+                # turn, orphaning the user's in-flight message.
+                parent_id = resolve_history_tip(
+                    messages,
+                    history.get('currentId'),
+                    meta.get('parent_message_id'),
+                    blocked=is_pending_internal_message,
                 )
                 message_list = get_message_list(messages, parent_id)
 
@@ -351,6 +350,10 @@ async def execute_due_timer(app, timer_id: str, claim_id: str | None = None) -> 
 
                 parent.chat = parent_chat
                 history['currentId'] = assistant_message_id
+                # Keep the denormalized tip column in step with the in-JSON tip;
+                # the reload that follows would otherwise restore the previous
+                # tip over the just-created timer turn.
+                parent.current_message_id = assistant_message_id
                 parent.updated_at = int(time.time())
                 timer_row = await db.get(Chat, timer_id)
                 if timer_row:

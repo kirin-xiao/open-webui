@@ -2862,7 +2862,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # other injector); the memory preamble trails it only under the gate above,
     # and before ``add_memory_context`` appends the ``<memory_context>`` base.
     # Both fragments fold into the injection signature so toggling memory (or
-    # editing a constant) re-baselines as a user action. Internal task/sub-agent
+    # editing a constant) re-baselines as a user action. Internal task/subagent
     # requests carry their own system prompt and never freeze, so they are
     # excluded (the same guard `apply_system_baseline` uses).
     if not metadata.get('internal'):
@@ -6452,6 +6452,9 @@ async def streaming_chat_response_handler(response, ctx):
                                     extra_params={
                                         '__messages__': form_data.get('messages', []),
                                         '__files__': metadata.get('files', []),
+                                        # Call-scoped id so a tool (subagent) can report the
+                                        # child it spawned back to this exact tool-call row.
+                                        '__tool_call_id__': tool_call.get('id', ''),
                                     },
                                 )
                                 result = await function(**params)
@@ -6459,8 +6462,8 @@ async def streaming_chat_response_handler(response, ctx):
                             result = {'error': str(e)}
                         return params, result, tool, tool_type, direct_tool
 
-                    # Sub-agent calls (canonical name plus legacy aliases) run in
-                    # parallel. A single turn may not continue the same sub-agent
+                    # Subagent calls (canonical name plus legacy aliases) run in
+                    # parallel. A single turn may not continue the same subagent
                     # session twice: two concurrent continuations would race on the
                     # child chat's history.
                     seen_subagent_sessions: set[str] = set()
@@ -6477,7 +6480,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     return (
                                         params,
                                         f'Error: sessionID "{session_id}" was passed more than once '
-                                        'in one tool batch; each sub-agent session may be continued '
+                                        'in one tool batch; each subagent session may be continued '
                                         'once per turn.',
                                         None,
                                         None,

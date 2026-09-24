@@ -1383,6 +1383,52 @@ async def get_chat_by_id(
 
 
 ############################
+# GetChatSubagentsById
+############################
+
+
+class SubagentChatItem(BaseModel):
+    id: str
+    title: str
+    state: str
+    updated_at: int
+
+
+@router.get('/{id}/subagents', response_model=list[SubagentChatItem])
+async def get_chat_subagents_by_id(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """List the internal subagent child chats spawned from chat `id`."""
+    chat = await Chats.get_chat_by_id_for_user(
+        id,
+        user,
+        db=db,
+    )
+
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    subagents: list[SubagentChatItem] = []
+    for child_id in await Chats.get_internal_chat_ids_by_parent_id(id, user.id):
+        child = await Chats.get_chat_by_id(child_id, db=db)
+        if not child:
+            continue
+        meta = child.meta or {}
+        subagents.append(
+            SubagentChatItem(
+                id=child.id,
+                title=child.title,
+                state=meta.get('state') or meta.get('status') or '',
+                updated_at=child.updated_at,
+            )
+        )
+
+    return subagents
+
+
+############################
 # UpdateChatById
 ############################
 

@@ -38,6 +38,8 @@
 		embeds?: string;
 		done?: string;
 		status?: string;
+		sessionID?: string;
+		subagentState?: string;
 	} = {};
 
 	export let open = false;
@@ -173,12 +175,33 @@
 		return formatToolLabel(isDone ? done : active, $i18n);
 	})();
 
-	const toggleOpen = () => {
+	// A `subagent` call (including the `Background subagent: "..."` display name,
+	// plus the legacy `Background sub-agent: "..."` form persisted by older chats)
+	// may resolve to a real child chat; link the label into it. Non-subagent
+	// names never match, so their rows keep the plain toggle behaviour.
+	$: isSubagentCall = /^(background )?sub-?agent\b/i.test((attributes?.name ?? '').trim());
+	$: subagentSessionId = isSubagentCall ? (attributes?.sessionID ?? '') : '';
+
+	const toggleOpen = (event?: MouseEvent) => {
+		// Links inside the row (e.g. a subagent's child chat) handle their own
+		// navigation; don't also expand the card. SvelteKit's router intercepts the
+		// bubbled `<a>` click for client-side nav.
+		if (event?.target instanceof Element && event.target.closest('a')) {
+			return;
+		}
+
 		open = !open;
 	};
 
 	const toggleOpenOnKeydown = (event: KeyboardEvent) => {
 		if (event.key !== 'Enter' && event.key !== ' ') {
+			return;
+		}
+
+		// Let a focused link (the subagent child chat) keep its native Enter
+		// activation; intercepting here would both expand the card and suppress
+		// the anchor's default navigation.
+		if (event.target instanceof Element && event.target.closest('a')) {
 			return;
 		}
 
@@ -259,6 +282,18 @@
 						<span class="text-black dark:text-white">
 							{$i18n.t('Allow {{NAME}}?', { NAME: attributes.name })}
 						</span>
+					{:else if subagentSessionId}
+						<!-- Subagent rows link into the child chat instead of only expanding. -->
+						<a
+							href={`/c/${subagentSessionId}`}
+							title={toolLabelText}
+							class="text-black dark:text-white hover:underline"
+						>
+							<!-- Short label (below md) -->
+							<span class="@md:hidden">{toolLabelText}</span>
+							<!-- Full label (md and above) -->
+							<span class="hidden @md:inline font-normal">{toolLabelText}</span>
+						</a>
 					{:else}
 						<!-- Short label (below md) -->
 						<span class="@md:hidden text-black dark:text-white">{toolLabelText}</span>

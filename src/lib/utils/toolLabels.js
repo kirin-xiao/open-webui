@@ -4,7 +4,7 @@
  * The module is free of runtime imports (no Svelte, no i18next) so it can be unit
  * tested directly and consumed from either render path. It returns translation
  * descriptors (`{ key, values }`) for UI chrome and raw `{ text }` for content that
- * must not be translated (tool names, sub-agent titles). Callers render them with
+ * must not be translated (tool names, subagent titles). Callers render them with
  * `i18n.t(key, values)`; `formatToolLabel` is a convenience for that.
  *
  * This file is `.js` and `formatToolLabel` calls `t()` with literal
@@ -73,7 +73,7 @@ const TOOL_NAME_ALIASES = {
 	task: 'subagent'
 };
 
-/** Raw names that identify the sub-agent tool itself, not a rendered call. */
+/** Raw names that identify the subagent tool itself, not a rendered call. */
 const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'delegate_task', 'task']);
 
 /**
@@ -124,14 +124,17 @@ function canonicalToolName(name) {
 /**
  * `structuredOutput.ts` rewrites a `subagent` call (or a persisted `delegate_task`
  * / `task` call) into a display name such as
- * `Sub-agent: "..."` (or `Background sub-agent: "..."`). Those must stay data, not be
+ * `Subagent: "..."` (or `Background subagent: "..."`). Those must stay data, not be
  * re-summarised, so detect them here as well.
+ *
+ * Older chats persisted `Sub-agent:` / `Background sub-agent:` titles, so the
+ * hyphen is optional to keep those legacy rows rendering as data too.
  *
  * @param {string} name
  * @returns {boolean}
  */
 function isDelegateDisplayName(name) {
-	return /^(background )?sub-agent\b/i.test((name ?? '').trim());
+	return /^(background )?sub-?agent\b/i.test((name ?? '').trim());
 }
 
 /**
@@ -265,14 +268,14 @@ function askUserLabel(args) {
  * @returns {ToolLabel}
  */
 function delegateTaskLabel(displayName) {
-	// Sub-agent names carry the task text and are already meaningful; treat them as data.
+	// Subagent names carry the task text and are already meaningful; treat them as data.
 	// Bare tool names (canonical or alias, including a namespaced form) are not.
 	const trimmed = (displayName ?? '').trim();
 	const tail = trimmed.toLowerCase().split(/[.:/]/).pop() ?? '';
 	const name =
 		trimmed && !SUBAGENT_TOOL_NAMES.has(trimmed.toLowerCase()) && !SUBAGENT_TOOL_NAMES.has(tail)
 			? trimmed
-			: 'Sub-agent';
+			: 'Subagent';
 	/** @type {ToolLabelText} */
 	const label = { text: name };
 	return { active: label, done: label, category: 'other' };

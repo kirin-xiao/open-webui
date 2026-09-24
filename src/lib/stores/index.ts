@@ -55,6 +55,17 @@ export const TTSWorker = writable(null);
 export const chatId = writable('');
 export const chatTitle = writable('');
 
+// Child chat ids whose background subagent run has finished. Recomputed by
+// Chat.svelte from history; consumed by the structured output renderer so a
+// dispatch row keeps spinning until its child completes.
+export const subagentCompletions = writable(new Set<string>());
+
+// Live call -> child chat id map, keyed `${message_id}:${call_id}`. Populated
+// from the `subagent:created` socket event so a tool-call row can link into its
+// child while the run is still in progress (the result envelope only exists
+// once the child finishes).
+export const subagentSessions = writable(new Map<string, string>());
+
 export const channels = writable([]);
 export const channelId = writable(null);
 

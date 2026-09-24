@@ -214,6 +214,99 @@ def get_message_list(messages_map, message_id):
     return message_list
 
 
+def is_pending_internal_message(message) -> bool:
+    """An internal subagent/timer result that has not been synthesized yet.
+
+    These nodes sit at the tip with no children until the drain collapses them
+    into a synthesis turn. Two of them must stay *siblings* (so they batch)
+    rather than chaining one under the other.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    if message.get('childrenIds'):
+        return False
+    meta = message.get('meta') or {}
+    if meta.get('internal') is not True:
+        return False
+    if meta.get('type') == 'subagent':
+        return meta.get('status') in (None, 'pending')
+    return meta.get('type') == 'timer'
+
+
+def resolve_history_tip(messages_map, current_id, fallback_id=None, blocked=None):
+    """Return the branch tip a new turn should be appended after.
+
+    Background subagent and timer results must extend the user's *active* branch,
+    never fork off it. Walking ``current_id`` down to its last descendant via
+    ``childrenIds`` gives that tip. A timestamp scan is wrong: an in-flight turn is
+    persisted with ``done: False`` (and may even lack ``done``), so "newest
+    completed assistant" skips the live tip and orphans the user's message.
+
+    ``blocked`` marks a node the walk must not descend *into* (an undelivered
+    internal result). Skipping it keeps a second result a sibling of the first,
+    so the drain batches both instead of chaining and dropping one.
+
+    Falls back, in order, to the newest leaf by timestamp, then to ``fallback_id``
+    (e.g. the message that spawned the result) when the history is empty.
+    """
+    if not messages_map:
+        return fallback_id
+
+    if current_id and current_id in messages_map:
+        # A blocked start (unlikely: pending writes don't move currentId) should
+        # not become the anchor; ascend to its parent first.
+        start = current_id
+        ascents: set = set()
+        while (
+            blocked
+            and start in messages_map
+            and blocked(messages_map[start])
+            and messages_map[start].get('parentId')
+            and start not in ascents
+        ):
+            ascents.add(start)
+            start = messages_map[start]['parentId']
+        if start not in messages_map:
+            start = current_id
+        if blocked and start in messages_map and blocked(messages_map[start]):
+            # An undelivered result with no reachable parent (already-broken
+            # history): anchor at the caller's fallback rather than chaining a
+            # new result under it.
+            return fallback_id or start
+
+        visited: set = set()
+        message_id = start
+        while message_id in messages_map and message_id not in visited:
+            visited.add(message_id)
+            message = messages_map.get(message_id)
+            child_ids = message.get('childrenIds') if isinstance(message, dict) else None
+            next_id = next(
+                (
+                    child_id
+                    for child_id in reversed(child_ids or [])
+                    if child_id in messages_map and not (blocked and blocked(messages_map[child_id]))
+                ),
+                None,
+            )
+            if not next_id:
+                return message_id
+            message_id = next_id
+        return start
+
+    latest_leaf_id = None
+    latest_timestamp = -1
+    for message_id, message in messages_map.items():
+        if not isinstance(message, dict) or message.get('role') is None or message.get('childrenIds'):
+            continue
+        if blocked and blocked(message):
+            continue
+        timestamp = message.get('timestamp') or 0
+        if timestamp > latest_timestamp:
+            latest_leaf_id = message_id
+            latest_timestamp = timestamp
+    return latest_leaf_id or fallback_id
+
+
 def get_messages_content(messages: list[dict]) -> str:
     return '\n'.join([f'{message["role"].upper()}: {get_content_from_message(message)}' for message in messages])
 

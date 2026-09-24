@@ -1876,7 +1876,19 @@ async def chat_completion(
                 or None,
             )
             if is_internal:
-                subagent_results.append(await process)
+                # Register the internal branch exactly like a normal turn so the
+                # live response stream (keyed on the per-model `task_id` in the
+                # streaming handler) is reachable through the item-task lookup that
+                # `get_response_streams_by_chat_id` uses. Without this, a running
+                # subagent child (or the parent synthesis) persists no content and
+                # the chat API cannot overlay its in-progress output.
+                _, process_task = await create_task(
+                    request.app.state.redis,
+                    process,
+                    id=chat_id,
+                    task_id=per_model_metadata['task_id'],
+                )
+                subagent_results.append(await process_task)
                 continue
 
             task_id, _ = await create_task(

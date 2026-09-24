@@ -1710,7 +1710,7 @@ async def view_chat(
 # The advertised tool is `subagent` (opencode v2 parity). `delegate_task` and
 # `task` remain resolvable aliases: persisted chats and `toolLabels.js` still
 # reference the old names, and a model continuing an old chat may emit them.
-# Middleware resolves alias calls to the canonical entry and keeps sub-agent
+# Middleware resolves alias calls to the canonical entry and keeps subagent
 # fan-out parallel across every name in this set.
 SUBAGENT_CANONICAL_NAME = 'subagent'
 SUBAGENT_TOOL_ALIASES = ('delegate_task', 'task')
@@ -1724,32 +1724,65 @@ async def subagent(
     file_ids: list[str] | None = None,
     background: bool = False,
     sessionID: str | None = None,
-    model: str | None = None,
     __request__: Request = None,
     __user__: dict = None,
     __metadata__: dict = None,
     __chat_id__: str = None,
     __message_id__: str = None,
+    __tool_call_id__: str = None,
 ) -> str:
     """
-    Spawn a sub-agent in a child chat to work on a task using the current model and tools.
+    Spawns an isolated child subagent to execute an independent task, research workflow, or
+    background job.
 
-    :param description: A short 3-5 word label for the task, displayed to the user
-    :param prompt: The specific task for the sub-agent to complete
-    :param context: Relevant context, decisions, or file paths for the task
-    :param file_ids: Attached file IDs the sub-agent needs. Use this for images or files;
-        do not put file IDs only in context.
-    :param background: Return immediately and continue this chat when the sub-agent finishes
-    :param sessionID: Continue a previous sub-agent conversation by passing the value it
-        returned earlier. Omit to start a new sub-agent.
-    :param model: Model to run the sub-agent on. Omit to use the configured default or,
-        failing that, the current chat's model.
-    :return: Foreground result, or a JSON dispatch handle for background work
+    ### When to Use
+    - **Context Isolation:** Offload heavy exploration, extensive web searches, or verbose data
+      processing to prevent polluting the parent conversation's context window.
+    - **Parallel Execution:** Spawn concurrent tasks that do not depend on one another.
+    - **Thread Continuation:** Resume a previous subagent's conversation by providing its
+      `sessionID`.
+
+    ### When NOT to Use
+    - Do **not** use `background=true` if your very next step strictly depends on the subagent's
+      output.
+
+    ### Execution Modes
+    - **Foreground (`background=false`, default):** Blocks until the subagent completes. Use
+      when the next step strictly depends on the subagent's final output.
+    - **Background (`background=true`):** Returns immediately with a `sessionID` and runs
+      asynchronously. Use when you have other independent work to perform while the subagent
+      runs. **Do NOT poll or sleep:** the subagent's final result is automatically injected into
+      this chat upon completion.
+    - **Follow-ups:** Send follow-up instructions to a completed subagent by calling this tool
+      with its `sessionID` and a new `prompt`, without restarting from scratch.
+
+    ### Returns
+    - **Foreground (`background=false`):** The final response wrapped in
+      `<subagent sessionID="..." state="...">...</subagent>`.
+    - **Background (`background=true`):** An immediate acknowledgment
+      `{"sessionID": "...", "status": "running", "output": "..."}`; the subagent's final output
+      will be delivered to this chat when complete.
+
+    :param description: (required) A concise 3-5 word title summarizing the task. Visible to the
+        user in UI.
+    :param prompt: (required) Explicit instructions and success criteria for the subagent. When
+        delegating research, specify the expected depth: `"quick"` (basic verification), `"medium"`
+        (broad overview), or `"very thorough"` (deep multi-source investigation). When steering an
+        active agent, state the new direction or adjustment clearly.
+    :param context: (optional) Essential background, prior findings, constraints, or file paths
+        needed to execute the task. Leave empty if unnecessary.
+    :param file_ids: (optional) Array of file/image IDs the subagent requires access to. Always
+        pass IDs here; referencing them solely inside `prompt` or `context` does not grant access.
+    :param background: (optional, default: false) Set to `true` to run asynchronously without
+        blocking.
+    :param sessionID: (optional) The `sessionID` of a subagent to resume or steer. Omit to spawn a
+        fresh subagent with clean context. Provide to steer an in-progress background subagent or
+        continue a prior session.
     """
     if __request__ is None:
         return 'Error: request context not available.'
     if getattr(__request__.state, 'internal', False) is True:
-        return 'Error: sub-agents cannot delegate recursively.'
+        return 'Error: subagents cannot delegate recursively.'
 
     from open_webui.utils.subagents import delegate
 
@@ -1760,12 +1793,12 @@ async def subagent(
         background,
         file_ids=file_ids,
         session_id=sessionID,
-        model=model,
         request=__request__,
         user_data=__user__ or {},
         metadata=__metadata__ or {},
         parent_chat_id=__chat_id__ or '',
         parent_message_id=__message_id__,
+        tool_call_id=__tool_call_id__,
     )
 
 

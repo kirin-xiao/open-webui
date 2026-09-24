@@ -27,6 +27,7 @@
 		getAllTags,
 		getChatById,
 		getChatListByTagName,
+		getSubagentChatsByParentId,
 		markChatUnreadById,
 		updateChatById,
 		updateChatFolderIdById
@@ -102,6 +103,38 @@
 	}
 
 	let chat = null;
+
+	// Internal subagent children of this chat, shown nested only while this row
+	// is the selected chat (one fetch per selection, not for every sidebar row).
+	type SubagentChatItem = { id: string; title: string; state?: string; updated_at?: number };
+	let subagentChats: SubagentChatItem[] = [];
+	let subagentChatsLoadedFor: string | null = null;
+
+	const loadSubagentChats = async () => {
+		const requestedId = id;
+		const children = await getSubagentChatsByParentId(localStorage.token, requestedId).catch(
+			(error) => {
+				console.error(error);
+				return null;
+			}
+		);
+		// Drop a response for a row that is no longer the selected chat: selection
+		// may have moved on while the request was in flight.
+		if (subagentChatsLoadedFor !== requestedId || requestedId !== $chatId) {
+			return;
+		}
+		subagentChats = Array.isArray(children) ? children : [];
+	};
+
+	$: if (id === $chatId) {
+		if (subagentChatsLoadedFor !== id) {
+			subagentChatsLoadedFor = id;
+			void loadSubagentChats();
+		}
+	} else if (subagentChatsLoadedFor !== null) {
+		subagentChatsLoadedFor = null;
+		subagentChats = [];
+	}
 
 	let mouseOver = false;
 	let focusWithin = false;
@@ -591,7 +624,7 @@
 <div
 	id="sidebar-chat-group"
 	bind:this={itemElement}
-	class=" w-full {className} relative group"
+	class=" w-full {className} group"
 	draggable={!confirmEdit && !readonly}
 	on:mouseenter={() => {
 		mouseOver = true;
@@ -606,184 +639,202 @@
 		focusWithin = false;
 	}}
 >
-	{#if confirmEdit}
-		<div
-			id="sidebar-chat-item"
-			class=" w-full flex justify-between rounded-xl px-2 py-1.5 {id === $chatId || confirmEdit
-				? ($settings?.highContrastMode ?? false)
-					? 'bg-black/[0.035] dark:bg-white/[0.06] selected'
-					: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
-				: selected
+	<!-- Row + menu share a positioning context that excludes the nested
+	     subagent chips, so the menu stays centered on the chat row. -->
+	<div class="relative">
+		{#if confirmEdit}
+			<div
+				id="sidebar-chat-item"
+				class=" w-full flex justify-between rounded-xl px-2 py-1.5 {id === $chatId || confirmEdit
 					? ($settings?.highContrastMode ?? false)
-						? 'bg-black/[0.035] dark:bg-white/[0.055] selected'
+						? 'bg-black/[0.035] dark:bg-white/[0.06] selected'
 						: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
-					: 'hover:bg-gray-100 dark:hover:bg-gray-900 group-hover:bg-gray-100 dark:group-hover:bg-gray-900'}  whitespace-nowrap text-ellipsis relative transition {generating
-				? 'cursor-not-allowed'
-				: ''}"
-		>
-			<input
-				id="chat-title-input-{id}"
-				bind:value={chatTitle}
-				class=" bg-transparent w-full outline-hidden mr-10"
-				placeholder={generating ? $i18n.t('Generating...') : ''}
-				disabled={generating}
-				on:keydown={chatTitleInputKeydownHandler}
-				on:blur={async (e) => {
-					if (doubleClicked) {
-						e.preventDefault();
-						e.stopPropagation();
+					: selected
+						? ($settings?.highContrastMode ?? false)
+							? 'bg-black/[0.035] dark:bg-white/[0.055] selected'
+							: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
+						: 'hover:bg-gray-100 dark:hover:bg-gray-900 group-hover:bg-gray-100 dark:group-hover:bg-gray-900'}  whitespace-nowrap text-ellipsis relative transition {generating
+					? 'cursor-not-allowed'
+					: ''}"
+			>
+				<input
+					id="chat-title-input-{id}"
+					bind:value={chatTitle}
+					class=" bg-transparent w-full outline-hidden mr-10"
+					placeholder={generating ? $i18n.t('Generating...') : ''}
+					disabled={generating}
+					on:keydown={chatTitleInputKeydownHandler}
+					on:blur={async (e) => {
+						if (doubleClicked) {
+							e.preventDefault();
+							e.stopPropagation();
 
-						await tick();
-						setTimeout(() => {
-							const input = document.getElementById(`chat-title-input-${id}`);
-							if (input) input.focus();
-						}, 0);
+							await tick();
+							setTimeout(() => {
+								const input = document.getElementById(`chat-title-input-${id}`);
+								if (input) input.focus();
+							}, 0);
 
-						doubleClicked = false;
-						return;
-					}
-				}}
-			/>
-		</div>
-	{:else if $mobile}
-		<a
-			id="sidebar-chat-item"
-			class={chatItemClass}
-			href="/c/{id}"
-			aria-current={id === $chatId ? 'page' : undefined}
-			on:click={selectChatHandler}
-			draggable="false"
-		>
-			{@render chatItemContent()}
-		</a>
-	{:else}
-		<LinkPreview.Root
-			openDelay={300}
-			closeDelay={0}
-			disabled={confirmEdit || dragged || !($settings?.chatHoverPreview ?? true)}
-			bind:open={openPreview}
-		>
-			<LinkPreview.Trigger
+							doubleClicked = false;
+							return;
+						}
+					}}
+				/>
+			</div>
+		{:else if $mobile}
+			<a
 				id="sidebar-chat-item"
 				class={chatItemClass}
 				href="/c/{id}"
 				aria-current={id === $chatId ? 'page' : undefined}
-				onclick={selectChatHandler}
-				ondblclick={renameChatFromDoubleClick}
+				on:click={selectChatHandler}
 				draggable="false"
 			>
 				{@render chatItemContent()}
-			</LinkPreview.Trigger>
-
-			<ChatHoverPreview
-				chatId={id}
-				title={chatTitle || title}
-				{openPreview}
-				side="right"
-				align="center"
-			/>
-		</LinkPreview.Root>
-	{/if}
-
-	{#if !readonly}
-		<div
-			id="sidebar-chat-item-menu"
-			class="{$mobile
-				? 'selected'
-				: showInlineActions
-					? 'selected'
-					: 'hover-reveal'} absolute {className === 'pr-2'
-				? 'right-[0.5rem]'
-				: 'right-1'} inset-y-0 mr-1.5 flex items-center"
-		>
-			{#if confirmEdit}
-				<div
-					class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
+			</a>
+		{:else}
+			<LinkPreview.Root
+				openDelay={300}
+				closeDelay={0}
+				disabled={confirmEdit || dragged || !($settings?.chatHoverPreview ?? true)}
+				bind:open={openPreview}
+			>
+				<LinkPreview.Trigger
+					id="sidebar-chat-item"
+					class={chatItemClass}
+					href="/c/{id}"
+					aria-current={id === $chatId ? 'page' : undefined}
+					onclick={selectChatHandler}
+					ondblclick={renameChatFromDoubleClick}
+					draggable="false"
 				>
-					<Tooltip content={$i18n.t('Generate')}>
-						<button
-							class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-							id="generate-title-button"
-							disabled={generating}
-							on:click={() => {
-								generateTitleHandler();
-							}}
-						>
-							<SparklesIcon strokeWidth="1.5" />
-						</button>
-					</Tooltip>
-				</div>
-			{:else if shiftKey && mouseOver}
-				<div class=" flex items-center self-center space-x-1.5">
-					<Tooltip content={$i18n.t('Archive')} className="flex items-center">
-						<button
-							class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-							disabled={archiving}
-							on:click={() => {
-								archiveChatHandler(id);
-							}}
-							type="button"
-						>
-							<ArchiveBoxIcon className="size-3.5" strokeWidth="1.7" />
-						</button>
-					</Tooltip>
+					{@render chatItemContent()}
+				</LinkPreview.Trigger>
 
-					{#if $user?.role === 'admin' || ($user?.permissions?.chat?.delete ?? true)}
-						<Tooltip content={$i18n.t('Delete')}>
+				<ChatHoverPreview
+					chatId={id}
+					title={chatTitle || title}
+					{openPreview}
+					side="right"
+					align="center"
+				/>
+			</LinkPreview.Root>
+		{/if}
+
+		{#if !readonly}
+			<div
+				id="sidebar-chat-item-menu"
+				class="{$mobile
+					? 'selected'
+					: showInlineActions
+						? 'selected'
+						: 'hover-reveal'} absolute {className === 'pr-2'
+					? 'right-[0.5rem]'
+					: 'right-1'} inset-y-0 mr-1.5 flex items-center"
+			>
+				{#if confirmEdit}
+					<div
+						class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
+					>
+						<Tooltip content={$i18n.t('Generate')}>
 							<button
-								class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-								disabled={deleting}
+								class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+								id="generate-title-button"
+								disabled={generating}
 								on:click={() => {
-									deleteChatHandler(id);
+									generateTitleHandler();
+								}}
+							>
+								<SparklesIcon strokeWidth="1.5" />
+							</button>
+						</Tooltip>
+					</div>
+				{:else if shiftKey && mouseOver}
+					<div class=" flex items-center self-center space-x-1.5">
+						<Tooltip content={$i18n.t('Archive')} className="flex items-center">
+							<button
+								class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+								disabled={archiving}
+								on:click={() => {
+									archiveChatHandler(id);
 								}}
 								type="button"
 							>
-								<GarbageBinIcon className="size-3.5" strokeWidth="1.7" />
+								<ArchiveBoxIcon className="size-3.5" strokeWidth="1.7" />
 							</button>
 						</Tooltip>
-					{/if}
-				</div>
-			{:else}
-				<div class="flex self-center z-10 items-end">
-					<ChatMenu
-						chatId={id}
-						cloneChatHandler={() => {
-							cloneChatHandler(id);
-						}}
-						shareHandler={() => {
-							showShareChatModal = true;
-						}}
-						{moveChatHandler}
-						archiveChatHandler={() => {
-							archiveChatHandler(id);
-						}}
-						{renameHandler}
-						deleteHandler={() => {
-							showDeleteConfirm = true;
-						}}
-						{markUnreadHandler}
-						onOpen={() => {
-							menuOpen = true;
-							dispatch('select');
-						}}
-						onClose={() => {
-							menuOpen = false;
-							dispatch('unselect');
-						}}
-						onPinChange={async () => {
-							dispatch('change');
-						}}
-					>
-						<button
-							type="button"
-							aria-label={$i18n.t('Chat Menu')}
-							class="flex size-5 items-center justify-center self-center dark:hover:text-white transition m-0"
+
+						{#if $user?.role === 'admin' || ($user?.permissions?.chat?.delete ?? true)}
+							<Tooltip content={$i18n.t('Delete')}>
+								<button
+									class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+									disabled={deleting}
+									on:click={() => {
+										deleteChatHandler(id);
+									}}
+									type="button"
+								>
+									<GarbageBinIcon className="size-3.5" strokeWidth="1.7" />
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
+				{:else}
+					<div class="flex self-center z-10 items-end">
+						<ChatMenu
+							chatId={id}
+							cloneChatHandler={() => {
+								cloneChatHandler(id);
+							}}
+							shareHandler={() => {
+								showShareChatModal = true;
+							}}
+							{moveChatHandler}
+							archiveChatHandler={() => {
+								archiveChatHandler(id);
+							}}
+							{renameHandler}
+							deleteHandler={() => {
+								showDeleteConfirm = true;
+							}}
+							{markUnreadHandler}
+							onOpen={() => {
+								menuOpen = true;
+								dispatch('select');
+							}}
+							onClose={() => {
+								menuOpen = false;
+								dispatch('unselect');
+							}}
+							onPinChange={async () => {
+								dispatch('change');
+							}}
 						>
-							<MoreHorizontalIcon className="size-3.5" strokeWidth="2" />
-						</button>
-					</ChatMenu>
-				</div>
-			{/if}
+							<button
+								type="button"
+								aria-label={$i18n.t('Chat Menu')}
+								class="flex size-5 items-center justify-center self-center dark:hover:text-white transition m-0"
+							>
+								<MoreHorizontalIcon className="size-3.5" strokeWidth="2" />
+							</button>
+						</ChatMenu>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+
+	{#if subagentChats.length > 0}
+		<div class="mb-0.5 ml-4 space-y-0.5 border-l border-gray-100 pl-2 dark:border-gray-850/40">
+			{#each subagentChats as subagent (subagent.id)}
+				<a
+					href={`/c/${subagent.id}`}
+					title={subagent.title}
+					class="block truncate text-[0.75rem] text-gray-500 transition hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+				>
+					{subagent.title}
+				</a>
+			{/each}
 		</div>
 	{/if}
 </div>

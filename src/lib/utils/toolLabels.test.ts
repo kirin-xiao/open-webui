@@ -156,21 +156,28 @@ describe('getToolLabel row labels', () => {
 		expect(render(getToolLabel('', {}).done)).toBe('tool');
 	});
 
-	it('keeps the sub-agent task title as data', () => {
-		const label = getToolLabel('Sub-agent: "summarise the repo"', { task: 'summarise the repo' });
-		expect(render(label.done)).toBe('Sub-agent: "summarise the repo"');
+	it('keeps the subagent task title as data', () => {
+		const label = getToolLabel('Subagent: "summarise the repo"', { task: 'summarise the repo' });
+		expect(render(label.done)).toBe('Subagent: "summarise the repo"');
 		expect(label.category).toBe('other');
-		expect(render(getToolLabel('Background sub-agent: "x"', {}).done)).toBe(
-			'Background sub-agent: "x"'
+		expect(render(getToolLabel('Background subagent: "x"', {}).done)).toBe(
+			'Background subagent: "x"'
 		);
 	});
 
-	it('resolves the canonical sub-agent name and its aliases', () => {
-		expect(render(getToolLabel('subagent', {}).done)).toBe('Sub-agent');
-		expect(render(getToolLabel('delegate_task', {}).done)).toBe('Sub-agent');
-		expect(render(getToolLabel('task', {}).done)).toBe('Sub-agent');
-		expect(render(getToolLabel('mcp.subagent', {}).done)).toBe('Sub-agent');
-		expect(render(getToolLabel('mcp.delegate_task', {}).done)).toBe('Sub-agent');
+	it('still treats legacy hyphenated sub-agent titles as data', () => {
+		expect(render(getToolLabel('Sub-agent: "old"', {}).done)).toBe('Sub-agent: "old"');
+		expect(render(getToolLabel('Background sub-agent: "old"', {}).done)).toBe(
+			'Background sub-agent: "old"'
+		);
+	});
+
+	it('resolves the canonical subagent name and its aliases', () => {
+		expect(render(getToolLabel('subagent', {}).done)).toBe('Subagent');
+		expect(render(getToolLabel('delegate_task', {}).done)).toBe('Subagent');
+		expect(render(getToolLabel('task', {}).done)).toBe('Subagent');
+		expect(render(getToolLabel('mcp.subagent', {}).done)).toBe('Subagent');
+		expect(render(getToolLabel('mcp.delegate_task', {}).done)).toBe('Subagent');
 		expect(getToolLabel('subagent', {}).category).toBe('other');
 	});
 
@@ -557,7 +564,8 @@ describe('i18n catalogue coverage', () => {
 			['my_tool', { query: 'q' }],
 			['my_tool', {}],
 			['delegate_task', {}],
-			['Sub-agent: "x"', {}]
+			['Subagent: "x"', {}],
+			['Sub-agent: "legacy"', {}]
 		];
 		for (const [name, args] of rows) {
 			const label = getToolLabel(name, args);

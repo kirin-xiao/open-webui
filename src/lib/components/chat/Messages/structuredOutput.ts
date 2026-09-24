@@ -39,6 +39,8 @@ export type OutputDetailToken = {
 		embeds?: string;
 		output?: string;
 		status?: string;
+		sessionID?: string;
+		subagentState?: string;
 	};
 };
 
@@ -97,7 +99,7 @@ const OPENAI_TOOL_NAMES: Record<string, string> = {
 	computer_call: 'Computer Use'
 };
 
-// Canonical sub-agent tool name plus the aliases persisted by older chats.
+// Canonical subagent tool name plus the aliases persisted by older chats.
 const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'delegate_task', 'task']);
 
 function getTextFromParts(parts: OutputContentPart[] = []): string {
@@ -166,6 +168,50 @@ function parseJSONStringValue(value: unknown): unknown {
 	return parsed;
 }
 
+export type SubagentResult = {
+	sessionID: string;
+	state: string;
+	background: boolean;
+};
+
+/**
+ * Read the child chat id and run state out of a subagent tool result.
+ *
+ * A background dispatch returns a JSON handle
+ * (`{"sessionID": "...", "status": "running", "output": "..."}`), while both
+ * foreground and later-synthesised results carry the
+ * `<subagent sessionID="..." state="...">` envelope. Missing fields come back as
+ * empty strings so callers can fall back to plain rendering.
+ */
+export function parseSubagentResult(resultText: string, name?: string): SubagentResult {
+	const text = resultText ?? '';
+	const parsed = parseJSONStringValue(text) as Record<string, unknown> | null;
+
+	let sessionID = '';
+	let state = '';
+
+	if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+		sessionID = typeof parsed.sessionID === 'string' ? parsed.sessionID : '';
+		state = typeof parsed.status === 'string' ? parsed.status : '';
+	}
+
+	if (!sessionID && !state) {
+		const envelope = text.match(/<subagent\b[^>]*>/i)?.[0] ?? '';
+		sessionID = envelope.match(/sessionID\s*=\s*"([^"]*)"/i)?.[1] ?? '';
+		state = envelope.match(/state\s*=\s*"([^"]*)"/i)?.[1] ?? '';
+	}
+
+	// `Background subagent` is what the current builder emits; the hyphenated
+	// `Background sub-agent` is the legacy display name persisted in older chats.
+	const backgroundName = /^background sub-?agent\b/i.test((name ?? '').trim());
+
+	return {
+		sessionID,
+		state,
+		background: state === 'running' || backgroundName
+	};
+}
+
 function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputItem) {
 	if (!callItem || !resultItem || callItem.name !== 'display_file') {
 		return null;
@@ -194,7 +240,13 @@ function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputI
 		: result;
 }
 
-function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string, OutputItem>) {
+function buildToolCallToken(
+	item: OutputItem,
+	toolOutputByCallId: Record<string, OutputItem>,
+	completedSubagentIds?: Set<string>,
+	sessions?: Map<string, string>,
+	messageId?: string
+) {
 	const callId = item.call_id ?? item.id ?? '';
 	const resultItem = toolOutputByCallId[callId];
 	const status = String(item.status ?? '');
@@ -202,6 +254,8 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 	const isDone = !!resultItem || status === 'failed' || status === 'incomplete';
 	const isExecuting = !isDone && status === 'completed';
 	let name = item.name ?? '';
+	let subagent: SubagentResult = { sessionID: '', state: '', background: false };
+	let argSessionId = '';
 	if (SUBAGENT_TOOL_NAMES.has(name)) {
 		try {
 			const args =
@@ -215,19 +269,45 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 					: typeof args.task === 'string' && args.task
 						? args.task
 						: '?';
-			const label = args.background === true ? 'Background sub-agent' : 'Sub-agent';
+			const label = args.background === true ? 'Background subagent' : 'Subagent';
 			name = `${label}: "${description.length > 60 ? `${description.slice(0, 60)}...` : description}"`;
+			argSessionId = typeof args.sessionID === 'string' ? args.sessionID.trim() : '';
 		} catch {
-			name = 'Sub-agent';
+			name = 'Subagent';
+		}
+
+		subagent = parseSubagentResult(getToolResultText(resultItem), name);
+		// A continuation/follow-up call carries the child id in its arguments; the
+		// result envelope is preferred, but fall back to the args so the row links
+		// before the child returns.
+		if (!subagent.sessionID && argSessionId) {
+			subagent = { ...subagent, sessionID: argSessionId };
+		}
+		// A live `subagent:created` event reports the child before its result
+		// exists; use it so a running foreground row is clickable.
+		if (!subagent.sessionID && sessions) {
+			const liveChildId = sessions.get(`${messageId ?? ''}:${callId}`);
+			if (liveChildId) {
+				subagent = { ...subagent, sessionID: liveChildId };
+			}
 		}
 	}
+
+	// A background dispatch returns a `running` handle immediately, so the tool
+	// call itself looks finished while the child is still working. Keep the row
+	// spinning until the child's completion shows up in history.
+	const isSubagentRunning =
+		!!subagent.sessionID &&
+		subagent.state === 'running' &&
+		!(completedSubagentIds?.has(subagent.sessionID) ?? false);
+	const done = isDone && !isSubagentRunning;
 
 	return {
 		summary: isPending
 			? 'Tool Approval Needed'
-			: isDone
+			: done
 				? 'Tool Executed'
-				: isExecuting
+				: isSubagentRunning || isExecuting
 					? 'Executing...'
 					: 'Preparing...',
 		text: getToolResultText(resultItem),
@@ -235,8 +315,10 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 			type: 'tool_calls',
 			id: callId,
 			name,
-			done: isDone ? 'true' : 'false',
-			status,
+			done: done ? 'true' : 'false',
+			status: isSubagentRunning ? 'in_progress' : status,
+			sessionID: subagent.sessionID,
+			subagentState: subagent.state,
 			arguments: stringifyAttribute(item.arguments ?? ''),
 			files: stringifyAttribute(resultItem?.files),
 			embeds: stringifyAttribute(resultItem?.embeds)
@@ -333,10 +415,13 @@ function buildOpenAIToolToken(item: OutputItem, isLastItem: boolean) {
 function buildDetailToken(
 	item: OutputItem,
 	isLastItem: boolean,
-	toolOutputByCallId: Record<string, OutputItem>
+	toolOutputByCallId: Record<string, OutputItem>,
+	completedSubagentIds?: Set<string>,
+	sessions?: Map<string, string>,
+	messageId?: string
 ): OutputDetailToken | null {
 	if (item.type === 'function_call') {
-		return buildToolCallToken(item, toolOutputByCallId);
+		return buildToolCallToken(item, toolOutputByCallId, completedSubagentIds, sessions, messageId);
 	}
 	if (item.type === 'reasoning') {
 		return buildReasoningToken(item, isLastItem);
@@ -350,7 +435,12 @@ function buildDetailToken(
 	return null;
 }
 
-export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDisplayItem[] {
+export function buildOutputDisplayItems(
+	output: OutputItem[] = [],
+	completedSubagentIds?: Set<string>,
+	sessions?: Map<string, string>,
+	messageId?: string
+): OutputDisplayItem[] {
 	const displayItems: OutputDisplayItem[] = [];
 	const currentDetailTokens: OutputDetailToken[] = [];
 	const toolOutputByCallId: Record<string, OutputItem> = {};
@@ -408,7 +498,14 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 		}
 
 		if (item.type && GROUPABLE_OUTPUT_TYPES.has(item.type)) {
-			const token = buildDetailToken(item, index === output.length - 1, toolOutputByCallId);
+			const token = buildDetailToken(
+				item,
+				index === output.length - 1,
+				toolOutputByCallId,
+				completedSubagentIds,
+				sessions,
+				messageId
+			);
 			if (token) {
 				currentDetailTokens.push(token);
 			}
@@ -449,6 +546,62 @@ export function getOutputText(output?: OutputItem[] | null): string {
 		.map(getMessageText)
 		.filter((text) => text.trim())
 		.join('\n');
+}
+
+type HistoryMessage = {
+	content?: unknown;
+	meta?: Record<string, unknown> | null;
+};
+
+/**
+ * Collect the ids of subagent children that have finished, from the persisted
+ * internal result messages (`meta.internal === true && meta.type === 'subagent'`).
+ *
+ * A `pending`/`running` state means the child has not finished; any other (or a
+ * missing) state counts as finished. Child ids are read from the current and
+ * legacy `meta` fields plus the `<subagent sessionID="...">` envelope in the
+ * message content, so a background dispatch row can keep spinning until its
+ * child is complete.
+ */
+export function collectCompletedSubagentIds(
+	messages: Record<string, HistoryMessage> | null | undefined
+): Set<string> {
+	const completed = new Set<string>();
+
+	for (const message of Object.values(messages ?? {})) {
+		const meta = message?.meta;
+		if (meta?.internal !== true || meta?.type !== 'subagent') {
+			continue;
+		}
+
+		const state = typeof meta.state === 'string' ? meta.state : '';
+		const status = typeof meta.status === 'string' ? meta.status : '';
+		const unfinished =
+			state === 'pending' ||
+			state === 'running' ||
+			(!state && (status === 'pending' || status === 'running'));
+		if (unfinished) {
+			continue;
+		}
+
+		const envelopeID = parseSubagentResult(
+			typeof message.content === 'string' ? message.content : ''
+		).sessionID;
+		const ids = [
+			meta.childID,
+			meta.subagent_chat_id,
+			...(Array.isArray(meta.childIDs) ? meta.childIDs : []),
+			...(Array.isArray(meta.subagent_chat_ids) ? meta.subagent_chat_ids : []),
+			envelopeID
+		];
+		for (const id of ids) {
+			if (typeof id === 'string' && id) {
+				completed.add(id);
+			}
+		}
+	}
+
+	return completed;
 }
 
 function appendDelta(current: unknown, delta: unknown): unknown {
