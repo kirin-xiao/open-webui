@@ -409,8 +409,11 @@ def model_allows_memory(model: dict | None) -> bool:
     return ((model or {}).get('info', {}).get('meta', {}).get('capabilities') or {}).get('memory', True)
 
 
-MEMORY_DEFAULT_USER_CHAR_LIMIT = 2000
-MEMORY_DEFAULT_CONTEXT_CHAR_LIMIT = 2000
+# A budget of 0 (or negative) disables the cap: the whole selection is injected.
+# The store is per-user and small, so the default is unbounded; operators can
+# still set a finite `memories.*_char_limit` to bound the frozen top's size.
+MEMORY_DEFAULT_USER_CHAR_LIMIT = 0
+MEMORY_DEFAULT_CONTEXT_CHAR_LIMIT = 0
 # Path-hint rows are a lexical-recall channel: a literal path-segment match is
 # strong evidence, so they enter at a floor score instead of being dropped by
 # the vector relevance threshold.
@@ -419,11 +422,18 @@ MEMORY_CONTEXT_FLOOR_SCORE = -1.0
 SECTION_TITLES = {'user': 'User Memory', 'context': 'Memory Context'}
 
 
-def _char_limit(value, default: int) -> int:
+def _char_limit(value, default: int) -> int | None:
+    """Resolve a section budget. Returns ``None`` for "no cap".
+
+    A non-positive value disables the cap so the full selection is injected; a
+    positive value is a hard ceiling. A missing or unparseable value falls back
+    to ``default``, which is itself unbounded by default.
+    """
     try:
-        return max(250, int(value or default))
+        resolved = int(value) if value is not None else int(default)
     except (TypeError, ValueError):
-        return default
+        resolved = default
+    return resolved if resolved > 0 else None
 
 
 @dataclass(frozen=True)
@@ -524,19 +534,20 @@ def collect_memory_entries(all_memories, results, hints, relevance_threshold: fl
     return entries
 
 
-def _fit_section(entries: list[MemoryEntry], limit: int) -> tuple[list[str], list[str], int]:
+def _fit_section(entries: list[MemoryEntry], limit: int | None) -> tuple[list[str], list[str], int]:
     """Fit whole entries into a section budget; never cut an entry mid-text.
 
-    Returns the rendered lines, the ids actually emitted, and how many entries
-    were dropped. The emitted ids are authoritative — the caller must not infer
-    them by matching label text back into the output.
+    ``limit`` of ``None`` disables the cap (every entry is emitted). Returns the
+    rendered lines, the ids actually emitted, and how many entries were dropped.
+    The emitted ids are authoritative — the caller must not infer them by matching
+    label text back into the output.
     """
     lines: list[str] = []
     emitted: list[str] = []
     used = 0
     for entry in entries:
         line = f'- {entry.label}'
-        if used + len(line) + 1 > limit:
+        if limit is not None and used + len(line) + 1 > limit:
             if not lines:
                 # A single entry larger than the whole budget: truncate it rather
                 # than emit a section header with nothing under it.
@@ -549,7 +560,9 @@ def _fit_section(entries: list[MemoryEntry], limit: int) -> tuple[list[str], lis
     return lines, emitted, 0
 
 
-def render_memory_context(entries: list[MemoryEntry], limits: dict[str, int]) -> tuple[str, dict[str, int], list[str]]:
+def render_memory_context(
+    entries: list[MemoryEntry], limits: dict[str, int | None]
+) -> tuple[str, dict[str, int], list[str]]:
     """Render entries (already in final display order) into titled sections."""
     parts: list[str] = []
     dropped = {'user': 0, 'context': 0}
@@ -917,7 +930,7 @@ async def add_memory_context(
     _strip_memory_context(messages)
 
     base_entries = _entries_for_ids(base_ids, rows_by_id)
-    base_text, base_dropped, _ = render_memory_context(base_entries, limits)
+    base_text, base_dropped, base_rendered = render_memory_context(base_entries, limits)
     _log_dropped(base_dropped, limits)
     if base_text:
         form_data['messages'] = add_or_update_system_message(
@@ -957,12 +970,13 @@ async def add_memory_context(
 
     # Edits and deletions to rows already frozen into the system-prompt base are
     # delivered as a tail update on the current user turn, never by rewriting the
-    # frozen top.
+    # frozen top. Pass the *rendered* base: only entries the model actually saw
+    # may be diffed/narrated, and a budget-truncated id is not a correction.
     injections, base_labels = await _emit_base_updates(
         form_data=form_data,
         state=state,
         rows_by_id=rows_by_id,
-        base_ids=base_ids,
+        base_ids=base_rendered,
         anchor=anchor,
         injections=injections,
         event_emitter=event_emitter,
@@ -972,7 +986,10 @@ async def add_memory_context(
     # only the primary branch writes it so branches do not clobber each other.
     owns_ledger = not (metadata or {}).get('compare_mode') or (metadata or {}).get('is_primary_branch')
     new_state = {
-        'base': base_ids,
+        # Persist only what was rendered. A budget-truncated id stays out of the
+        # base, so `_select_memory_ids` re-selects it on a later turn and it is
+        # delivered as a tail injection instead of being silently lost.
+        'base': base_rendered,
         'injections': injections,
         'base_labels': base_labels,
         'established': True,

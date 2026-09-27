@@ -312,6 +312,58 @@ async def test_continuation_does_not_emit_second_injection(memory_harness, monke
 
 
 @pytest.mark.asyncio
+async def test_overbudget_base_persists_only_rendered_ids_and_delivers_rest_at_tail(
+    memory_harness, monkeypatch
+):
+    """A base entry that does not fit the budget must not be recorded as frozen.
+
+    It stays out of ``base`` so the next turn re-selects it and delivers it as a
+    tail injection instead of silently losing it.
+    """
+    module, saved = memory_harness
+    # Two rows; the first nearly fills the budget, so the second does not fit.
+    big = _MemoryRow('m1', 'x' * 700)
+    small = _MemoryRow('m2', 'y' * 400)
+    monkeypatch.setattr(
+        module,
+        'Memories',
+        type('M', (), {'get_memories_by_user_id': staticmethod(lambda *a, **k: _rows_with(big, small))}),
+    )
+    monkeypatch.setattr(
+        module,
+        'collect_memory_entries',
+        lambda *a, **k: [_entry('m1', label='x' * 700), _entry('m2', label='y' * 400)],
+    )
+    # Finite budget: only the first entry fits; m2 is dropped.
+    monkeypatch.setattr(
+        module,
+        'Config',
+        type('C', (), {'get_many': staticmethod(_config_with_limit), 'get': staticmethod(lambda k, d=None: d)}),
+    )
+
+    form_data = _form_data([{'id': 'u1', 'role': 'user', 'content': 'hi'}])
+    await module.add_memory_context(None, form_data, type('U', (), {'id': 'u'})(), {'id': 'm'}, _metadata())
+
+    # Only the rendered id is frozen; the dropped id must not be claimed as base.
+    assert saved['base'] == ['m1']
+    assert 'm2' not in saved['base']
+    assert 'm2' not in (saved.get('base_labels') or {})
+
+    # Next turn: m2 is re-selected and now delivered as a frozen tail injection.
+    saved.update({'chain_ids': {'u1', 'u2'}})
+    next_form = _form_data([{'id': 'u2', 'role': 'user', 'content': 'next'}])
+    await module.add_memory_context(
+        None, next_form, type('U', (), {'id': 'u'})(), {'id': 'm'}, _metadata(user_message_id='u2')
+    )
+    injected_ids = {memory_id for entry in saved['injections'] for memory_id in entry.get('ids', [])}
+    assert 'm2' in injected_ids
+
+
+async def _config_with_limit(*keys):
+    return {'memories.context_char_limit': 1000, 'memories.user_char_limit': 1000}
+
+
+@pytest.mark.asyncio
 async def test_new_turn_emits_one_frozen_injection(memory_harness):
     module, saved = memory_harness
     saved.update({'base': ['m1'], 'injections': []})
@@ -506,6 +558,26 @@ def test_fit_does_not_mark_dropped_entry_as_emitted():
     assert emitted == ['m1']
     assert dropped['context'] == 1
     assert 'm2' not in emitted
+
+
+def test_char_limit_non_positive_disables_the_cap():
+    # 0 / negative mean "no cap"; a positive value is a ceiling.
+    assert memory._char_limit(0, 2000) is None
+    assert memory._char_limit(-5, 2000) is None
+    assert memory._char_limit(1500, 2000) == 1500
+    # A missing/unparseable value falls back to the default, then to unbounded.
+    assert memory._char_limit(None, 0) is None
+    assert memory._char_limit('nonsense', 0) is None
+    assert memory._char_limit('nonsense', 2000) == 2000
+
+
+def test_fit_section_unbounded_emits_everything():
+    """A ``None`` limit injects the whole section, including oversized entries."""
+    entries = [_entry('m1', label='a' * 500), _entry('m2', label='b' * 500)]
+    text, dropped, emitted = memory.render_memory_context(entries, {'user': None, 'context': None})
+    assert emitted == ['m1', 'm2']
+    assert dropped == {'user': 0, 'context': 0}
+    assert '<memory_context' not in text  # helper returns the section body, not the wrapper
 
 
 # ---------------------------------------------------------------------------

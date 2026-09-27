@@ -435,8 +435,10 @@ ENABLE_MEMORY_SYSTEM_CONTEXT = os.getenv('ENABLE_MEMORY_SYSTEM_CONTEXT', 'True')
 # text, keep decision rules and drop narration.
 ENABLE_MEMORY_BACKGROUND_REVIEW = os.getenv('ENABLE_MEMORY_BACKGROUND_REVIEW', 'False').lower() == 'true'
 MEMORIES_REVIEW_INTERVAL_TURNS = int(os.getenv('MEMORIES_REVIEW_INTERVAL_TURNS', '10'))
-MEMORIES_USER_CHAR_LIMIT = int(os.getenv('MEMORIES_USER_CHAR_LIMIT', '2000'))
-MEMORIES_CONTEXT_CHAR_LIMIT = int(os.getenv('MEMORIES_CONTEXT_CHAR_LIMIT', '2000'))
+# Memory injection budgets. 0 (default) disables the cap: the whole selected
+# store is injected. Set a positive value to bound the frozen top's char budget.
+MEMORIES_USER_CHAR_LIMIT = int(os.getenv('MEMORIES_USER_CHAR_LIMIT', '0'))
+MEMORIES_CONTEXT_CHAR_LIMIT = int(os.getenv('MEMORIES_CONTEXT_CHAR_LIMIT', '0'))
 # Memory retrieval has its own relevance gate so tuning memory no longer
 # retunes document/KB RAG on instances with hybrid search enabled.
 MEMORIES_RELEVANCE_THRESHOLD = float(os.getenv('MEMORIES_RELEVANCE_THRESHOLD', '0.7'))
