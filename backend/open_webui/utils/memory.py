@@ -1148,8 +1148,8 @@ def memory_review_prompt(*, existing_text: str, transcript: str, today: str | No
 Today's date is {today}.
 
 Memory types:
-- user: durable facts, preferences, or instructions about the user.
-- context: other durable context that may help future chats for this user account.
+- user: durable facts, preferences, or instructions distinctly personal to the user.
+- context: other durable context that may help future chats, including topic-specific memories.
 
 Rules:
 - Save enduring details that can improve future conversations.

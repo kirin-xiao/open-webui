@@ -816,7 +816,9 @@ async def list_memory_paths(
 
     :param query: Optional query to filter memory paths or contents
     :param count: Maximum number of paths to return
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to search every memory. Topic-specific memories can
+        be stored as "context".
     :return: JSON with memory paths, counts, children, and update times
     """
     try:
@@ -848,7 +850,9 @@ async def read_memory_path(
 
     :param path: Memory path to read
     :param count: Maximum number of memories to return
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to read every memory. Topic-specific memories can
+        be stored as "context".
     :param include_children: Include memories under child paths
     :return: JSON with parent paths, child paths, and memories at the path
     """
@@ -883,7 +887,9 @@ async def search_memories(
 
     :param query: Optional query to search memory content and path
     :param count: Number of memories to return (default 5)
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to search every memory. Topic-specific memories can
+        be stored as "context".
     :param path: Optional memory path to search around
     :param memory_id: Optional exact memory ID to read
     :return: JSON with matching memories and their dates
@@ -943,7 +949,9 @@ async def add_memory(
     unless the user explicitly asks you to remember them.
 
     :param content: The memory content to store
-    :param type: Use "user" for facts/preferences about the user, or "context" for other durable context
+    :param type: "user" for a durable fact, preference, or instruction distinctly
+        personal to the user; "context" for other durable context, including
+        topic-specific memories. ("all" is only a read filter.)
     :param path: Optional stable memory address for grouping related memories
     :param attribution: Who originated the fact: "user" when the user stated it,
         "assistant" when it is your own inference/judgment. Omit when relaying
@@ -984,8 +992,9 @@ async def update_memory(
     """
     Apply a batch of memory changes after learning enduring information.
 
-    Use type "user" for facts, preferences, or instructions about the user.
-    Use type "context" for other durable context that may help future chats.
+    Use type "user" for facts, preferences, or instructions distinctly personal to the user.
+    Use type "context" for other durable context, including topic-specific memories.
+    ("all" is only a read filter.)
     Do not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details
     unless the user explicitly asks you to remember them.
     Path is optional. Use it as a stable memory address to group related memories.
