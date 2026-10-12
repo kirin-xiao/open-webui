@@ -195,6 +195,7 @@
 				id={`${id}-${tokenIdx}`}
 				collapsed={$settings?.collapseCodeBlocks ?? false}
 				{token}
+				{chatId}
 				lang={token?.lang ?? ''}
 				code={token?.text ?? ''}
 				{attributes}

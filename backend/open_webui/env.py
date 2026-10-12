@@ -369,6 +369,9 @@ RESET_CONFIG_ON_START = os.getenv('RESET_CONFIG_ON_START', 'False').lower() == '
 ENABLE_REALTIME_CHAT_SAVE = os.getenv('ENABLE_REALTIME_CHAT_SAVE', 'False').lower() == 'true'
 ENABLE_QUERIES_CACHE = os.getenv('ENABLE_QUERIES_CACHE', 'False').lower() == 'true'
 ENABLE_ADMIN_CHAT_ACCESS = os.getenv('ENABLE_ADMIN_CHAT_ACCESS', 'True').lower() == 'true'
+# Deprecated and inert (#30239): RAG context is always delivered as a frozen
+# tail injection, never into the system message. Kept so existing deployments
+# carrying the env var do not fail; it has no effect.
 RAG_SYSTEM_CONTEXT = os.getenv('RAG_SYSTEM_CONTEXT', 'False').lower() == 'true'
 
 # Empty by default: chunk metadata also holds internal bookkeeping (file hashes, collection names, scores).

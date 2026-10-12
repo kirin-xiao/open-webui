@@ -399,7 +399,7 @@
 					{/if}
 				</div>
 			{:else if message?.meta?.internal === true && message?.meta?.type === 'subagent'}
-				<SubagentResultRow content={message.content} result={message.meta} />
+				<SubagentResultRow content={message.content} result={message.meta} linkable={!readOnly} />
 			{:else if message.content !== ''}
 				<div class="w-full">
 					<div

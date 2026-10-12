@@ -68,6 +68,7 @@ export const DEFAULT_PERMISSIONS = {
 		web_search: true,
 		image_generation: true,
 		code_interpreter: true,
+		subagents: true,
 		memories: true,
 		automations: false,
 		calendar: true,

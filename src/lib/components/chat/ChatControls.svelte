@@ -300,7 +300,7 @@
 							{:else if activeTab === 'files' && terminalFilesAvailable && $selectedTerminalId}
 								<FileNav {chatId} />
 							{:else if activeTab === 'files' && codeInterpreterEnabled}
-								<PyodideFileNav />
+								<PyodideFileNav {chatId} />
 							{:else}
 								<Controls embed={true} {models} bind:chatFiles bind:params />
 							{/if}
@@ -430,7 +430,7 @@
 							{:else if activeTab === 'files' && terminalFilesAvailable && $selectedTerminalId}
 								<FileNav overlay={dragged} {chatId} />
 							{:else if activeTab === 'files' && codeInterpreterEnabled}
-								<PyodideFileNav overlay={dragged} />
+								<PyodideFileNav overlay={dragged} {chatId} />
 							{:else}
 								<Controls embed={true} {models} bind:chatFiles bind:params />
 							{/if}

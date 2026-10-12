@@ -1099,6 +1099,22 @@
 		<div class="flex flex-col w-full">
 			<div class="flex w-full justify-between my-1">
 				<div class=" self-center text-xs font-normal">
+					{$i18n.t('Subagents')}
+				</div>
+				<Switch bind:state={permissions.features.subagents} ariaLabel={$i18n.t('Subagents')} />
+			</div>
+			{#if defaultPermissions?.features?.subagents && !permissions.features.subagents}
+				<div>
+					<div class="text-xs text-gray-500">
+						{$i18n.t('This is a default user permission and will remain enabled.')}
+					</div>
+				</div>
+			{/if}
+		</div>
+
+		<div class="flex flex-col w-full">
+			<div class="flex w-full justify-between my-1">
+				<div class=" self-center text-xs font-normal">
 					{$i18n.t('Memories')}
 				</div>
 				<Switch bind:state={permissions.features.memories} ariaLabel={$i18n.t('Memories')} />

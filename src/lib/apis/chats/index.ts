@@ -785,6 +785,38 @@ export const getChatById = async (token: string, id: string) => {
 	return res;
 };
 
+export const getSubagentChatsByParentId = async (token: string, id: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}/subagents`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.then((json) => {
+			return json;
+		})
+		.catch((err) => {
+			error = getErrorDetail(err);
+
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const getChatByShareId = async (token: string, share_id: string) => {
 	let error = null;
 
@@ -1328,14 +1360,21 @@ export const compactChatById = async (token: string, id: string, model?: string 
 		body: JSON.stringify({ model })
 	})
 		.then(async (res) => {
-			if (!res.ok) throw await res.json();
+			if (!res.ok) {
+				const body = await res.json().catch(() => ({}));
+				const detail = getErrorDetail(body);
+				// Preserve the HTTP status (409 = a compaction already holds the
+				// per-chat lease) alongside the human-readable detail so the UI can
+				// show a clear "already in progress" message.
+				const err: any = new Error(typeof detail === 'string' ? detail : `HTTP ${res.status}`);
+				err.status = res.status;
+				err.detail = detail;
+				throw err;
+			}
 			return res.json();
 		})
-		.then((json) => {
-			return json;
-		})
 		.catch((err) => {
-			error = getErrorDetail(err);
+			error = err;
 
 			console.error(err);
 			return null;

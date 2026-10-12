@@ -20,6 +20,7 @@ from open_webui.utils.memory import (
     clean_memory_path,
     list_memory_path_groups,
     memory_vector_text,
+    memory_write_meta,
     read_memory_path_rows,
     search_memory_rows,
     validate_memory_operations,
@@ -74,12 +75,16 @@ class AddMemoryForm(BaseModel):
     content: str
     type: Literal['user', 'context'] = 'context'
     path: str | None = None
+    # Provenance is model-declared; a malformed value is dropped by
+    # ``memory_write_meta`` (never abort the write with a validation error).
+    attribution: str | None = None
 
 
 class MemoryUpdateModel(BaseModel):
     content: str | None = None
     type: Literal['user', 'context'] | None = None
     path: str | None = None
+    attribution: str | None = None
 
 
 class MemoryOperationModel(BaseModel):
@@ -88,6 +93,7 @@ class MemoryOperationModel(BaseModel):
     content: str | None = None
     type: Literal['user', 'context'] | None = None
     path: str | None = None
+    attribution: str | None = None
 
 
 class UpdateMemoriesForm(BaseModel):
@@ -201,7 +207,7 @@ async def add_memory(
         content,
         memory_type=form_data.type,
         path=path,
-        meta={'created_by': 'manual'},
+        meta=memory_write_meta(source='manual', attribution=form_data.attribution),
     )
 
     vector = await request.app.state.EMBEDDING_FUNCTION(
@@ -245,12 +251,13 @@ async def update_memories(
     source = form_data.source or 'tool'
     for operation in operations:
         if operation.get('action') in {'add', 'replace', 'move'}:
-            operation['meta'] = {
-                'created_by': source,
-                'chat_id': metadata.get('chat_id'),
-                'message_id': metadata.get('message_id'),
-                'model': model.get('id') if isinstance(model, dict) else None,
-            }
+            operation['meta'] = memory_write_meta(
+                source=source,
+                attribution=operation.get('attribution'),
+                chat_id=metadata.get('chat_id'),
+                message_id=metadata.get('message_id'),
+                model=model.get('id') if isinstance(model, dict) else None,
+            )
 
     try:
         results = await Memories.apply_memory_operations(user.id, operations)
@@ -356,10 +363,11 @@ async def query_memory(
     # Filter results by relevance threshold to avoid returning unrelated
     # memories.  Vector similarity search always returns the top-K nearest
     # neighbours even when they are completely irrelevant; applying the
-    # same RELEVANCE_THRESHOLD used by RAG ensures only genuinely matching
-    # memories are surfaced (distances are normalised to 0→1, higher is
-    # better).
-    relevance_threshold = await Config.get('rag.relevance_threshold', 0.0)
+    # memory-specific MEMORIES_RELEVANCE_THRESHOLD ensures only genuinely
+    # matching memories are surfaced (distances are normalised to 0→1, higher
+    # is better).  This used to borrow rag.relevance_threshold, which coupled
+    # memory tuning to document/KB RAG.
+    relevance_threshold = await Config.get('memories.relevance_threshold', 0.0)
     if results and relevance_threshold > 0.0 and results.distances and results.distances[0]:
         from open_webui.retrieval.vector.main import SearchResult
 
@@ -569,7 +577,7 @@ async def update_memory_by_id(
         memory_type=form_data.type,
         path=path,
         update_path=form_data.path is not None,
-        meta={'created_by': 'manual'},
+        meta=memory_write_meta(source='manual', attribution=form_data.attribution),
     )
     if memory is None:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)

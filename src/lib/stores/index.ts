@@ -55,6 +55,17 @@ export const TTSWorker = writable(null);
 export const chatId = writable('');
 export const chatTitle = writable('');
 
+// Child chat ids whose background subagent run has finished. Recomputed by
+// Chat.svelte from history; consumed by the structured output renderer so a
+// dispatch row keeps spinning until its child completes.
+export const subagentCompletions = writable(new Set<string>());
+
+// Live call -> child chat id map, keyed `${message_id}:${call_id}`. Populated
+// from the `subagent:created` socket event so a tool-call row can link into its
+// child while the run is still in progress (the result envelope only exists
+// once the child finishes).
+export const subagentSessions = writable(new Map<string, string>());
+
 export const channels = writable([]);
 export const channelId = writable(null);
 
@@ -97,9 +108,6 @@ export const adminFeedbackCount: Writable<number | null> = writable(null);
 
 export const toolServers = writable([]);
 export const terminalServers: Writable<any[] | null> = writable(null);
-
-// Persistent Pyodide worker for code interpreter FS
-export const pyodideWorker: Writable<Worker | null> = writable(null);
 
 export const banners: Writable<Banner[]> = writable([]);
 
@@ -374,6 +382,9 @@ type Config = {
 		enable_admin_chat_access: boolean;
 		enable_admin_analytics: boolean;
 		enable_context_compaction?: boolean;
+		context_compaction_buffer?: number;
+		context_compaction_keep_tokens?: number;
+		context_compaction_auto?: boolean;
 		enable_tool_permissions?: boolean;
 		enable_community_sharing: boolean;
 		enable_memories: boolean;

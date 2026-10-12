@@ -7,7 +7,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from open_webui.config import (
-    CONTEXT_COMPACTION_RETENTION_PERCENTAGE,
+    CONTEXT_COMPACTION_AUTO,
+    CONTEXT_COMPACTION_BUFFER,
+    CONTEXT_COMPACTION_KEEP_TOKENS,
     CONTEXT_COMPACTION_TOKEN_THRESHOLD,
     ENABLE_ADMIN_CHAT_ACCESS,
     ENABLE_ADMIN_EXPORT,
@@ -43,12 +45,22 @@ from open_webui.utils.access_control import filter_allowed_access_grants, has_pe
 from open_webui.utils.access_control.folders import has_folder_write_access
 from open_webui.utils.auth import bearer_security, get_admin_user, get_current_user, get_verified_user
 from open_webui.utils.chat_fork import build_fork_history
-from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
+from open_webui.utils.context_compaction import (
+    COMPACTION_IN_PROGRESS_DETAIL,
+    compact_chat_branch,
+    get_chat_context_usage,
+)
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Local aliases: the ``ChatConfigForm`` field names below shadow the config
+# symbols, so the field defaults need distinct names.
+CONTEXT_COMPACTION_AUTO_DEFAULT = CONTEXT_COMPACTION_AUTO
+CONTEXT_COMPACTION_BUFFER_DEFAULT = CONTEXT_COMPACTION_BUFFER
+CONTEXT_COMPACTION_KEEP_TOKENS_DEFAULT = CONTEXT_COMPACTION_KEEP_TOKENS
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +71,9 @@ CHAT_CONFIG_KEYS = {
     'ENABLE_CONTEXT_COMPACTION': 'chat.context_compaction.enable',
     'CONTEXT_COMPACTION_TOKEN_THRESHOLD': 'chat.context_compaction.token_threshold',
     'CONTEXT_COMPACTION_TOKEN_CAP': 'chat.context_compaction.token_cap',
-    'CONTEXT_COMPACTION_RETENTION_PERCENTAGE': 'chat.context_compaction.retention_percentage',
+    'CONTEXT_COMPACTION_BUFFER': 'chat.context_compaction.buffer',
+    'CONTEXT_COMPACTION_KEEP_TOKENS': 'chat.context_compaction.keep_tokens',
+    'CONTEXT_COMPACTION_AUTO': 'chat.context_compaction.auto',
     'CONTEXT_COMPACTION_PROMPT_TEMPLATE': 'chat.context_compaction.prompt_template',
     'ENABLE_TOOL_PERMISSIONS': 'chat.tool_permissions.enable',
     'ENABLE_TOOL_SEARCH': 'chat.tool_search.enable',
@@ -203,7 +217,9 @@ class ChatConfigForm(BaseModel):
     ENABLE_CONTEXT_COMPACTION: bool
     CONTEXT_COMPACTION_TOKEN_THRESHOLD: int | None = None
     CONTEXT_COMPACTION_TOKEN_CAP: int | None = None
-    CONTEXT_COMPACTION_RETENTION_PERCENTAGE: int | None = None
+    CONTEXT_COMPACTION_BUFFER: int = CONTEXT_COMPACTION_BUFFER_DEFAULT
+    CONTEXT_COMPACTION_KEEP_TOKENS: int = CONTEXT_COMPACTION_KEEP_TOKENS_DEFAULT
+    CONTEXT_COMPACTION_AUTO: bool = CONTEXT_COMPACTION_AUTO_DEFAULT
     CONTEXT_COMPACTION_PROMPT_TEMPLATE: str
     ENABLE_TOOL_PERMISSIONS: bool = False
     ENABLE_TOOL_SEARCH: bool = False
@@ -264,8 +280,12 @@ async def get_chat_config_values() -> dict:
         config['CONTEXT_COMPACTION_MODEL'] = ''
     if config.get('CONTEXT_COMPACTION_TOKEN_CAP') is None:
         config['CONTEXT_COMPACTION_TOKEN_CAP'] = config.get('CONTEXT_COMPACTION_TOKEN_THRESHOLD', 80000)
-    if config.get('CONTEXT_COMPACTION_RETENTION_PERCENTAGE') is None:
-        config['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] = 40
+    if config.get('CONTEXT_COMPACTION_BUFFER') is None:
+        config['CONTEXT_COMPACTION_BUFFER'] = CONTEXT_COMPACTION_BUFFER_DEFAULT
+    if config.get('CONTEXT_COMPACTION_KEEP_TOKENS') is None:
+        config['CONTEXT_COMPACTION_KEEP_TOKENS'] = CONTEXT_COMPACTION_KEEP_TOKENS_DEFAULT
+    if config.get('CONTEXT_COMPACTION_AUTO') is None:
+        config['CONTEXT_COMPACTION_AUTO'] = CONTEXT_COMPACTION_AUTO_DEFAULT
     return config
 
 
@@ -896,10 +916,8 @@ async def set_chat_config(form_data: ChatConfigForm, user=Depends(get_admin_user
         threshold = CONTEXT_COMPACTION_TOKEN_THRESHOLD
     threshold = max(1, int(threshold))
     token_cap = max(1, int(form_data.CONTEXT_COMPACTION_TOKEN_CAP or threshold))
-    retention_percentage = form_data.CONTEXT_COMPACTION_RETENTION_PERCENTAGE
-    if retention_percentage is None:
-        retention_percentage = CONTEXT_COMPACTION_RETENTION_PERCENTAGE
-    retention_percentage = min(50, max(10, int(retention_percentage)))
+    buffer = max(1, int(form_data.CONTEXT_COMPACTION_BUFFER))
+    keep_tokens = max(1, int(form_data.CONTEXT_COMPACTION_KEEP_TOKENS))
     tool_search_defer_threshold = max(0, int(form_data.TOOL_SEARCH_DEFER_THRESHOLD))
     tool_search_always_loaded = [item.strip() for item in form_data.TOOL_SEARCH_ALWAYS_LOADED if item.strip()]
     await Config.upsert(
@@ -909,7 +927,9 @@ async def set_chat_config(form_data: ChatConfigForm, user=Depends(get_admin_user
                 'CONTEXT_COMPACTION_MODEL': form_data.CONTEXT_COMPACTION_MODEL or '',
                 'CONTEXT_COMPACTION_TOKEN_THRESHOLD': threshold,
                 'CONTEXT_COMPACTION_TOKEN_CAP': token_cap,
-                'CONTEXT_COMPACTION_RETENTION_PERCENTAGE': retention_percentage,
+                'CONTEXT_COMPACTION_BUFFER': buffer,
+                'CONTEXT_COMPACTION_KEEP_TOKENS': keep_tokens,
+                'CONTEXT_COMPACTION_AUTO': bool(form_data.CONTEXT_COMPACTION_AUTO),
                 'TOOL_SEARCH_DEFER_THRESHOLD': tool_search_defer_threshold,
                 'TOOL_SEARCH_ALWAYS_LOADED': tool_search_always_loaded,
             }
@@ -1367,7 +1387,7 @@ async def compact_chat_by_id(
     if await has_active_tasks(request.app.state.redis, id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail='Wait for the current response to finish before compacting.',
+            detail=COMPACTION_IN_PROGRESS_DETAIL,
         )
 
     if not request.app.state.MODELS:
@@ -1434,6 +1454,52 @@ async def get_chat_by_id(
         return data
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+
+############################
+# GetChatSubagentsById
+############################
+
+
+class SubagentChatItem(BaseModel):
+    id: str
+    title: str
+    state: str
+    updated_at: int
+
+
+@router.get('/{id}/subagents', response_model=list[SubagentChatItem])
+async def get_chat_subagents_by_id(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """List the internal subagent child chats spawned from chat `id`."""
+    chat = await Chats.get_chat_by_id_for_user(
+        id,
+        user,
+        db=db,
+    )
+
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    subagents: list[SubagentChatItem] = []
+    for child_id in await Chats.get_internal_chat_ids_by_parent_id(id, user.id):
+        child = await Chats.get_chat_by_id(child_id, db=db)
+        if not child:
+            continue
+        meta = child.meta or {}
+        subagents.append(
+            SubagentChatItem(
+                id=child.id,
+                title=child.title,
+                state=meta.get('state') or meta.get('status') or '',
+                updated_at=child.updated_at,
+            )
+        )
+
+    return subagents
 
 
 ############################

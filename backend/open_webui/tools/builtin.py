@@ -67,6 +67,7 @@ from open_webui.tasks import stop_item_tasks
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.memory import sanitize_memory_attribution
 from open_webui.utils.notifications import notify_target
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.skill_files import SkillFile, SkillFileOperation, bounded_skill_manifest, skill_content_page
@@ -532,15 +533,15 @@ async def ask_user(
     Ask the user clarifying questions before continuing.
     Use this when the next step depends on user intent, preference, or a tradeoff that cannot be inferred safely.
 
-    :param questions: 1-3 question objects, each with id, header, question, and 2-3 options. Each option needs label and description.
+    :param questions: question objects, each with id, header, question, and options. Each option needs label and description.
         List the option you recommend first; the UI labels the first option Recommended.
     :param allow_other: Whether users may enter a free-form answer instead of choosing one of the options
     :param timeout_ms: How long the browser should keep the prompt open before cancelling it
     :return: JSON with status and answers keyed by question id
     """
     try:
-        if not isinstance(questions, list) or not 1 <= len(questions) <= 3:
-            raise ValueError('ask_user requires 1-3 questions.')
+        if not isinstance(questions, list) or not questions:
+            raise ValueError('ask_user requires at least one question.')
 
         normalized_questions = []
         seen_ids = set()
@@ -548,7 +549,7 @@ async def ask_user(
             if not isinstance(question, dict):
                 raise ValueError('Each question must be an object.')
 
-            question_id = str(question.get('id') or '').strip()[:64]
+            question_id = str(question.get('id') or '').strip()
             if not question_id:
                 raise ValueError('Each question requires a non-empty id.')
             if question_id in seen_ids:
@@ -556,16 +557,16 @@ async def ask_user(
             seen_ids.add(question_id)
 
             options = question.get('options')
-            if not isinstance(options, list) or not 2 <= len(options) <= 3:
-                raise ValueError('Each question requires 2-3 options.')
+            if not isinstance(options, list) or not options:
+                raise ValueError('Each question requires at least one option.')
 
             normalized_options = []
             for option in options:
                 if not isinstance(option, dict):
                     raise ValueError('Each option must be an object.')
 
-                label = str(option.get('label') or '').strip()[:80]
-                description = str(option.get('description') or '').strip()[:240]
+                label = str(option.get('label') or '').strip()
+                description = str(option.get('description') or '').strip()
                 if not label or not description:
                     raise ValueError('Each option requires a label and description.')
 
@@ -576,14 +577,14 @@ async def ask_user(
                     }
                 )
 
-            question_text = str(question.get('question') or '').strip()[:500]
+            question_text = str(question.get('question') or '').strip()
             if not question_text:
                 raise ValueError('Each question requires question text.')
 
             normalized_questions.append(
                 {
                     'id': question_id,
-                    'header': str(question.get('header') or '').strip()[:48] or f'Question {index + 1}',
+                    'header': str(question.get('header') or '').strip() or f'Question {index + 1}',
                     'question': question_text,
                     'options': normalized_options,
                     'allow_other': bool(question.get('allow_other', allow_other)),
@@ -651,6 +652,12 @@ async def execute_code(
     Execute Python code in a sandboxed environment and return the output.
     Use this to perform calculations, data analysis, generate visualizations,
     or run any Python code that would help answer the user's question.
+
+    For matplotlib, call plt.show() to show a figure to the user directly; do
+    not use savefig unless the user explicitly asks for a downloadable file.
+    When you write any file to /mnt/uploads/, tell the user they can view or
+    download it from the Controls -> Files panel in the top right. If the result
+    contains an image link or markdown image, include it in your reply.
 
     :param code: The Python code to execute
     :return: JSON with stdout, stderr, and result from execution
@@ -816,7 +823,9 @@ async def list_memory_paths(
 
     :param query: Optional query to filter memory paths or contents
     :param count: Maximum number of paths to return
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to search every memory. Topic-specific memories can
+        be stored as "context".
     :return: JSON with memory paths, counts, children, and update times
     """
     try:
@@ -848,7 +857,9 @@ async def read_memory_path(
 
     :param path: Memory path to read
     :param count: Maximum number of memories to return
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to read every memory. Topic-specific memories can
+        be stored as "context".
     :param include_children: Include memories under child paths
     :return: JSON with parent paths, child paths, and memories at the path
     """
@@ -883,7 +894,9 @@ async def search_memories(
 
     :param query: Optional query to search memory content and path
     :param count: Number of memories to return (default 5)
-    :param type: "user", "context", or "all"
+    :param type: Filter by memory type. Pass "user" or "context" to return only that
+        type; omit (or pass "all") to search every memory. Topic-specific memories can
+        be stored as "context".
     :param path: Optional memory path to search around
     :param memory_id: Optional exact memory ID to read
     :return: JSON with matching memories and their dates
@@ -931,6 +944,7 @@ async def add_memory(
     content: str,
     type: str = 'user',
     path: Optional[str] = None,
+    attribution: Literal['user', 'assistant'] | None = None,
     __request__: Request = None,
     __user__: dict = None,
 ) -> str:
@@ -942,8 +956,13 @@ async def add_memory(
     unless the user explicitly asks you to remember them.
 
     :param content: The memory content to store
-    :param type: Use "user" for facts/preferences about the user, or "context" for other durable context
+    :param type: "user" for a durable fact, preference, or instruction distinctly
+        personal to the user; "context" for other durable context, including
+        topic-specific memories. ("all" is only a read filter.)
     :param path: Optional stable memory address for grouping related memories
+    :param attribution: Who originated the fact: "user" when the user stated it,
+        "assistant" when it is your own inference/judgment. Omit when relaying
+        the user's own statement.
     :return: Confirmation that the memory was stored
     """
     if __request__ is None:
@@ -954,7 +973,12 @@ async def add_memory(
 
         memory = await _add_memory(
             __request__,
-            AddMemoryForm(content=content, type=Memories.normalize_memory_type(type), path=path),
+            AddMemoryForm(
+                content=content,
+                type=Memories.normalize_memory_type(type),
+                path=path,
+                attribution=attribution,
+            ),
             user,
         )
 
@@ -975,8 +999,9 @@ async def update_memory(
     """
     Apply a batch of memory changes after learning enduring information.
 
-    Use type "user" for facts, preferences, or instructions about the user.
-    Use type "context" for other durable context that may help future chats.
+    Use type "user" for facts, preferences, or instructions distinctly personal to the user.
+    Use type "context" for other durable context, including topic-specific memories.
+    ("all" is only a read filter.)
     Do not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details
     unless the user explicitly asks you to remember them.
     Path is optional. Use it as a stable memory address to group related memories.
@@ -984,10 +1009,15 @@ async def update_memory(
     Leave path empty when no useful grouping is clear.
 
     Operation shapes:
-    - {"action": "add", "content": "...", "type": "user"|"context", "path": "..."}
-    - {"action": "replace", "id": "...", "content": "...", "type": "user"|"context", "path": "..."}
+    - {"action": "add", "content": "...", "type": "user"|"context", "path": "...", "attribution": "user"|"assistant"}
+    - {"action": "replace", "id": "...", "content": "...", "type": "user"|"context",
+       "path": "...", "attribution": "user"|"assistant"}
     - {"action": "move", "id": "...", "path": "..."}
     - {"action": "remove", "id": "..."}
+
+    Set "attribution" to "user" when the user stated the fact or preference, and to
+    "assistant" when it is your own inference, correction, or judgment (for example a
+    self-corrected 已修正 conclusion). Never label your own inference as "user".
 
     :param operations: Memory operations to apply in one request
     :return: JSON with operation results
@@ -1013,6 +1043,7 @@ async def replace_memory_content(
     content: str,
     type: Optional[str] = None,
     path: Optional[str] = None,
+    attribution: Literal['user', 'assistant'] | None = None,
     __request__: Request = None,
     __user__: dict = None,
 ) -> str:
@@ -1023,6 +1054,9 @@ async def replace_memory_content(
     :param content: The new content for the memory
     :param type: Optional "user" or "context" type for the updated memory
     :param path: Optional stable memory address for grouping related memories
+    :param attribution: Who originated the correction: "assistant" for your own
+        inference/judgment (default), or "user" when relaying a user-stated
+        correction.
     :return: Confirmation that the memory was updated
     """
     if __request__ is None:
@@ -1038,6 +1072,12 @@ async def replace_memory_content(
                 content=content,
                 type=Memories.normalize_memory_type(type) if type else None,
                 path=path,
+                # A model-initiated correction defaults to an assistant action; the
+                # human UI edit path leaves attribution unset and is stamped "user".
+                # Sanitize before defaulting so a malformed value (dropped to None)
+                # takes the assistant default instead of the manual-source "user"
+                # fallback — never claim user provenance on a tool write.
+                attribution=sanitize_memory_attribution(attribution) or 'assistant',
             ),
             user=user,
         )
@@ -1683,45 +1723,98 @@ async def view_chat(
 # SUB-AGENT TOOL
 # =============================================================================
 
+# The advertised tool is `subagent` (opencode v2 parity). `delegate_task` and
+# `task` remain resolvable aliases: persisted chats and `toolLabels.js` still
+# reference the old names, and a model continuing an old chat may emit them.
+# Middleware resolves alias calls to the canonical entry and keeps subagent
+# fan-out parallel across every name in this set.
+SUBAGENT_CANONICAL_NAME = 'subagent'
+SUBAGENT_TOOL_ALIASES = ('delegate_task', 'task')
+SUBAGENT_TOOL_NAMES = frozenset((SUBAGENT_CANONICAL_NAME, *SUBAGENT_TOOL_ALIASES))
 
-async def delegate_task(
-    task: str,
+
+async def subagent(
+    description: str,
+    prompt: str,
     context: str = '',
     file_ids: list[str] | None = None,
     background: bool = False,
+    sessionID: str | None = None,
     __request__: Request = None,
     __user__: dict = None,
     __metadata__: dict = None,
     __chat_id__: str = None,
     __message_id__: str = None,
+    __tool_call_id__: str = None,
 ) -> str:
     """
-    Delegate focused work to a parallel sub-agent using the current model and tools.
+    Spawns an isolated child subagent to execute an independent task, research workflow, or
+    background job.
 
-    :param task: The specific task for the sub-agent to complete
-    :param context: Relevant context, decisions, or file paths for the task
-    :param file_ids: Attached file IDs the sub-agent needs. Use this for images or files;
-        do not put file IDs only in context.
-    :param background: Return immediately and continue this chat when the sub-agent finishes
-    :return: Foreground result text, or a JSON dispatch handle for background work
+    ### When to Use
+    - **Context Isolation:** Offload heavy exploration, extensive web searches, or verbose data
+      processing to prevent polluting the parent conversation's context window.
+    - **Parallel Execution:** Spawn concurrent tasks that do not depend on one another.
+    - **Thread Continuation:** Resume a previous subagent's conversation by providing its
+      `sessionID`.
+
+    ### When NOT to Use
+    - Do **not** use `background=true` if your very next step strictly depends on the subagent's
+      output.
+
+    ### Execution Modes
+    - **Foreground (`background=false`, default):** Blocks until the subagent completes. Use
+      when the next step strictly depends on the subagent's final output.
+    - **Background (`background=true`):** Returns immediately with a `sessionID` and runs
+      asynchronously. Use when you have other independent work to perform while the subagent
+      runs. **Do NOT poll or sleep:** the subagent's final result is automatically injected into
+      this chat upon completion.
+    - **Follow-ups:** Send follow-up instructions to a completed subagent by calling this tool
+      with its `sessionID` and a new `prompt`, without restarting from scratch.
+
+    ### Returns
+    - **Foreground (`background=false`):** The final response wrapped in
+      `<subagent sessionID="..." state="...">...</subagent>`.
+    - **Background (`background=true`):** An immediate acknowledgment
+      `{"sessionID": "...", "status": "running", "output": "..."}`; the subagent's final output
+      will be delivered to this chat when complete.
+
+    :param description: (required) A concise 3-5 word title summarizing the task. Visible to the
+        user in UI.
+    :param prompt: (required) Explicit instructions and success criteria for the subagent. When
+        delegating research, specify the expected depth: `"quick"` (basic verification), `"medium"`
+        (broad overview), or `"very thorough"` (deep multi-source investigation). When steering an
+        active agent, state the new direction or adjustment clearly.
+    :param context: (optional) Essential background, prior findings, constraints, or file paths
+        needed to execute the task. Leave empty if unnecessary.
+    :param file_ids: (optional) Array of file/image IDs the subagent requires access to. Always
+        pass IDs here; referencing them solely inside `prompt` or `context` does not grant access.
+    :param background: (optional, default: false) Set to `true` to run asynchronously without
+        blocking.
+    :param sessionID: (optional) The `sessionID` of a subagent to resume or steer. Omit to spawn a
+        fresh subagent with clean context. Provide to steer an in-progress background subagent or
+        continue a prior session.
     """
     if __request__ is None:
         return 'Error: request context not available.'
     if getattr(__request__.state, 'internal', False) is True:
-        return 'Error: sub-agents cannot delegate recursively.'
+        return 'Error: subagents cannot delegate recursively.'
 
     from open_webui.utils.subagents import delegate
 
     return await delegate(
-        task,
+        description,
+        prompt,
         context,
         background,
         file_ids=file_ids,
+        session_id=sessionID,
         request=__request__,
         user_data=__user__ or {},
         metadata=__metadata__ or {},
         parent_chat_id=__chat_id__ or '',
         parent_message_id=__message_id__,
+        tool_call_id=__tool_call_id__,
     )
 
 
