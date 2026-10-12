@@ -179,10 +179,12 @@
 		<div class="space-y-2">
 			{#if question}
 				{#key question.id}
-					<div class="space-y-2">
+					<div class="max-h-[60vh] space-y-2 overflow-y-auto pr-1">
 						<div>
-							<div class="flex items-center justify-between gap-3">
-								<div class="text-sm font-medium text-gray-900 dark:text-gray-100">
+							<div class="flex items-start justify-between gap-3">
+								<div
+									class="min-w-0 break-words text-sm font-medium text-gray-900 dark:text-gray-100"
+								>
 									{question.header}
 								</div>
 								{#if questions.length > 1}
@@ -193,7 +195,9 @@
 									</div>
 								{/if}
 							</div>
-							<div class="mt-0.5 text-xs leading-relaxed text-gray-600 dark:text-gray-300">
+							<div
+								class="mt-0.5 break-words text-xs leading-relaxed text-gray-600 dark:text-gray-300"
+							>
 								{question.question}
 							</div>
 						</div>
@@ -203,7 +207,7 @@
 								{#each question.options || [] as option, optionIndex}
 									<button
 										type="button"
-										class="group flex w-full min-w-0 items-baseline gap-2 rounded-lg py-1.5 text-start transition-colors {isSelectedOption(
+										class="group flex w-full min-w-0 items-start gap-2 rounded-lg py-1.5 text-start transition-colors {isSelectedOption(
 											question,
 											optionIndex
 										)
@@ -211,7 +215,7 @@
 											: 'text-gray-700 hover:text-gray-950 dark:text-gray-300 dark:hover:text-white'}"
 										on:click={() => selectOption(question, option, optionIndex)}
 									>
-										<span class="min-w-0 shrink-0 text-xs">{option.label}</span>
+										<span class="max-w-[50%] shrink-0 break-words text-xs">{option.label}</span>
 										<Tooltip
 											as="span"
 											className="min-w-0 flex-1"
@@ -219,7 +223,7 @@
 											placement="top-start"
 										>
 											<span
-												class="block truncate text-xs leading-relaxed text-gray-500 transition-colors group-hover:text-gray-700 dark:text-gray-400 dark:group-hover:text-gray-300"
+												class="line-clamp-2 break-words text-xs leading-relaxed text-gray-500 transition-colors group-hover:text-gray-700 dark:text-gray-400 dark:group-hover:text-gray-300"
 											>
 												{option.description}
 											</span>

@@ -32,6 +32,7 @@
 		getAllTags,
 		getChatById,
 		getChatListByTagName,
+		getSubagentChatsByParentId,
 		markChatUnreadById,
 		updateChatById,
 		updateChatFolderIdById
@@ -128,6 +129,38 @@
 	}
 
 	let chat = null;
+
+	// Internal subagent children of this chat, shown nested only while this row
+	// is the selected chat (one fetch per selection, not for every sidebar row).
+	type SubagentChatItem = { id: string; title: string; state?: string; updated_at?: number };
+	let subagentChats: SubagentChatItem[] = [];
+	let subagentChatsLoadedFor: string | null = null;
+
+	const loadSubagentChats = async () => {
+		const requestedId = id;
+		const children = await getSubagentChatsByParentId(localStorage.token, requestedId).catch(
+			(error) => {
+				console.error(error);
+				return null;
+			}
+		);
+		// Drop a response for a row that is no longer the selected chat: selection
+		// may have moved on while the request was in flight.
+		if (subagentChatsLoadedFor !== requestedId || requestedId !== $chatId) {
+			return;
+		}
+		subagentChats = Array.isArray(children) ? children : [];
+	};
+
+	$: if (id === $chatId) {
+		if (subagentChatsLoadedFor !== id) {
+			subagentChatsLoadedFor = id;
+			void loadSubagentChats();
+		}
+	} else if (subagentChatsLoadedFor !== null) {
+		subagentChatsLoadedFor = null;
+		subagentChats = [];
+	}
 
 	let mouseOver = false;
 	let focusWithin = false;
@@ -663,7 +696,10 @@
 		focusWithin = false;
 	}}
 >
-	{#if confirmEdit}
+	<!-- Row + menu share a positioning context that excludes the nested
+	     subagent chips, so the menu stays centered on the chat row. -->
+	<div class="relative">
+		{#if confirmEdit}
 		<div
 			id="sidebar-chat-item"
 			class=" w-full flex justify-between rounded-xl px-2 py-1.5 {id === $chatId || confirmEdit
@@ -888,6 +924,21 @@
 					</ChatMenu>
 				</div>
 			{/if}
+			</div>
+		{/if}
+	</div>
+
+	{#if subagentChats.length > 0}
+		<div class="mb-0.5 ml-4 space-y-0.5 border-l border-gray-100 pl-2 dark:border-gray-850/40">
+			{#each subagentChats as subagent (subagent.id)}
+				<a
+					href={`/c/${subagent.id}`}
+					title={subagent.title}
+					class="block truncate text-[0.75rem] text-gray-500 transition hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+				>
+					{subagent.title}
+				</a>
+			{/each}
 		</div>
 	{/if}
 </div>

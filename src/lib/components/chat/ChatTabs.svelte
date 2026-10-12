@@ -1113,7 +1113,7 @@
 						bind:terminalContext={fileContexts[tab.id]}
 					/>
 				{:else if tab.kind === 'files' && codeInterpreterEnabled}
-					<PyodideFileNav overlay={dragged} />
+					<PyodideFileNav overlay={dragged} {chatId} />
 				{/if}
 			</div>
 		{/each}

@@ -26,8 +26,8 @@ def normalize_ask_user_request(arguments: dict) -> dict:
     questions = arguments.get('questions')
     if not isinstance(questions, list):
         raise ValueError('ask_user questions must be an array of question objects.')
-    if not 1 <= len(questions) <= 3:
-        raise ValueError('ask_user requires 1-3 questions.')
+    if not questions:
+        raise ValueError('ask_user requires at least one question.')
 
     normalized_questions = []
     seen_ids = set()
@@ -36,7 +36,7 @@ def normalize_ask_user_request(arguments: dict) -> dict:
         if not isinstance(question, dict):
             raise ValueError('Each question must be an object.')
 
-        question_id = str(question.get('id') or '').strip()[:64]
+        question_id = str(question.get('id') or '').strip()
         if not question_id:
             raise ValueError('Each question requires a non-empty id.')
         if question_id in seen_ids:
@@ -44,27 +44,27 @@ def normalize_ask_user_request(arguments: dict) -> dict:
         seen_ids.add(question_id)
 
         options = question.get('options')
-        if not isinstance(options, list) or not 2 <= len(options) <= 3:
-            raise ValueError('Each question requires 2-3 options.')
+        if not isinstance(options, list) or not options:
+            raise ValueError('Each question requires at least one option.')
 
         normalized_options = []
         for option in options:
             if not isinstance(option, dict):
                 raise ValueError('Each option must be an object.')
-            label = str(option.get('label') or '').strip()[:80]
-            description = str(option.get('description') or '').strip()[:240]
+            label = str(option.get('label') or '').strip()
+            description = str(option.get('description') or '').strip()
             if not label or not description:
                 raise ValueError('Each option requires a label and description.')
             normalized_options.append({'label': label, 'description': description})
 
-        question_text = str(question.get('question') or '').strip()[:500]
+        question_text = str(question.get('question') or '').strip()
         if not question_text:
             raise ValueError('Each question requires question text.')
 
         normalized_questions.append(
             {
                 'id': question_id,
-                'header': str(question.get('header') or '').strip()[:48] or f'Question {index + 1}',
+                'header': str(question.get('header') or '').strip() or f'Question {index + 1}',
                 'question': question_text,
                 'options': normalized_options,
                 'allow_other': bool(question.get('allow_other', allow_other)),

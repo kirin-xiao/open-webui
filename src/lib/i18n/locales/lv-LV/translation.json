@@ -4508,5 +4508,12 @@
 	"YouTube": "YouTube",
 	"YouTube video player": "YouTube video atskaņotājs",
 	"Zoom in": "Tuvināt",
-	"Zoom out": "Tālināt"
+	"Zoom out": "Tālināt",
+	"Allow the AI to delegate tasks to subagents. Each subagent creates a real chat with full tool access. Uses additional LLM calls.": "Atļaut MI deleģēt uzdevumus apakšaģentiem. Katrs apakšaģents izveido īstu tērzēšanu ar pilnu piekļuvi rīkiem. Izmanto papildu LLM izsaukumus.",
+	"Background subagent finished": "Fona apakšaģents pabeidza darbu",
+	"background subagents": "fona apakšaģenti",
+	"simultaneous subagents": "vienlaicīgi apakšaģenti",
+	"The score should be a value between 0.0 (0%) and 1.0 (100%).": "Rezultātam jābūt vērtībai starp 0.0 (0%) un 1.0 (100%).",
+	"tool loops per subagent": "rīku cikli katram apakšaģentam",
+	"You are a subagent...": "Tu esi apakšaģents..."
 }

@@ -215,6 +215,7 @@
 				className={markdown?.document ? 'document-code-block' : ''}
 				collapsed={markdown?.document ? false : ($settings?.collapseCodeBlocks ?? false)}
 				{token}
+				{chatId}
 				lang={token?.lang ?? ''}
 				code={token?.text ?? ''}
 				{attributes}

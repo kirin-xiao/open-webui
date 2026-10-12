@@ -31,7 +31,7 @@ from open_webui.utils.tools import (
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 router = APIRouter()
 
@@ -68,9 +68,8 @@ MODELS_CONFIG_KEYS = {
 }
 SUBAGENTS_CONFIG_KEYS = {
     'ENABLE_SUBAGENTS': 'subagents.enable',
-    'SUBAGENTS_BACKGROUND_ENABLED': 'subagents.background_enabled',
-    'SUBAGENTS_MAX_CONCURRENT': 'subagents.max_concurrent',
-    'SUBAGENTS_MAX_ASYNC': 'subagents.max_async',
+    'SUBAGENTS_DEPTH': 'subagents.depth',
+    'SUBAGENTS_MODEL': 'subagents.model',
     'SUBAGENTS_MAX_ITERATIONS': 'subagents.max_iterations',
     'SUBAGENTS_MAX_OUTPUT': 'subagents.max_output',
     'SUBAGENTS_SYSTEM_PROMPT': 'subagents.system_prompt',
@@ -798,28 +797,13 @@ async def set_models_config(request: Request, form_data: ModelsConfigForm, user=
 
 class SubagentsConfigForm(BaseModel):
     ENABLE_SUBAGENTS: bool
-    SUBAGENTS_BACKGROUND_ENABLED: bool
-    SUBAGENTS_MAX_CONCURRENT: int | None = Field(default=None, gt=0)
-    SUBAGENTS_MAX_ASYNC: int | None = Field(default=None, gt=0)
-    SUBAGENTS_MAX_ITERATIONS: int | None = Field(default=None, gt=0)
-    SUBAGENTS_MAX_OUTPUT: int | None = Field(default=None, gt=0)
+    # New in T1. Optional so an older frontend (or a frontend that does not surface
+    # these yet) does not 422; omitted fields are left untouched on save.
+    SUBAGENTS_DEPTH: int = 1
+    SUBAGENTS_MODEL: str = ''
+    SUBAGENTS_MAX_ITERATIONS: int
+    SUBAGENTS_MAX_OUTPUT: int
     SUBAGENTS_SYSTEM_PROMPT: str
-
-    @field_validator(
-        'SUBAGENTS_MAX_CONCURRENT',
-        'SUBAGENTS_MAX_ASYNC',
-        'SUBAGENTS_MAX_ITERATIONS',
-        'SUBAGENTS_MAX_OUTPUT',
-        mode='before',
-    )
-    @classmethod
-    def normalize_limit(cls, value):
-        return None if value in ('', 0) else value
-
-    @field_validator('SUBAGENTS_MAX_CONCURRENT', 'SUBAGENTS_MAX_ASYNC', mode='before')
-    @classmethod
-    def normalize_legacy_unlimited(cls, value):
-        return None if value == -1 else value
 
 
 @router.get('/subagents', response_model=SubagentsConfigForm)
@@ -833,7 +817,9 @@ async def set_subagents_config(
     form_data: SubagentsConfigForm,
     user=Depends(get_admin_user),
 ):
-    await Config.upsert(config_updates(form_data.model_dump(), SUBAGENTS_CONFIG_KEYS))
+    # `exclude_unset` keeps an older frontend that omits the new depth/model fields
+    # from clobbering the stored/default values with form defaults.
+    await Config.upsert(config_updates(form_data.model_dump(exclude_unset=True), SUBAGENTS_CONFIG_KEYS))
     values = await get_config_values(SUBAGENTS_CONFIG_KEYS)
     await publish_event(
         request,

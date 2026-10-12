@@ -4483,5 +4483,12 @@
 	"YouTube": "یوتیوب",
 	"YouTube video player": "پخش\u200cکننده ویدیوی YouTube",
 	"Zoom in": "بزرگ\u200cنمایی",
-	"Zoom out": "کوچک\u200cنمایی"
+	"Zoom out": "کوچک\u200cنمایی",
+	"Allow the AI to delegate tasks to subagents. Each subagent creates a real chat with full tool access. Uses additional LLM calls.": "به هوش مصنوعی اجازه دهید وظایف را به زیرعامل‌ها واگذار کند. هر زیرعامل یک گفتگوی واقعی با دسترسی کامل به ابزارها ایجاد می‌کند. از فراخوانی‌های اضافی LLM استفاده می‌کند.",
+	"Background subagent finished": "زیرعامل پس‌زمینه به پایان رسید",
+	"background subagents": "زیرعامل پس‌زمینه",
+	"simultaneous subagents": "زیرعامل همزمان",
+	"The score should be a value between 0.0 (0%) and 1.0 (100%).": "امتیاز باید مقداری بین 0.0 (0%) و 1.0 (100%) باشد.",
+	"tool loops per subagent": "حلقه ابزار برای هر زیرعامل",
+	"You are a subagent...": "شما یک زیرعامل هستید..."
 }

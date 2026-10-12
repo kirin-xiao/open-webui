@@ -54,7 +54,9 @@
 		showFileNavPath,
 		showFileNavDir,
 		chatRequestQueues,
-		desktopEvent
+		desktopEvent,
+		subagentCompletions,
+		subagentSessions
 	} from '$lib/stores';
 	import { refreshChatList, refreshFolderChatLists } from '$lib/stores/chatList';
 
@@ -82,8 +84,10 @@
 	import { routeAvatarAnimation } from '$lib/utils/voice-avatar';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
 	import { resumeTemporaryChat } from '$lib/apis';
+	import { getMessageCheckpoint } from '$lib/utils/contextCompaction';
 	import {
 		applyResponseStreamEvent,
+		collectCompletedSubagentIds,
 		getOutputText,
 		setOutputText
 	} from './Messages/structuredOutput';
@@ -242,8 +246,11 @@
 	} else {
 		selectedModelIds = selectedModels;
 	}
-	let serverContextUsage = null;
-	let contextUsage = null;
+	let serverContextUsage: any = null;
+	let contextUsage: any = null;
+	// Lifecycle ledger mirrored from `chat.meta.context_compaction` and updated by
+	// the `context_compaction` socket event.
+	let contextCompaction: any = null;
 
 	const normalizeSelectedModels = (modelIds: string[] = []) => {
 		const selected = resolveDefaultModelIds(
@@ -287,26 +294,29 @@
 		return Number.isFinite(threshold) && threshold > 0 ? threshold : null;
 	};
 
-	const getContextUsage = (
-		chatHistory: typeof history,
-		system: string,
-		threshold: number | null
-	) => {
-		if (!chatHistory?.currentId) {
+	// Secondary fallback used only before the server `context_usage` payload has
+	// loaded. Mirrors the server math (same threshold ceiling, same checkpoint
+	// read shim, same CJK-agnostic char/4 estimate) so it cannot diverge wildly.
+	const getLocalContextUsage = () => {
+		if (!history?.currentId) {
 			return null;
 		}
 
-		const messages = createMessagesList(chatHistory, chatHistory.currentId);
-		const systemTokens = estimateTokens(system);
+		const messages = createMessagesList(history, history.currentId);
+		const threshold =
+			getContextThreshold(atSelectedModel?.id ?? selectedModels.find((id) => id), $models, params) ??
+			serverContextUsage?.threshold ??
+			null;
+		const systemTokens = estimateTokens($settings?.system ?? '');
 		let estimatedTokens = systemTokens;
 		let hasUsageCheckpoint = false;
 		let summary = '';
 		let startIdx = 0;
 
 		for (let idx = 0; idx < messages.length; idx += 1) {
-			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
-			if (typeof value === 'string' && value.trim()) {
-				summary = value;
+			const checkpoint = getMessageCheckpoint(messages[idx]);
+			if (checkpoint) {
+				summary = checkpoint.summary;
 				startIdx = idx;
 			}
 		}
@@ -339,18 +349,16 @@
 		};
 	};
 
-	$: contextThreshold = contextCompactionEnabled
-		? (getContextThreshold(
-				atSelectedModel?.id ?? selectedModels.find((id) => id),
-				$models,
-				params
-			) ??
-			serverContextUsage?.threshold ??
-			null)
+	// Server-authoritative: `get_chat_context_usage` runs the same budget walk as
+	// the trigger, so prefer its `threshold`/`percent`; fall back to the mirrored
+	// local estimate only when the server payload is unavailable.
+	$: contextUsage = contextCompactionEnabled
+		? (serverContextUsage ?? getLocalContextUsage())
 		: null;
-	$: contextUsage =
-		getContextUsage(history, $settings?.system ?? '', contextThreshold) ??
-		(contextCompactionEnabled ? serverContextUsage : null);
+	// Distinguishes the server payload from the mirrored local fallback for the
+	// ring's budget-source indicator. Gate on the usage actually in effect so a
+	// stale/disabled server payload can never label the local fallback as server.
+	$: contextUsageSource = contextUsage && serverContextUsage ? 'server' : 'estimated';
 	$: embeddedHeaderTitle = embeddedTitle || $chatTitle || $i18n.t('Chat');
 
 	let selectedToolIds: string[] = [];
@@ -423,6 +431,7 @@
 		contextCompactions.set({});
 		compactionChatId = $chatId;
 	}
+	let contextCompactionToastId: any = null;
 
 	let chat: any = null;
 	let tags = [];
@@ -971,6 +980,7 @@
 		taskIds = null;
 		chatTasks = [];
 		serverContextUsage = null;
+		contextCompaction = null;
 		history = {
 			messages: {},
 			currentId: null
@@ -1309,15 +1319,84 @@
 		contextCompactions.set(next);
 	};
 
-	const handleContextCompactionStatus = (status, messageId: string) => {
-		if (status?.action !== 'context_compaction') return;
-		if (status.done && !status.error) {
-			clearContextCompaction(messageId);
-		} else {
-			$contextCompactions = {
-				...$contextCompactions,
-				[messageId]: status.error ? { error: $i18n.t('Context compaction failed') } : 'in_progress'
+	// Re-read the server-authoritative usage after a compaction settles so the
+	// ring and the checkpoint row reflect the newly dropped/kept history.
+	const refreshContextUsage = async () => {
+		if (!$chatId || $temporaryChatEnabled) {
+			return;
+		}
+		try {
+			const chat = await getChatById(localStorage.token, $chatId);
+			if (chat) {
+				serverContextUsage = chat?.context_usage ?? serverContextUsage;
+				contextCompaction = chat?.meta?.context_compaction ?? contextCompaction;
+			}
+		} catch (error) {
+			console.error(error);
+		}
+	};
+
+	const handleContextCompactionStatus = async (status, messageId: string) => {
+		if (status?.action !== 'context_compaction') {
+			return;
+		}
+
+		const now = Math.floor(Date.now() / 1000);
+
+		if (status?.done) {
+			if (messageId) {
+				if (status?.error) {
+					$contextCompactions = {
+						...$contextCompactions,
+						[messageId]: { error: $i18n.t('Context compaction failed') }
+					};
+				} else {
+					clearContextCompaction(messageId);
+				}
+			}
+
+			contextCompaction = {
+				...contextCompaction,
+				status: status?.error ? 'failed' : 'completed',
+				updated_at: now,
+				...(status?.error ? { error: 'Context compaction failed' } : {})
 			};
+
+			if (contextCompactionToastId !== null) {
+				if (status?.error) {
+					toast.error($i18n.t('Context compaction failed'), {
+						id: contextCompactionToastId,
+						duration: 3000
+					});
+				} else {
+					toast.success($i18n.t('Context compacted'), {
+						id: contextCompactionToastId,
+						duration: 1800
+					});
+				}
+				contextCompactionToastId = null;
+			}
+
+			if (!status?.error) {
+				await refreshContextUsage();
+			}
+			return;
+		}
+
+		if (messageId) {
+			$contextCompactions = { ...$contextCompactions, [messageId]: 'in_progress' };
+		}
+
+		contextCompaction = {
+			...contextCompaction,
+			status: 'running',
+			updated_at: now
+		};
+
+		if (contextCompactionToastId === null) {
+			contextCompactionToastId = toast.loading($i18n.t('Compacting context'), {
+				duration: Infinity
+			});
 		}
 	};
 
@@ -1576,6 +1655,26 @@
 			if (type === 'chat:list') {
 				return;
 			}
+			if (type === 'subagent:created') {
+				// A tool call reported the child it spawned. Record it against the
+				// call so its row can link into the child immediately, before the
+				// run's `<subagent sessionID=...>` result exists. Handled before the
+				// message lookup below: the row renders reactively from the store and
+				// must not depend on the message being loaded yet.
+				const data = event?.data?.data ?? null;
+				const callId = data?.call_id;
+				const childId = data?.sessionID;
+				if (callId && childId) {
+					const key = `${data?.message_id ?? event.message_id}:${callId}`;
+					subagentSessions.update((map) => {
+						if (map.get(key) === childId) return map;
+						const next = new Map(map);
+						next.set(key, childId);
+						return next;
+					});
+				}
+				return;
+			}
 			let message = history.messages[event.message_id];
 			if (message) message = { ...message };
 
@@ -1593,7 +1692,7 @@
 					if (data?.checkpoint_message_id && history.messages[data.checkpoint_message_id]) {
 						history.messages[data.checkpoint_message_id].contextSummary = data.context_summary;
 					}
-					handleContextCompactionStatus(data, event.message_id);
+					await handleContextCompactionStatus(data, event.message_id);
 					autoScrollToBottom();
 				} else if (type === 'chat:active') {
 					if (!data?.active) {
@@ -2517,6 +2616,29 @@
 	});
 	$: if (!$user && (bridge?.connected || bridge?.connecting)) bridge.end();
 	$: if (selectedModelIds && $models && $config) bridge?.syncModel();
+	// Feed the renderer the set of child chats whose background run has finished,
+	// so a still-running dispatch row keeps its spinner instead of flipping to
+	// "done" as soon as the immediate `running` handle lands in history.
+	let subagentCompletionKey = '';
+	$: {
+		const completed = collectCompletedSubagentIds(history?.messages ?? {});
+		const key = [...completed].sort().join('\n');
+		if (key !== subagentCompletionKey) {
+			subagentCompletionKey = key;
+			subagentCompletions.set(completed);
+		}
+	}
+
+	// A child subagent chat gets a slim banner back to the chat it was spawned
+	// from. Derived here so the template does not reach into the loosely-typed
+	// `chat` object directly.
+	$: isSubagentChat =
+		chat?.meta?.internal === true &&
+		chat?.meta?.type === 'subagent' &&
+		!!chat?.meta?.parent_chat_id;
+	$: subagentParentChatId = isSubagentChat ? String(chat.meta.parent_chat_id) : '';
+	$: subagentDescription =
+		isSubagentChat && typeof chat.meta.description === 'string' ? chat.meta.description : '';
 
 	const dispatchCallOverlayAudio = (message, final = false) => {
 		if (message.error || !$showCallOverlay || callMode !== 'current') {
@@ -3030,6 +3152,7 @@
 				// Load tasks from chat-level DB field
 				chatTasks = chat?.tasks ?? [];
 				serverContextUsage = chat?.context_usage ?? null;
+				contextCompaction = chat?.meta?.context_compaction ?? null;
 
 				autoScroll = true;
 				await tick();
@@ -3755,6 +3878,13 @@
 		if ($contextCompactions[compactMessageId] === 'in_progress') return;
 		$contextCompactions = { ...$contextCompactions, [compactMessageId]: 'in_progress' };
 
+		contextCompaction = {
+			...(contextCompaction ?? {}),
+			status: 'running',
+			manual: true,
+			updated_at: Math.floor(Date.now() / 1000)
+		};
+
 		try {
 			const result = await compactChatById(localStorage.token, compactChatId, model);
 			if ($chatId !== compactChatId) return;
@@ -3774,17 +3904,79 @@
 
 			await loadChat();
 			clearContextCompaction(compactMessageId);
-		} catch (error) {
+		} catch (error: any) {
 			if ($chatId === compactChatId) {
-				$contextCompactions = {
-					...$contextCompactions,
-					[compactMessageId]: {
-						error: String(error?.detail ?? error?.message ?? $i18n.t('Context compaction failed'))
-					}
-				};
+				const message = error?.detail ?? error?.message ?? $i18n.t('Context compaction failed');
+				if (error?.status === 409) {
+					// A concurrent auto/manual compaction already holds the per-chat lease.
+					// Leave the lifecycle status alone: the in-flight run owns it and will
+					// publish its own completion, so a 409 must not mislabel it as failed.
+					$contextCompactions = { ...$contextCompactions, [compactMessageId]: 'in_progress' };
+					toast.warning($i18n.t('Compaction already in progress'));
+				} else {
+					$contextCompactions = {
+						...$contextCompactions,
+						[compactMessageId]: { error: String(message) }
+					};
+					toast.error(message);
+					contextCompaction = {
+						...(contextCompaction ?? {}),
+						status: 'failed',
+						updated_at: Math.floor(Date.now() / 1000),
+						error: message
+					};
+				}
 			}
 		} finally {
 			messageInput?.focus({ preventScroll: true });
+		}
+	};
+
+	// Undo a checkpoint: clear the structured record on the boundary message so
+	// the full history projects again. The row disappears; the dropped messages
+	// were never deleted.
+	const handleUndoCheckpoint = async (messageId: string) => {
+		if (!contextCompactionEnabled) {
+			toast.message($i18n.t('Context compaction is disabled'));
+			return;
+		}
+		const currentHistory: any = history;
+		if (!$chatId || !messageId || !currentHistory?.messages?.[messageId]) {
+			toast.message($i18n.t('No chat to compact'));
+			return;
+		}
+
+		const toastId = toast.loading($i18n.t('Removing checkpoint...'));
+		try {
+			const nextHistory: any = structuredClone(currentHistory);
+			// Clear every checkpoint, not just the clicked one. Each compaction
+			// writes its record onto a boundary message and leaves any earlier
+			// record in the summarized-away prefix, so clearing only the newest
+			// would let the read shim fall back to an older checkpoint instead of
+			// restoring the full history. Empty string (not a missing key) is
+			// required: the backend only clears the stored column when the field
+			// is present.
+			for (const message of Object.values(nextHistory.messages ?? {}) as any[]) {
+				if ('contextSummary' in message || 'context_summary' in message) {
+					message.contextSummary = '';
+					delete message.context_summary;
+				}
+			}
+
+			await updateChatById(localStorage.token, $chatId, { history: nextHistory });
+
+			for (const message of Object.values(currentHistory.messages ?? {}) as any[]) {
+				delete message.contextSummary;
+				delete message.context_summary;
+			}
+			history = history;
+
+			toast.success($i18n.t('Context checkpoint removed'), { id: toastId });
+			await loadChat();
+		} catch (error: any) {
+			const message =
+				error?.detail ?? error?.message ?? $i18n.t('Failed to remove context checkpoint');
+			toast.error(message, { id: toastId });
 		}
 	};
 
@@ -5347,6 +5539,24 @@
 								</Tooltip>{/if}
 						</div>
 					{:else}
+						{#if isSubagentChat}
+							<div
+								class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-gray-50/80 px-3 py-1.5 text-xs text-gray-500 dark:border-gray-850/40 dark:text-gray-400"
+							>
+								<span class="font-normal">{$i18n.t('Subagent chat for')}</span>
+								<a
+									href={`/c/${subagentParentChatId}`}
+									class="font-normal text-gray-700 transition hover:text-gray-900 hover:underline dark:text-gray-200 dark:hover:text-white"
+								>
+									{$i18n.t('Back to parent chat')}
+								</a>
+								{#if subagentDescription}
+									<span class="min-w-0 truncate text-gray-400 dark:text-gray-500">
+										{subagentDescription}
+									</span>
+								{/if}
+							</div>
+						{/if}
 						<Navbar
 							tabbed={fullWidthTabs}
 							bind:tabTitleEditor
@@ -5462,6 +5672,11 @@
 										forkHandler={$temporaryChatEnabled ? null : handleForkChat}
 										topPadding={!embedded && !fullWidthTabs}
 										bottomPadding={files.length > 0}
+										{contextUsage}
+										{contextCompaction}
+										{contextCompactionEnabled}
+										onUndoCheckpoint={handleUndoCheckpoint}
+										onRegenerateCheckpoint={handleManualCompact}
 										{onSelect}
 										{onInsertToNote}
 									/>
@@ -5518,6 +5733,7 @@
 										dropzoneId={messageInputDropzoneId}
 										chatId={$chatId}
 										{contextUsage}
+										{contextUsageSource}
 										{contextCompactionEnabled}
 										{embedded}
 										compactHandler={handleManualCompact}
@@ -5619,6 +5835,7 @@
 										dropzoneId={messageInputDropzoneId}
 										chatId={$chatId}
 										{contextUsage}
+										{contextUsageSource}
 										{contextCompactionEnabled}
 										{embedded}
 										compactHandler={handleManualCompact}

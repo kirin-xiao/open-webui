@@ -6,7 +6,7 @@
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import ToolOutputFile from './ToolOutputFile.svelte';
 	import { resolveChatMessageToolCall } from '$lib/apis/chats';
-	import { settings } from '$lib/stores';
+	import { settings, subagentCompletions, subagentSessions } from '$lib/stores';
 	import { toast } from 'svelte-sonner';
 
 	import Markdown from './Markdown.svelte';
@@ -73,7 +73,12 @@
 		compactPreview ? 'text-xs' : 'text-[0.9375rem]'
 	} text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition`;
 
-	$: displayItems = buildOutputDisplayItems(output) as OutputDisplayItem[];
+	$: displayItems = buildOutputDisplayItems(
+		output,
+		$subagentCompletions,
+		$subagentSessions,
+		messageId
+	) as OutputDisplayItem[];
 </script>
 
 {#each displayItems as displayItem (displayItem.id)}

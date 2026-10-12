@@ -41,6 +41,7 @@
 	export let canCreateSkill: boolean | (() => boolean) = false;
 	export let contextUsage = null;
 	export let fileUploadEnabled: boolean | (() => boolean) = true;
+	export let contextSource: any = null;
 
 	$: compactAvailable = typeof canCompact === 'function' ? canCompact() : canCompact;
 	$: isCompactDisabled =
@@ -56,6 +57,7 @@
 	$: createSkillAvailable =
 		typeof canCreateSkill === 'function' ? canCreateSkill() : canCreateSkill;
 	$: resolvedContextUsage = typeof contextUsage === 'function' ? contextUsage() : contextUsage;
+	$: resolvedContextSource = typeof contextSource === 'function' ? contextSource() : contextSource;
 	$: contextHasThreshold = Number(resolvedContextUsage?.threshold) > 0;
 	$: contextPercent = contextHasThreshold
 		? Math.max(0, Math.round(resolvedContextUsage?.percent ?? 0))
@@ -126,6 +128,7 @@
 					temporaryEnabled={isTemporaryEnabled}
 					{contextPercent}
 					{contextHasThreshold}
+					contextSource={resolvedContextSource}
 					{hasChatContent}
 					canCreateSkill={createSkillAvailable}
 					onSelect={(e) => {
