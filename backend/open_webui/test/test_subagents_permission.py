@@ -46,7 +46,8 @@ async def _get_tools(
     internal=False,
     direct=False,
 ):
-    async def _fake_groups(user_id, db=None):
+    async def _fake_groups(user_id, db=None, include_inherited=False):
+        # `include_inherited` is passed by the production access-control matcher.
         return [] if group_permissions is None else [SimpleNamespace(permissions=group_permissions)]
 
     monkeypatch.setattr(access_control.Groups, 'get_groups_by_member_id', _fake_groups)
@@ -152,6 +153,8 @@ async def test_denied_call_is_tool_not_found(monkeypatch):
         raise AssertionError('no callable should run')
 
     ns['get_updated_tool_function'] = _never
-    _, result, tool, _, _ = await ns['execute_tool_call'](_legacy_call('delegate_task', {'task': 'x'}))
+    _, result, tool, _, _ = await ns['execute_tool_call'](
+        ns['form_data'], ns['metadata'], None, _legacy_call('delegate_task', {'task': 'x'})
+    )
     assert result == 'Error: Tool "delegate_task" not found.'
     assert tool is None

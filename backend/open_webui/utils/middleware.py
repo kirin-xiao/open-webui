@@ -3412,6 +3412,37 @@ async def build_chat_response_context(request, form_data, user, model, metadata,
     }
 
 
+def apply_subagent_alias(tool_call: dict, tools: dict) -> bool:
+    """Rewrite a replayed legacy subagent call to the canonical tool, in place.
+
+    ``delegate_task`` / ``task`` stay resolvable aliases of ``subagent`` so
+    persisted chats and models continuing them keep working. The legacy schema
+    named the work ``task``; the canonical schema splits it into
+    ``description``/``prompt``. A real tool registered under an alias name keeps
+    precedence. Returns True when the call was rewritten.
+    """
+    name = tool_call.get('name', '')
+    if (
+        name not in SUBAGENT_TOOL_NAMES
+        or name == SUBAGENT_CANONICAL_NAME
+        or tools.get(name) is not None
+        or not tools.get(SUBAGENT_CANONICAL_NAME)
+    ):
+        return False
+
+    tool_call['name'] = SUBAGENT_CANONICAL_NAME
+    try:
+        params = JSONCodec.loads(tool_call.get('arguments') or '{}')
+    except Exception:
+        return True
+    if isinstance(params, dict) and 'task' in params and 'prompt' not in params:
+        legacy_task = params.pop('task')
+        params.setdefault('description', legacy_task)
+        params['prompt'] = legacy_task
+        tool_call['arguments'] = JSONCodec.dumps(params)
+    return True
+
+
 async def execute_tool_call(form_data, metadata, event_caller, tool_call):
     """Execute the saved function_call item, already resolved before approval staging."""
     name = tool_call.get('name', '')
@@ -6108,26 +6139,9 @@ async def streaming_chat_response_handler(response, ctx):
 
                     # `delegate_task` / `task` remain resolvable aliases of the canonical
                     # `subagent` tool: persisted chats and models continuing them still
-                    # emit the old names. Rewrite the staged call so it executes the
-                    # canonical tool, translating the legacy single `task` argument.
+                    # emit the old names, so the staged call is rewritten in place.
                     for staged_call in response_tool_calls:
-                        staged_name = staged_call.get('name', '')
-                        if (
-                            staged_name in SUBAGENT_TOOL_NAMES
-                            and staged_name != SUBAGENT_CANONICAL_NAME
-                            and tools.get(staged_name) is None
-                            and tools.get(SUBAGENT_CANONICAL_NAME)
-                        ):
-                            staged_call['name'] = SUBAGENT_CANONICAL_NAME
-                            try:
-                                staged_params = JSONCodec.loads(staged_call.get('arguments') or '{}')
-                            except Exception:
-                                staged_params = None
-                            if isinstance(staged_params, dict) and 'task' in staged_params and 'prompt' not in staged_params:
-                                legacy_task = staged_params.pop('task')
-                                staged_params.setdefault('description', legacy_task)
-                                staged_params['prompt'] = legacy_task
-                                staged_call['arguments'] = JSONCodec.dumps(staged_params)
+                        apply_subagent_alias(staged_call, tools)
 
                     # Subagent calls run in parallel. A single turn may not continue
                     # the same subagent session twice: two concurrent continuations

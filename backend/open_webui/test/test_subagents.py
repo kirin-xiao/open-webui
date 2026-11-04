@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,15 +179,24 @@ async def _wait_until(predicate, *, attempts: int = 200) -> bool:
 
 
 def _load_middleware_namespace():
-    """Compile parse_tool_params/execute_tool_call/execute_subagent_call from source."""
+    """Compile apply_subagent_alias/execute_tool_call/execute_subagent_call from source.
+
+    The merged middleware runs the staged-call pipeline from upstream (module-level
+    ``execute_tool_call`` over ``{name, arguments, call_id}`` items) with the fork's
+    alias rewriting and per-batch sessionID guard layered on top, so these are the
+    units that carry the subagent contract.
+    """
     tree = ast.parse(MIDDLEWARE_PATH.read_text())
-    wanted = {'parse_tool_params', 'execute_tool_call', 'execute_subagent_call'}
+    wanted = {'apply_subagent_alias', 'execute_tool_call', 'execute_subagent_call'}
     ns = {
         'JSONCodec': JSONCodec,
         'ast': ast,
         'log': SimpleNamespace(debug=lambda *a, **k: None, warning=lambda *a, **k: None),
         'uuid4': uuid4,
         'asyncio': asyncio,
+        're': re,
+        'time': time,
+        'is_saved_chat_id': lambda chat_id: True,
         'SUBAGENT_CANONICAL_NAME': SUBAGENT_CANONICAL_NAME,
         'SUBAGENT_TOOL_NAMES': SUBAGENT_TOOL_NAMES,
     }
@@ -221,8 +231,10 @@ def _install_tool(ns, calls):
         calls.append(kwargs)
         return '<subagent sessionID="child-1" state="completed">\nok\n</subagent>'
 
-    ns['tools'] = {'subagent': {'callable': _subagent_callable, 'type': 'builtin', 'spec': _tool_spec()}}
-    ns['metadata'] = {'session_id': 's'}
+    tools = {'subagent': {'callable': _subagent_callable, 'type': 'builtin', 'spec': _tool_spec()}}
+    ns['tools'] = tools
+    # The staged-call executor reads the resolved tool table off metadata.
+    ns['metadata'] = {'session_id': 's', 'tools': tools}
     ns['form_data'] = {'messages': []}
 
     async def _get_updated_tool_function(function, extra_params):
@@ -230,13 +242,17 @@ def _install_tool(ns, calls):
 
     ns['get_updated_tool_function'] = _get_updated_tool_function
     ns['seen_subagent_sessions'] = set()
+    ns['event_caller'] = None
     return _subagent_callable
 
 
 def _legacy_call(name, params):
+    """A staged function_call item as the tool loop builds it before dispatch."""
     return {
         'id': 'tc-1',
-        'function': {'name': name, 'arguments': json.dumps(params)},
+        'call_id': 'tc-1',
+        'name': name,
+        'arguments': json.dumps(params),
     }
 
 
@@ -247,8 +263,11 @@ async def test_legacy_delegate_task_alias_translates_task_argument():
     calls: list[dict] = []
     _install_tool(ns, calls)
 
+    call = _legacy_call('delegate_task', {'task': 'summarise the repo'})
+    assert ns['apply_subagent_alias'](call, ns['tools']) is True
+
     params, result, tool, tool_type, direct = await ns['execute_tool_call'](
-        _legacy_call('delegate_task', {'task': 'summarise the repo'})
+        ns['form_data'], ns['metadata'], None, call
     )
 
     assert params == {'description': 'summarise the repo', 'prompt': 'summarise the repo'}
@@ -264,8 +283,11 @@ async def test_legacy_task_alias_translates_task_argument():
     calls: list[dict] = []
     _install_tool(ns, calls)
 
+    call = _legacy_call('task', {'task': 'write the changelog'})
+    assert ns['apply_subagent_alias'](call, ns['tools']) is True
+
     params, result, tool, tool_type, direct = await ns['execute_tool_call'](
-        _legacy_call('task', {'task': 'write the changelog'})
+        ns['form_data'], ns['metadata'], None, call
     )
 
     assert params == {'description': 'write the changelog', 'prompt': 'write the changelog'}
@@ -278,8 +300,19 @@ async def test_canonical_subagent_name_is_not_rewritten():
     calls: list[dict] = []
     _install_tool(ns, calls)
 
+    call = _legacy_call(
+        'subagent', {'description': 'label', 'prompt': 'the real prompt', 'sessionID': 'child-1'}
+    )
+    assert ns['apply_subagent_alias'](call, ns['tools']) is False
+    assert call['name'] == 'subagent'
+    assert json.loads(call['arguments']) == {
+        'description': 'label',
+        'prompt': 'the real prompt',
+        'sessionID': 'child-1',
+    }
+
     params, result, tool, tool_type, direct = await ns['execute_tool_call'](
-        _legacy_call('subagent', {'description': 'label', 'prompt': 'the real prompt', 'sessionID': 'child-1'})
+        ns['form_data'], ns['metadata'], None, call
     )
 
     assert params == {'description': 'label', 'prompt': 'the real prompt', 'sessionID': 'child-1'}
@@ -299,7 +332,14 @@ async def test_tool_absent_is_rejected():
         raise AssertionError('tool should not have a callable')
 
     ns['get_updated_tool_function'] = _never
-    params, result, tool, tool_type, direct = await ns['execute_tool_call'](_legacy_call('subagent', {'prompt': 'x'}))
+
+    call = _legacy_call('subagent', {'prompt': 'x'})
+    # An alias with no canonical tool registered is not rewritten either.
+    assert ns['apply_subagent_alias'](_legacy_call('task', {'task': 'x'}), ns['tools']) is False
+
+    params, result, tool, tool_type, direct = await ns['execute_tool_call'](
+        ns['form_data'], ns['metadata'], None, call
+    )
 
     assert result == 'Error: Tool "subagent" not found.'
     assert tool is None

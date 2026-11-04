@@ -700,230 +700,230 @@
 	     subagent chips, so the menu stays centered on the chat row. -->
 	<div class="relative">
 		{#if confirmEdit}
-		<div
-			id="sidebar-chat-item"
-			class=" w-full flex justify-between rounded-xl px-2 py-1.5 {id === $chatId || confirmEdit
-				? ($settings?.highContrastMode ?? false)
-					? 'bg-black/[0.035] dark:bg-white/[0.06] selected'
-					: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
-				: selected || multiSelected
+			<div
+				id="sidebar-chat-item"
+				class=" w-full flex justify-between rounded-xl px-2 py-1.5 {id === $chatId || confirmEdit
 					? ($settings?.highContrastMode ?? false)
-						? 'bg-black/[0.035] dark:bg-white/[0.055] selected'
+						? 'bg-black/[0.035] dark:bg-white/[0.06] selected'
 						: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
-					: 'hover:bg-gray-100 dark:hover:bg-gray-900 group-hover:bg-gray-100 dark:group-hover:bg-gray-900'}  whitespace-nowrap text-ellipsis relative transition {generating
-				? 'cursor-not-allowed'
-				: ''}"
-		>
-			<input
-				aria-label={$i18n.t('Rename')}
-				id="chat-title-input-{id}"
-				bind:value={chatTitle}
-				class=" bg-transparent w-full outline-hidden mr-10"
-				placeholder={generating ? $i18n.t('Generating...') : ''}
-				disabled={generating}
-				on:keydown={chatTitleInputKeydownHandler}
-				on:blur={async (e) => {
-					if (doubleClicked) {
-						e.preventDefault();
-						e.stopPropagation();
+					: selected || multiSelected
+						? ($settings?.highContrastMode ?? false)
+							? 'bg-black/[0.035] dark:bg-white/[0.055] selected'
+							: 'bg-black/[0.035] dark:bg-white/[0.045] selected'
+						: 'hover:bg-gray-100 dark:hover:bg-gray-900 group-hover:bg-gray-100 dark:group-hover:bg-gray-900'}  whitespace-nowrap text-ellipsis relative transition {generating
+					? 'cursor-not-allowed'
+					: ''}"
+			>
+				<input
+					aria-label={$i18n.t('Rename')}
+					id="chat-title-input-{id}"
+					bind:value={chatTitle}
+					class=" bg-transparent w-full outline-hidden mr-10"
+					placeholder={generating ? $i18n.t('Generating...') : ''}
+					disabled={generating}
+					on:keydown={chatTitleInputKeydownHandler}
+					on:blur={async (e) => {
+						if (doubleClicked) {
+							e.preventDefault();
+							e.stopPropagation();
 
-						await tick();
-						setTimeout(() => {
-							const input = document.getElementById(`chat-title-input-${id}`);
-							if (input) input.focus();
-						}, 0);
+							await tick();
+							setTimeout(() => {
+								const input = document.getElementById(`chat-title-input-${id}`);
+								if (input) input.focus();
+							}, 0);
 
-						doubleClicked = false;
-						return;
-					}
-				}}
-			/>
-		</div>
-	{:else}
-		<div id="sidebar-chat-item" class={chatItemClass}>
-			{#if selecting}
-				<button
-					type="button"
-					role="checkbox"
-					aria-checked={multiSelected}
-					disabled={readonly || $selectionBusy}
-					aria-label={$i18n.t('Select {{name}}', { name: title })}
-					class="mr-2 flex size-3.5 shrink-0 self-center items-center justify-center rounded border disabled:opacity-40 {multiSelected
-						? 'border-gray-900 bg-gray-900 text-white dark:border-gray-200 dark:bg-gray-200 dark:text-gray-900'
-						: 'border-gray-300 dark:border-gray-600'}"
-					on:click|stopPropagation={(event) => chatSelection?.select(id, event.shiftKey)}
-				>
-					{#if multiSelected}<CheckIcon className="size-2.5" strokeWidth="2" />{/if}
-				</button>
-			{/if}
-			{#if ownerUserId || participants.length > 1}
-				<div class="flex items-center self-center shrink-0 mr-2">
-					<ChatParticipants
-						{participants}
-						owner={ownerUserId ? { id: ownerUserId, name: ownerName } : null}
-						avatarClass="size-3.5"
-						bind:activeProfileId
-						bind:overflowOpen
-					/>
-				</div>
-			{/if}
-			{#if $mobile}
-				<a
-					class="flex min-w-0 flex-1 items-center"
-					href="/c/{id}"
-					aria-current={id === $chatId ? 'page' : undefined}
-					on:click={selectChatHandler}
-					draggable="false"
-				>
-					{@render chatItemContent()}
-				</a>
-			{:else}
-				<LinkPreview.Root
-					openDelay={300}
-					closeDelay={0}
-					disabled={confirmEdit ||
-						dragged ||
-						selecting ||
-						shiftKey ||
-						!($settings?.chatHoverPreview ?? true)}
-					bind:open={openPreview}
-					onOpenChange={(open) => {
-						if (open) {
-							activeProfileId = null;
-							overflowOpen = false;
+							doubleClicked = false;
+							return;
 						}
 					}}
-				>
-					<LinkPreview.Trigger
-						class="flex min-w-0 flex-1 -my-1.5 py-1.5 items-center"
+				/>
+			</div>
+		{:else}
+			<div id="sidebar-chat-item" class={chatItemClass}>
+				{#if selecting}
+					<button
+						type="button"
+						role="checkbox"
+						aria-checked={multiSelected}
+						disabled={readonly || $selectionBusy}
+						aria-label={$i18n.t('Select {{name}}', { name: title })}
+						class="mr-2 flex size-3.5 shrink-0 self-center items-center justify-center rounded border disabled:opacity-40 {multiSelected
+							? 'border-gray-900 bg-gray-900 text-white dark:border-gray-200 dark:bg-gray-200 dark:text-gray-900'
+							: 'border-gray-300 dark:border-gray-600'}"
+						on:click|stopPropagation={(event) => chatSelection?.select(id, event.shiftKey)}
+					>
+						{#if multiSelected}<CheckIcon className="size-2.5" strokeWidth="2" />{/if}
+					</button>
+				{/if}
+				{#if ownerUserId || participants.length > 1}
+					<div class="flex items-center self-center shrink-0 mr-2">
+						<ChatParticipants
+							{participants}
+							owner={ownerUserId ? { id: ownerUserId, name: ownerName } : null}
+							avatarClass="size-3.5"
+							bind:activeProfileId
+							bind:overflowOpen
+						/>
+					</div>
+				{/if}
+				{#if $mobile}
+					<a
+						class="flex min-w-0 flex-1 items-center"
 						href="/c/{id}"
 						aria-current={id === $chatId ? 'page' : undefined}
-						onclick={selectChatHandler}
-						ondblclick={renameChatFromDoubleClick}
+						on:click={selectChatHandler}
 						draggable="false"
 					>
 						{@render chatItemContent()}
-					</LinkPreview.Trigger>
-
-					<ChatHoverPreview
-						chatId={id}
-						title={chatTitle || title}
-						{openPreview}
-						side="right"
-						align="center"
-					/>
-				</LinkPreview.Root>
-			{/if}
-		</div>
-	{/if}
-
-	{#if (!readonly || (canRename && !confirmEdit)) && !selecting}
-		<div
-			id="sidebar-chat-item-menu"
-			class="{$mobile
-				? 'selected'
-				: showInlineActions
-					? 'selected'
-					: 'hover-reveal'} absolute {className === 'pr-2'
-				? 'right-[0.5rem]'
-				: 'right-1'} inset-y-0 mr-1.5 flex items-center"
-		>
-			{#if confirmEdit}
-				<div
-					class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
-				>
-					<Tooltip content={$i18n.t('Generate')}>
-						<button
-							aria-label={$i18n.t('Generate')}
-							class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-							id="generate-title-button"
-							disabled={generating}
-							on:click={() => {
-								generateTitleHandler();
-							}}
-						>
-							<SparklesIcon strokeWidth="1.5" />
-						</button>
-					</Tooltip>
-				</div>
-			{:else if !readonly && shiftKey && mouseOver && !chatSelection}
-				<div class=" flex items-center self-center space-x-1.5">
-					{#if $visibleControls['chat.archive']}
-						<Tooltip content={$i18n.t('Archive')} className="flex items-center">
-							<button
-								aria-label={$i18n.t('Archive')}
-								class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-								disabled={archiving}
-								on:click={() => {
-									archiveChatHandler(id);
-								}}
-								type="button"
-							>
-								<ArchiveBoxIcon className="size-3.5" strokeWidth="1.7" />
-							</button>
-						</Tooltip>
-					{/if}
-
-					{#if $user?.role === 'admin' || ($user?.permissions?.chat?.delete ?? true)}
-						<Tooltip content={$i18n.t('Delete')}>
-							<button
-								aria-label={$i18n.t('Delete')}
-								class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-								disabled={deleting}
-								on:click={() => {
-									deleteChatHandler(id);
-								}}
-								type="button"
-							>
-								<GarbageBinIcon className="size-3.5" strokeWidth="1.7" />
-							</button>
-						</Tooltip>
-					{/if}
-				</div>
-			{:else}
-				<div class="flex self-center z-10 items-end">
-					<ChatMenu
-						{readonly}
-						chatId={id}
-						cloneChatHandler={() => {
-							cloneChatHandler(id);
-						}}
-						shareHandler={() => {
-							showShareChatModal = true;
-						}}
-						{moveChatHandler}
-						archiveChatHandler={() => {
-							archiveChatHandler(id);
-						}}
-						{renameHandler}
-						deleteHandler={() => {
-							showDeleteConfirm = true;
-						}}
-						{markUnreadHandler}
-						onOpen={() => {
-							menuOpen = true;
-							dispatch('select');
-						}}
-						onClose={() => {
-							menuOpen = false;
-							dispatch('unselect');
-						}}
-						onPinChange={async () => {
-							dispatch('change');
+					</a>
+				{:else}
+					<LinkPreview.Root
+						openDelay={300}
+						closeDelay={0}
+						disabled={confirmEdit ||
+							dragged ||
+							selecting ||
+							shiftKey ||
+							!($settings?.chatHoverPreview ?? true)}
+						bind:open={openPreview}
+						onOpenChange={(open) => {
+							if (open) {
+								activeProfileId = null;
+								overflowOpen = false;
+							}
 						}}
 					>
-						<button
-							type="button"
-							aria-label={$i18n.t('Chat Menu')}
-							class="flex {($settings?.highContrastMode ?? false)
-								? 'size-6'
-								: 'size-5'} items-center justify-center self-center dark:hover:text-white transition m-0"
+						<LinkPreview.Trigger
+							class="flex min-w-0 flex-1 -my-1.5 py-1.5 items-center"
+							href="/c/{id}"
+							aria-current={id === $chatId ? 'page' : undefined}
+							onclick={selectChatHandler}
+							ondblclick={renameChatFromDoubleClick}
+							draggable="false"
 						>
-							<MoreHorizontalIcon className="size-3.5" strokeWidth="2" />
-						</button>
-					</ChatMenu>
-				</div>
-			{/if}
+							{@render chatItemContent()}
+						</LinkPreview.Trigger>
+
+						<ChatHoverPreview
+							chatId={id}
+							title={chatTitle || title}
+							{openPreview}
+							side="right"
+							align="center"
+						/>
+					</LinkPreview.Root>
+				{/if}
+			</div>
+		{/if}
+
+		{#if (!readonly || (canRename && !confirmEdit)) && !selecting}
+			<div
+				id="sidebar-chat-item-menu"
+				class="{$mobile
+					? 'selected'
+					: showInlineActions
+						? 'selected'
+						: 'hover-reveal'} absolute {className === 'pr-2'
+					? 'right-[0.5rem]'
+					: 'right-1'} inset-y-0 mr-1.5 flex items-center"
+			>
+				{#if confirmEdit}
+					<div
+						class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
+					>
+						<Tooltip content={$i18n.t('Generate')}>
+							<button
+								aria-label={$i18n.t('Generate')}
+								class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+								id="generate-title-button"
+								disabled={generating}
+								on:click={() => {
+									generateTitleHandler();
+								}}
+							>
+								<SparklesIcon strokeWidth="1.5" />
+							</button>
+						</Tooltip>
+					</div>
+				{:else if !readonly && shiftKey && mouseOver && !chatSelection}
+					<div class=" flex items-center self-center space-x-1.5">
+						{#if $visibleControls['chat.archive']}
+							<Tooltip content={$i18n.t('Archive')} className="flex items-center">
+								<button
+									aria-label={$i18n.t('Archive')}
+									class="flex size-5 items-center justify-center self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+									disabled={archiving}
+									on:click={() => {
+										archiveChatHandler(id);
+									}}
+									type="button"
+								>
+									<ArchiveBoxIcon className="size-3.5" strokeWidth="1.7" />
+								</button>
+							</Tooltip>
+						{/if}
+
+						{#if $user?.role === 'admin' || ($user?.permissions?.chat?.delete ?? true)}
+							<Tooltip content={$i18n.t('Delete')}>
+								<button
+									aria-label={$i18n.t('Delete')}
+									class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+									disabled={deleting}
+									on:click={() => {
+										deleteChatHandler(id);
+									}}
+									type="button"
+								>
+									<GarbageBinIcon className="size-3.5" strokeWidth="1.7" />
+								</button>
+							</Tooltip>
+						{/if}
+					</div>
+				{:else}
+					<div class="flex self-center z-10 items-end">
+						<ChatMenu
+							{readonly}
+							chatId={id}
+							cloneChatHandler={() => {
+								cloneChatHandler(id);
+							}}
+							shareHandler={() => {
+								showShareChatModal = true;
+							}}
+							{moveChatHandler}
+							archiveChatHandler={() => {
+								archiveChatHandler(id);
+							}}
+							{renameHandler}
+							deleteHandler={() => {
+								showDeleteConfirm = true;
+							}}
+							{markUnreadHandler}
+							onOpen={() => {
+								menuOpen = true;
+								dispatch('select');
+							}}
+							onClose={() => {
+								menuOpen = false;
+								dispatch('unselect');
+							}}
+							onPinChange={async () => {
+								dispatch('change');
+							}}
+						>
+							<button
+								type="button"
+								aria-label={$i18n.t('Chat Menu')}
+								class="flex {($settings?.highContrastMode ?? false)
+									? 'size-6'
+									: 'size-5'} items-center justify-center self-center dark:hover:text-white transition m-0"
+							>
+								<MoreHorizontalIcon className="size-3.5" strokeWidth="2" />
+							</button>
+						</ChatMenu>
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>

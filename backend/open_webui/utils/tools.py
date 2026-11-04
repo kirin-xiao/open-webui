@@ -52,6 +52,7 @@ from open_webui.tools.builtin import (
     create_automation,
     create_calendar_event,
     create_tasks,
+    create_tool,
     delete_automation,
     delete_calendar_event,
     delete_memory,

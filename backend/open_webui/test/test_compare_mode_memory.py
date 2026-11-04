@@ -268,10 +268,14 @@ async def test_resume_payload_restores_compare_context(monkeypatch):
     class _Chat:
         chat = {'models': ['m1'], 'params': {}}
         variables = {}
+        # Ownership check: chat params are only replayed when the assistant message
+        # belongs to the chat's owner.
+        user_id = 'u1'
 
     assistant = {
         'parentId': 'user-1',
         'model': 'm1',
+        'user_id': 'u1',
         'meta': {'compare_mode': True, 'is_primary_branch': False, 'params': {}},
     }
 
