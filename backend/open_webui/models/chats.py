@@ -20,7 +20,13 @@ from open_webui.models.automations import AutomationRun
 from open_webui.models.chat_messages import ChatMessage, ChatMessages, normalize_context_summary
 from open_webui.models.folders import Folders
 from open_webui.models.tags import Tag, TagModel, Tags
-from open_webui.utils.misc import get_output_text, sanitize_data_for_db, sanitize_text_for_db
+from open_webui.utils.misc import (
+    get_output_text,
+    is_internal_steer_node,
+    is_promoted_internal_steer,
+    sanitize_data_for_db,
+    sanitize_text_for_db,
+)
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import (
     JSON,
@@ -549,6 +555,9 @@ class ChatTable:
                     and child.get('id') == child_id
                     and child.get('role')
                     and child.get('parentId') == message_id
+                    # A steer is not a visible branch; never descend the tip walk
+                    # onto one (a promoted steer is reached from its own id).
+                    and not is_internal_steer_node(child)
                 ),
                 None,
             )
@@ -574,6 +583,17 @@ class ChatTable:
         child_ids.append(child_id)
         return True
 
+    @staticmethod
+    def _steer_has_assistant_child(messages: dict, message_id: str) -> bool:
+        """True when a steer was promoted into a real turn.
+
+        The turn-end drain turns a parent steer that no boundary consumed into a
+        normal visible turn and attaches its assistant response as a child. A
+        boundary-delivered or pending steer never gets one; any user child it
+        has is a polluted next-turn link that must be re-anchored away.
+        """
+        return is_promoted_internal_steer(messages.get(message_id), messages)
+
     def _repair_chat_current_id(self, chat: dict) -> bool:
         history = chat.get('history')
         if not isinstance(history, dict):
@@ -583,14 +603,86 @@ class ChatTable:
         if not isinstance(messages, dict):
             return False
 
+        steer_ids = {message_id for message_id, message in messages.items() if is_internal_steer_node(message)}
+
         changed = False
         for message_id, message in messages.items():
-            if not isinstance(message, dict):
+            if not isinstance(message, dict) or message_id in steer_ids:
+                # Steers are model-input appends, never anchor branch children.
                 continue
             changed = self._add_child_id_to_parent(messages, message.get('parentId'), message_id) or changed
 
+        # An older save may already have linked a steer as a child. Remove those
+        # links so branch navigation and the tip walk never see a steer.
+        for message in messages.values():
+            if not isinstance(message, dict):
+                continue
+            children = message.get('childrenIds')
+            if not isinstance(children, list):
+                continue
+            kept = [child_id for child_id in children if not is_internal_steer_node(messages.get(child_id))]
+            if kept != children:
+                message['childrenIds'] = kept
+                changed = True
+
+        # A non-promoted steer's children are messages that were anchored to it
+        # while it was wrongly `currentId`. Move them back to the steer's parent
+        # so the steer cannot stay in their parent chain.
+        for steer_id in steer_ids:
+            if self._steer_has_assistant_child(messages, steer_id):
+                continue
+            steer = messages[steer_id]
+            parent_id = steer.get('parentId')
+            children = steer.get('childrenIds')
+            if not isinstance(children, list) or not children:
+                continue
+            kept = []
+            for child_id in children:
+                child = messages.get(child_id) if isinstance(child_id, str) else None
+                if not isinstance(child, dict) or is_internal_steer_node(child):
+                    kept.append(child_id)
+                    continue
+                if child.get('parentId') == steer_id:
+                    child['parentId'] = parent_id
+                    changed = True
+                if isinstance(parent_id, str) and parent_id in messages:
+                    changed = self._add_child_id_to_parent(messages, parent_id, child_id) or changed
+            if kept != children:
+                steer['childrenIds'] = kept
+                changed = True
+
         current_id = history.get('currentId')
         current_message = messages.get(current_id)
+
+        if is_internal_steer_node(current_message):
+            promoted = self._steer_has_assistant_child(messages, current_id)
+            replacement_id = None
+            if promoted:
+                replacement_id = self._last_descendant_id(messages, current_id)
+            else:
+                ancestor_id = current_message.get('parentId')
+                seen_ids = {current_id}
+                while (
+                    isinstance(ancestor_id, str)
+                    and ancestor_id in messages
+                    and is_internal_steer_node(messages[ancestor_id])
+                    and ancestor_id not in seen_ids
+                ):
+                    seen_ids.add(ancestor_id)
+                    ancestor_id = messages[ancestor_id].get('parentId')
+                if isinstance(ancestor_id, str) and ancestor_id in messages:
+                    replacement_id = self._last_descendant_id(messages, ancestor_id)
+
+            if replacement_id and replacement_id != current_id:
+                history['currentId'] = replacement_id
+                current_id = replacement_id
+                current_message = messages.get(current_id)
+                changed = True
+            elif not promoted:
+                # No non-steer ancestor: fall through to the latest-leaf scan
+                # rather than leaving the steer as the visible tip.
+                current_message = None
+
         output = []
         if isinstance(current_message, dict):
             output = current_message.get('output') or []
@@ -623,6 +715,8 @@ class ChatTable:
         latest_timestamp = -1
         for message_id, message in messages.items():
             if not isinstance(message, dict) or not message.get('role'):
+                continue
+            if is_internal_steer_node(message):
                 continue
 
             children_ids = message.get('childrenIds') if isinstance(message.get('childrenIds'), list) else []
@@ -878,6 +972,7 @@ class ChatTable:
                         ):
                             updated['history']['messages'][mid] = message
                     updated['history'] = self.merge_history(updated['history'], {})
+                self._repair_chat_current_id(updated)
 
                 updated = self._clean_null_bytes(updated)
                 chat_item.chat = updated
@@ -1975,7 +2070,10 @@ class ChatTable:
 
                 model = ChatModel.model_validate(chat_item)
                 model.chat = self._clean_null_bytes(model.chat)
-                self._repair_chat_current_id(model.chat)
+                if self._repair_chat_current_id(model.chat):
+                    # The denormalized column shadows the in-JSON tip on read, so
+                    # a repaired steer tip must move it too.
+                    model.current_message_id = self.get_current_message_id(model.chat)
                 return model
 
         except Exception:
@@ -2014,7 +2112,8 @@ class ChatTable:
 
                 model = ChatModel.model_validate(chat)
                 model.chat = self._clean_null_bytes(model.chat)
-                self._repair_chat_current_id(model.chat)
+                if self._repair_chat_current_id(model.chat):
+                    model.current_message_id = self.get_current_message_id(model.chat)
                 return model
 
         except Exception:

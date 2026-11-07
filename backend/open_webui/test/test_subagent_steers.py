@@ -19,7 +19,7 @@ import pytest
 from fastapi import HTTPException
 
 from open_webui.models.chats import ChatModel, Chats
-from open_webui.routers.chats import get_chat_subagents_by_id
+from open_webui.routers.chats import get_chat_subagents_by_id, steer_chat_by_id, SteerChatForm
 from open_webui.test.subagent_test_utils import (
     FakeChatMessages,
     FakeChats,
@@ -32,7 +32,12 @@ from open_webui.test.subagent_test_utils import (
     user_data,
 )
 from open_webui.utils import subagents
-from open_webui.utils.misc import is_pending_internal_message, resolve_history_tip
+from open_webui.utils.misc import (
+    get_message_list,
+    is_internal_steer_node,
+    is_pending_internal_message,
+    resolve_history_tip,
+)
 
 
 class Harness:
@@ -396,6 +401,159 @@ def test_merge_history_keeps_steers_out_of_branch_children():
     assert again['currentId'] == 'tip'
 
 
+def _repair_history(history):
+    chat = {'history': copy.deepcopy(history)}
+    changed = Chats._repair_chat_current_id(chat)
+    return chat['history'], changed
+
+
+def test_repair_keeps_boundary_steer_off_branch_and_current_id():
+    """A delivered boundary steer is not a branch child and never the tip."""
+    history = _parent_history(_steer_message('steer-1', status='delivered'))
+    history['currentId'] = 'steer-1'
+    repaired, changed = _repair_history(history)
+
+    assert changed is True
+    assert repaired['currentId'] == 'tip'
+    assert 'steer-1' not in repaired['messages']['tip']['childrenIds']
+    assert is_internal_steer_node(repaired['messages']['steer-1']) is True
+    # The visible chain never contains the non-promoted steer.
+    assert [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])] == ['tip']
+
+
+def test_repair_keeps_pending_steer_off_branch_and_current_id():
+    history = _parent_history(_steer_message('steer-1', status='pending'))
+    history['currentId'] = 'steer-1'
+    repaired, _ = _repair_history(history)
+
+    assert repaired['currentId'] == 'tip'
+    assert 'steer-1' not in repaired['messages']['tip']['childrenIds']
+    assert [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])] == ['tip']
+
+
+def test_get_message_list_skips_non_promoted_steer_links():
+    """A stale parent link cannot replay a boundary steer as a user message."""
+    messages = {
+        'tip': {
+            'id': 'tip',
+            'parentId': None,
+            'childrenIds': ['steer-1'],
+            'role': 'assistant',
+            'content': 'answer',
+            'timestamp': 10,
+        },
+        'steer-1': _steer_message('steer-1', status='delivered', parent_id='tip'),
+        'next-user': {
+            'id': 'next-user',
+            'parentId': 'steer-1',
+            'childrenIds': [],
+            'role': 'user',
+            'content': 'next question',
+            'timestamp': 11,
+        },
+    }
+
+    assert [message['id'] for message in get_message_list(messages, 'next-user')] == ['tip', 'next-user']
+
+
+def test_repair_promoted_steer_keeps_its_assistant_turn_reachable():
+    """A promoted steer is a real visible user turn with an assistant child."""
+    history = {
+        'currentId': 'steer-1',
+        'messages': {
+            'tip': {
+                'id': 'tip',
+                'parentId': None,
+                'childrenIds': ['steer-1'],
+                'role': 'assistant',
+                'content': 'answer',
+                'done': True,
+                'timestamp': 10,
+            },
+            'steer-1': _steer_message('steer-1', status='delivered', parent_id='tip')
+            | {'childrenIds': ['assistant-2']},
+            'assistant-2': {
+                'id': 'assistant-2',
+                'parentId': 'steer-1',
+                'childrenIds': [],
+                'role': 'assistant',
+                'content': 'steered answer',
+                'done': True,
+                'timestamp': 11,
+            },
+        },
+    }
+
+    repaired, _ = _repair_history(history)
+
+    # A steer itself is still never a branch child, but its turn stays on the
+    # currentId chain so the assistant response is visible.
+    assert repaired['currentId'] == 'assistant-2'
+    assert 'steer-1' not in repaired['messages']['tip']['childrenIds']
+    chain = [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])]
+    assert chain == ['tip', 'steer-1', 'assistant-2']
+
+
+def test_repair_reanchors_polluted_next_turn_and_moves_current_id_off_steer():
+    """A steer currentId left by an old save self-heals; the next turn survives."""
+    history = {
+        'currentId': 'steer-1',
+        'messages': {
+            'tip': {
+                'id': 'tip',
+                'parentId': None,
+                'childrenIds': ['steer-1'],
+                'role': 'assistant',
+                'content': 'answer',
+                'done': True,
+                'timestamp': 10,
+            },
+            'steer-1': _steer_message('steer-1', status='delivered', parent_id='tip') | {'childrenIds': ['next-user']},
+            'next-user': {
+                'id': 'next-user',
+                'parentId': 'steer-1',
+                'childrenIds': [],
+                'role': 'user',
+                'content': 'next question',
+                'timestamp': 11,
+            },
+        },
+    }
+
+    repaired, changed = _repair_history(history)
+
+    assert changed is True
+    assert repaired['messages']['next-user']['parentId'] == 'tip'
+    assert 'next-user' in repaired['messages']['tip']['childrenIds']
+    assert 'steer-1' not in repaired['messages']['tip']['childrenIds']
+    # The repaired tip is the re-anchored user turn, never the steer.
+    assert repaired['currentId'] == 'next-user'
+    chain = [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])]
+    assert 'steer-1' not in chain
+    assert chain == ['tip', 'next-user']
+
+
+def test_repair_leaves_healthy_history_and_internal_result_nodes_alone():
+    timer = {
+        'id': 'timer-1',
+        'parentId': 'tip',
+        'childrenIds': [],
+        'role': 'user',
+        'content': 'timer fired',
+        'meta': {'internal': True, 'type': 'timer'},
+        'timestamp': 11,
+    }
+    legacy = _pending_result('legacy-result')
+    history = _parent_history(timer, legacy)
+    history['currentId'] = 'legacy-result'
+
+    repaired, changed = _repair_history(history)
+
+    assert changed is False
+    assert repaired['currentId'] == 'legacy-result'
+    assert set(repaired['messages']['tip']['childrenIds']) == {'timer-1', 'legacy-result'}
+
+
 @pytest.mark.asyncio
 async def test_steer_enqueue_drain_deliver_supersede_roundtrip(monkeypatch):
     harness = Harness(monkeypatch)
@@ -471,6 +629,45 @@ async def test_enqueue_steer_marks_active_child_steer_queued(monkeypatch):
     )
 
     assert child.meta['state'] == 'steer_queued'
+
+
+@pytest.mark.asyncio
+async def test_steer_endpoint_delivers_into_an_internal_subagent_chat(monkeypatch):
+    """The endpoint's child target reaches the child drain and state machine."""
+    import open_webui.routers.chats as chats_router
+
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+    child = harness.seed_child(state='running')
+
+    async def has_active_child(redis, chat_id):
+        return chat_id == child.id
+
+    monkeypatch.setattr(chats_router, 'Chats', harness.fake_chats)
+    monkeypatch.setattr(chats_router, 'enqueue_steer', subagents.enqueue_steer)
+    monkeypatch.setattr(chats_router, 'has_active_tasks', has_active_child)
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None)))
+    response = await steer_chat_by_id(
+        request,
+        child.id,
+        SteerChatForm(content='inspect the child output'),
+        user=SimpleNamespace(id='user-1', role='user'),
+        db=None,
+    )
+
+    assert response.queued is True
+    assert response.id
+    steer = child.chat['history']['messages'][response.id]
+    assert steer['meta']['type'] == 'steer'
+    assert steer['meta']['source'] == 'user'
+    assert steer['meta']['childID'] == child.id
+    assert child.meta['state'] == 'steer_queued'
+
+    drained = await subagents.drain_pending_steers(child.id, 'user-1', child_id=child.id)
+    assert [message['id'] for message in drained] == [response.id]
+    # The instruction lives in the child chat, not in the parent transcript.
+    assert response.id not in harness.fake_chats.chats['chat-1'].chat['history']['messages']
 
 
 def test_steer_never_anchors_history_tip_in_any_status():

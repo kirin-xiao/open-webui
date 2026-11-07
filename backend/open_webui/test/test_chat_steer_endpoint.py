@@ -18,11 +18,12 @@ from open_webui.routers.chats import SteerChatForm, steer_chat_by_id
 
 
 class FakeChats:
-    def __init__(self, messages: dict | None = None):
+    def __init__(self, messages: dict | None = None, meta: dict | None = None):
         self.chat = SimpleNamespace(
             id='chat-1',
             user_id='user-1',
             chat={'history': {'currentId': 'tip', 'messages': messages or {}}},
+            meta=meta or {},
         )
 
     async def get_chat_by_id_and_user_id(self, id, user_id, db=None):
@@ -90,6 +91,51 @@ async def test_steer_endpoint_queues_user_steer_without_starting_a_turn(monkeypa
             'user-1',
             'inspect the failing test',
             {'source': 'user', 'model_id': 'model-1', 'message_id': None},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_steer_endpoint_targets_an_internal_subagent_child_chat(monkeypatch):
+    """A steer on a child chat must be selectable by that child's drain."""
+    import open_webui.routers.chats as chats_router
+
+    calls: list[tuple] = []
+
+    async def fake_has_active_tasks(redis, chat_id):
+        return chat_id == 'chat-1'
+
+    async def fake_enqueue_steer(chat_id, user_id, content, **kwargs):
+        calls.append((chat_id, user_id, content, kwargs))
+        return 'steer-child'
+
+    async def fake_mark_superseded(*args, **kwargs):
+        raise AssertionError('a live child must not supersede its fresh steer')
+
+    child_meta = {'internal': True, 'type': 'subagent', 'parent_chat_id': 'parent-1', 'state': 'running'}
+    monkeypatch.setattr(chats_router, 'Chats', FakeChats(meta=child_meta))
+    monkeypatch.setattr(chats_router, 'has_active_tasks', fake_has_active_tasks)
+    monkeypatch.setattr(chats_router, 'enqueue_steer', fake_enqueue_steer)
+    monkeypatch.setattr(chats_router, 'mark_steer_superseded', fake_mark_superseded)
+
+    response = await steer_chat_by_id(
+        make_request(),
+        'chat-1',
+        SteerChatForm(content='focus on the child', model_id='model-1'),
+        user=make_user(),
+        db=None,
+    )
+
+    assert response.queued is True
+    assert response.id == 'steer-child'
+    # child_id marks the record for the child's own boundary drain; source stays
+    # 'user' and nothing starts a second turn.
+    assert calls == [
+        (
+            'chat-1',
+            'user-1',
+            'focus on the child',
+            {'source': 'user', 'child_id': 'chat-1', 'model_id': 'model-1', 'message_id': None},
         )
     ]
 

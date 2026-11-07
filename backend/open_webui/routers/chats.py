@@ -1439,14 +1439,21 @@ async def steer_chat_by_id(
             if existing_meta.get('status') == 'superseded':
                 return SteerChatResponse(queued=False, reason='no_active_task')
 
-    steer_id = await enqueue_steer(
-        id,
-        user.id,
-        content,
-        source='user',
-        model_id=form_data.model_id,
-        message_id=form_data.steer_id,
-    )
+    chat_meta = chat.meta or {}
+    is_subagent_child = chat_meta.get('internal') is True and chat_meta.get('type') == 'subagent'
+
+    enqueue_kwargs = {
+        'source': 'user',
+        'model_id': form_data.model_id,
+        'message_id': form_data.steer_id,
+    }
+    if is_subagent_child:
+        # A user steer submitted directly on an internal subagent child chat is
+        # an instruction *for that child*. Marking the child target lets the
+        # child's boundary drain select it and moves it to `steer_queued`
+        # instead of stranding it in a parent-targeted store it never reads.
+        enqueue_kwargs['child_id'] = id
+    steer_id = await enqueue_steer(id, user.id, content, **enqueue_kwargs)
     if not steer_id:
         return SteerChatResponse(queued=False, reason='not_queued')
 

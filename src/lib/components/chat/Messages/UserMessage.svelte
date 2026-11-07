@@ -29,6 +29,8 @@
 	import Image from '$lib/components/common/Image.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import SubagentResultRow from './SubagentResultRow.svelte';
+	import SteerBlock from './SteerBlock.svelte';
+	import { steerEntryFromMessage } from './steers';
 
 	const i18n = getContext<typeof import('$lib/i18n').default>('i18n');
 	const contextCompactions =
@@ -81,6 +83,8 @@
 	$: isOwn = Boolean($_user?.id && authorId === $_user.id);
 	$: authorName = author?.name || $i18n.t('Unknown User');
 	let timerExpanded = false;
+	$: isInternalSteer = message?.meta?.internal === true && message?.meta?.type === 'steer';
+	$: steerEntry = isInternalSteer ? steerEntryFromMessage(message, message.id) : null;
 	$: if (history.messages) {
 		const source = history.messages[messageId];
 		if (source) {
@@ -166,7 +170,7 @@
 	id="message-{message.id}"
 	style="scroll-margin-top: 3rem;"
 >
-	{#if !compactPreview && (!($settings?.chatBubble ?? true) || !isOwn) && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer')}
+	{#if !compactPreview && (!($settings?.chatBubble ?? true) || !isOwn) && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer') && !isInternalSteer}
 		<div
 			class="shrink-0 me-2 {($settings?.chatBubble ?? true) ? 'mt-6' : 'hidden @lg:flex mt-0.5'}"
 		>
@@ -186,11 +190,12 @@
 	<div
 		class="flex-auto w-0 max-w-full {(message?.meta?.internal === true &&
 			message?.meta?.type === 'subagent') ||
-		(message?.meta?.internal === true && message?.meta?.type === 'timer')
+		(message?.meta?.internal === true && message?.meta?.type === 'timer') ||
+		isInternalSteer
 			? ''
 			: 'pl-1'}"
 	>
-		{#if !compactPreview && (!($settings?.chatBubble ?? true) || !isOwn) && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer')}
+		{#if !compactPreview && (!($settings?.chatBubble ?? true) || !isOwn) && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer') && !isInternalSteer}
 			<div
 				class={($settings?.chatBubble ?? true)
 					? 'mb-1 ps-2 text-xs text-gray-400 dark:text-gray-500'
@@ -425,6 +430,10 @@
 				</div>
 			{:else if message?.meta?.internal === true && message?.meta?.type === 'subagent'}
 				<SubagentResultRow content={message.content} result={message.meta} linkable={!readOnly} />
+			{:else if isInternalSteer}
+				{#if steerEntry}
+					<SteerBlock steers={[steerEntry]} {compactPreview} />
+				{/if}
 			{:else if message.content !== ''}
 				<div class="w-full">
 					<div
@@ -483,7 +492,7 @@
 				</div>
 			{/if}
 
-			{#if edit !== true && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer')}
+			{#if edit !== true && !(message?.meta?.internal === true && message?.meta?.type === 'subagent') && !(message?.meta?.internal === true && message?.meta?.type === 'timer') && !isInternalSteer}
 				<div
 					class="flex items-center {($settings?.chatBubble ?? true)
 						? isOwn

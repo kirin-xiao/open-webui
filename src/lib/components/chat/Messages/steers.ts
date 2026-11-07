@@ -26,6 +26,7 @@ type HistoryMessage = {
 	id?: unknown;
 	role?: unknown;
 	content?: unknown;
+	parentId?: unknown;
 	childrenIds?: unknown;
 	timestamp?: unknown;
 	meta?: Record<string, unknown> | null;
@@ -116,6 +117,10 @@ function isSteerMeta(meta: unknown): meta is Record<string, unknown> {
 	);
 }
 
+function isInternalSteerNode(message: HistoryMessage | null | undefined): boolean {
+	return !!message && message.role === 'user' && isSteerMeta(message.meta);
+}
+
 /** True for a persisted steer history node. */
 export function isSteerMessage(message: HistoryMessage | null | undefined): boolean {
 	if (!message || message.role !== 'user' || !isSteerMeta(message.meta)) return false;
@@ -141,13 +146,131 @@ export function pruneSteerBranches(messages: HistoryMessages): boolean {
 		const children = message.childrenIds as unknown[];
 		const kept = children.filter((childId) => {
 			if (typeof childId !== 'string') return true;
-			const child = messages[childId];
-			return !(child && child.role === 'user' && isSteerMeta(child.meta));
+			return !isInternalSteerNode(messages[childId]);
 		});
 		if (kept.length !== children.length) {
 			message.childrenIds = kept;
 			changed = true;
 		}
+	}
+	return changed;
+}
+
+/**
+ * True when a steer was promoted into a real turn.
+ *
+ * The turn-end drain attaches an assistant response to a promoted steer. A
+ * boundary-delivered or pending steer has no assistant child; a user child on
+ * it is a polluted next-turn link that must be re-anchored away.
+ */
+function isPromotedSteer(messages: HistoryMessages, messageId: string): boolean {
+	const message = messages?.[messageId];
+	if (!isInternalSteerNode(message)) return false;
+	const children = Array.isArray(message?.childrenIds) ? message.childrenIds : [];
+	return children.some((childId) => {
+		if (typeof childId !== 'string') return false;
+		return messages?.[childId]?.role === 'assistant';
+	});
+}
+
+function nonSteerAncestorId(messages: HistoryMessages, messageId: string): string | null {
+	const seen = new Set<string>([messageId]);
+	let parentId = messages?.[messageId]?.parentId;
+	while (typeof parentId === 'string' && messages?.[parentId] && !seen.has(parentId)) {
+		if (!isInternalSteerNode(messages[parentId])) return parentId;
+		seen.add(parentId);
+		parentId = messages[parentId]?.parentId;
+	}
+	return null;
+}
+
+/** Last descendant of `messageId`, never descending into a steer branch. */
+function deepestNonSteerChildId(messages: HistoryMessages, messageId: string): string {
+	let currentId = messageId;
+	const seen = new Set<string>();
+	while (messages?.[currentId] && !seen.has(currentId)) {
+		seen.add(currentId);
+		const children = Array.isArray(messages[currentId]?.childrenIds)
+			? (messages[currentId].childrenIds as unknown[])
+			: [];
+		let nextId: string | null = null;
+		for (let index = children.length - 1; index >= 0; index -= 1) {
+			const childId = children[index];
+			if (typeof childId !== 'string') continue;
+			const child = messages[childId];
+			if (child && !isInternalSteerNode(child)) {
+				nextId = childId;
+				break;
+			}
+		}
+		if (!nextId) break;
+		currentId = nextId;
+	}
+	return currentId;
+}
+
+/**
+ * Repair `history.currentId` after stale backend saves linked a steer.
+ *
+ * A non-promoted steer that had become `currentId` is replaced by its nearest
+ * non-steer ancestor's tip; a promoted steer moves to its assistant descendant.
+ * Non-promoted steer children (a polluted next user turn) are re-anchored to
+ * the steer's parent so the steer cannot remain in their parent chain. Normal
+ * histories are untouched.
+ */
+export function repairSteerCurrentId(
+	history: { currentId?: unknown; messages?: HistoryMessages } | null | undefined
+): boolean {
+	if (!history) return false;
+	let changed = pruneSteerBranches(history.messages);
+	const messages = history.messages;
+	if (!messages) return changed;
+
+	// Re-anchor children of a steer that was never promoted before repairing the
+	// tip, so the tip walk cannot pass through it.
+	for (const [steerId, steer] of Object.entries(messages)) {
+		if (!isInternalSteerNode(steer) || isPromotedSteer(messages, steerId)) continue;
+		const children = Array.isArray(steer?.childrenIds) ? [...steer.childrenIds] : [];
+		if (children.length === 0) continue;
+		const parentId = typeof steer?.parentId === 'string' ? steer.parentId : null;
+		const kept: unknown[] = [];
+		for (const childId of children) {
+			if (typeof childId !== 'string') {
+				kept.push(childId);
+				continue;
+			}
+			const child = messages[childId];
+			if (!child || isInternalSteerNode(child)) {
+				kept.push(childId);
+				continue;
+			}
+			child.parentId = parentId;
+			const parent = parentId ? messages[parentId] : null;
+			if (parent && Array.isArray(parent.childrenIds) && !parent.childrenIds.includes(childId)) {
+				parent.childrenIds = [...parent.childrenIds, childId];
+			}
+			changed = true;
+		}
+		if (kept.length !== children.length) {
+			steer.childrenIds = kept;
+			changed = true;
+		}
+	}
+
+	const currentId = typeof history.currentId === 'string' ? history.currentId : null;
+	const current = currentId ? messages[currentId] : null;
+	if (!currentId || !isInternalSteerNode(current)) return changed;
+
+	const replacementId = isPromotedSteer(messages, currentId)
+		? deepestNonSteerChildId(messages, currentId)
+		: (() => {
+				const ancestorId = nonSteerAncestorId(messages, currentId);
+				return ancestorId ? deepestNonSteerChildId(messages, ancestorId) : null;
+			})();
+
+	if (replacementId && replacementId !== currentId && messages[replacementId]) {
+		history.currentId = replacementId;
+		changed = true;
 	}
 	return changed;
 }
@@ -173,6 +296,16 @@ function toSteerEntry(message: HistoryMessage, fallbackId: string): SteerEntry |
 		...(typeof meta.childID === 'string' && meta.childID ? { childID: meta.childID } : {}),
 		...(typeof message.timestamp === 'number' ? { timestamp: message.timestamp } : {})
 	};
+}
+
+/** Normalize one persisted steer node for the compact transcript block. */
+export function steerEntryFromMessage(
+	message: HistoryMessage | null | undefined,
+	fallbackId = ''
+): SteerEntry | null {
+	if (!message) return null;
+	const id = typeof message.id === 'string' && message.id ? message.id : fallbackId;
+	return toSteerEntry(message, id);
 }
 
 /**

@@ -97,7 +97,7 @@
 		collectUnannotatedDeliveredSteers,
 		mergeSubagentCompletionStates,
 		planBusySubmit,
-		pruneSteerBranches
+		repairSteerCurrentId
 	} from './Messages/steers';
 
 	import {
@@ -1505,8 +1505,8 @@
 			autoScrollToBottom();
 		}
 		// A reload carries the backend-rebuilt `childrenIds`, which include steer
-		// nodes anchored at the tip. Never let one become a visible branch.
-		pruneSteerBranches(history.messages);
+		// nodes anchored at the tip. Never let one become a visible branch or tip.
+		repairSteerCurrentId(history);
 		history = history;
 	};
 
@@ -3208,8 +3208,9 @@
 				// Sanitize history: repair orphaned references and structurally-malformed
 				// nodes from failed regenerations (#24424, #24157, #20474)
 				sanitizeHistory(history);
-				// Steers are model-input only; drop their backend-built branch links.
-				pruneSteerBranches(history.messages);
+				// Steers are model-input only; drop their backend-built branch links
+				// and repair a polluted currentId left by an older save.
+				repairSteerCurrentId(history);
 
 				chatTitle.set(chatContent.title);
 

@@ -209,6 +209,13 @@ def get_message_list(messages_map, message_id):
     # Track the map keys, not the messages' own 'id' field: a message may omit it
     while current_message and message_id not in visited_message_ids:
         visited_message_ids.add(message_id)
+        if is_internal_steer_node(current_message) and not is_promoted_internal_steer(current_message, messages_map):
+            # A boundary-injected or pending steer is model input only. A stale
+            # parent link must not replay it as a normal user turn; skip it and
+            # keep walking to its anchor (the promoted case is a real turn).
+            message_id = current_message.get('parentId')
+            current_message = messages_map.get(message_id) if message_id else None
+            continue
         message_list.append(current_message)
 
         message_id = current_message.get('parentId')
@@ -216,6 +223,37 @@ def get_message_list(messages_map, message_id):
 
     message_list.reverse()
     return message_list
+
+
+def is_internal_steer_node(message) -> bool:
+    """True for a durable internal steer history node, whatever its status.
+
+    A steer is model-input only until the turn-end drain promotes a parent
+    steer into a real user turn. It keeps its ``parentId`` anchor for the drain,
+    but must never be linked as an anchor's branch child or become ``currentId``.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    meta = message.get('meta')
+    return isinstance(meta, dict) and meta.get('internal') is True and meta.get('type') == 'steer'
+
+
+def is_promoted_internal_steer(message, messages_map) -> bool:
+    """True when an internal steer was promoted into a real visible turn.
+
+    The turn-end drain attaches an assistant response to a promoted steer. A
+    boundary-delivered or pending steer has no such child; any user child it has
+    is a polluted next-turn link.
+    """
+    if not is_internal_steer_node(message):
+        return False
+    child_ids = message.get('childrenIds')
+    if not isinstance(child_ids, list):
+        return False
+    return any(
+        isinstance(messages_map.get(child_id), dict) and messages_map[child_id].get('role') == 'assistant'
+        for child_id in child_ids
+    )
 
 
 def is_pending_internal_message(message) -> bool:

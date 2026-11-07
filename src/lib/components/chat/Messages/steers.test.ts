@@ -8,7 +8,9 @@ import {
 	mergeSubagentCompletionStates,
 	planBusySubmit,
 	pruneSteerBranches,
+	repairSteerCurrentId,
 	steerEntriesFromAnnotation,
+	steerEntryFromMessage,
 	subagentStatesToCompleted
 } from './steers';
 
@@ -160,6 +162,89 @@ describe('steer branch pruning', () => {
 
 		expect(pruneSteerBranches(messages)).toBe(false);
 		expect(messages.u1.childrenIds).toEqual(['a1']);
+	});
+});
+
+describe('steer currentId repair', () => {
+	it('moves a boundary steer currentId back to the nearest ancestor', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1'] },
+			s1: steerNode('s1', 'delivered steer', { status: 'delivered' }, { parentId: 'tip' })
+		};
+		const history = { currentId: 's1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(true);
+		expect(history.currentId).toBe('tip');
+		expect(messages.tip.childrenIds).toEqual([]);
+		// The node is still available for chip/annotation fallback rendering.
+		expect(messages.s1.content).toBe('delivered steer');
+	});
+
+	it('moves a promoted steer currentId to its assistant descendant', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1'] },
+			s1: steerNode(
+				's1',
+				'promoted steer',
+				{ status: 'delivered' },
+				{ parentId: 'tip', childrenIds: ['a1'] }
+			),
+			a1: { id: 'a1', role: 'assistant', content: 'answer', parentId: 's1', childrenIds: [] }
+		};
+		const history = { currentId: 's1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(true);
+		expect(history.currentId).toBe('a1');
+		expect(messages.s1.childrenIds).toEqual(['a1']);
+	});
+
+	it('re-anchors a polluted next turn and never keeps the steer as currentId', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1'] },
+			s1: steerNode(
+				's1',
+				'delivered steer',
+				{ status: 'delivered' },
+				{ parentId: 'tip', childrenIds: ['u2'] }
+			),
+			u2: { id: 'u2', role: 'user', content: 'next', parentId: 's1', childrenIds: [] }
+		};
+		const history = { currentId: 's1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(true);
+		expect(messages.u2.parentId).toBe('tip');
+		expect(messages.tip.childrenIds).toEqual(['u2']);
+		expect(messages.s1.childrenIds).toEqual([]);
+		expect(history.currentId).toBe('u2');
+	});
+
+	it('leaves healthy histories untouched', () => {
+		const messages = {
+			u1: { id: 'u1', role: 'user', content: 'hi', childrenIds: ['a1'] },
+			a1: { id: 'a1', role: 'assistant', content: 'hello', parentId: 'u1', childrenIds: [] }
+		};
+		const history = { currentId: 'a1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(false);
+		expect(history.currentId).toBe('a1');
+	});
+});
+
+describe('steer transcript rendering guard', () => {
+	it('normalizes a steer node into the compact block entry', () => {
+		const entry = steerEntryFromMessage(
+			steerNode('s1', 'look closer', { status: 'delivered' }),
+			's1'
+		);
+
+		expect(entry).toEqual(
+			expect.objectContaining({ id: 's1', content: 'look closer', status: 'delivered' })
+		);
+	});
+
+	it('does not treat a normal user message or an empty steer as a steer block', () => {
+		expect(steerEntryFromMessage({ id: 'u1', role: 'user', content: 'hi' }, 'u1')).toBeNull();
+		expect(steerEntryFromMessage(steerNode('s2', '   '), 's2')).toBeNull();
 	});
 });
 

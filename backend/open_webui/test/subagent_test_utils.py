@@ -68,6 +68,10 @@ class FakeChats:
     async def get_chat_by_id(self, id, db=None):
         return self.chats.get(id)
 
+    async def get_chat_by_id_and_user_id(self, id, user_id, db=None):
+        chat = self.chats.get(id)
+        return chat if chat and chat.user_id == user_id else None
+
     async def update_chat_meta_by_id(self, id, meta, db=None):
         chat = self.chats.get(id)
         if chat is None or not meta:
