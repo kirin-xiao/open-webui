@@ -162,6 +162,7 @@ from open_webui.utils.skills import (
     replace_skill_mentions_with_labels,
     strip_skill_mentions,
 )
+from open_webui.utils.subagents import drain_pending_steers, mark_steer_delivered
 from open_webui.utils.system_baseline import (
     append_current_date_line,
     apply_system_baseline,
@@ -3412,6 +3413,311 @@ async def build_chat_response_context(request, form_data, user, model, metadata,
     }
 
 
+# ---------------------------------------------------------------------------
+# Boundary-safe steering
+#
+# A steer is a durable pending history node (see utils/subagents.py). It never
+# enters the visible history mid-turn: at each model-request boundary the
+# pending records are read, merged into one synthetic block, and appended to
+# the *request* message list only. They are marked delivered only once the
+# provider request has started, so a failed request falls back to the pending
+# state instead of losing the steer.
+# ---------------------------------------------------------------------------
+
+STEER_BLOCK_OPEN = '<steering>'
+STEER_BLOCK_CLOSE = '</steering>'
+STEER_BLOCK_PREAMBLE = (
+    'The user sent the following message(s) while you were working. '
+    'Treat them as additional instructions for your next response.'
+)
+
+
+def _steer_user_id(user) -> str | None:
+    if isinstance(user, dict):
+        return user.get('id')
+    return getattr(user, 'id', None)
+
+
+def _steer_text(value) -> str:
+    """Coerce a steer field to text without letting malformed history fail a turn."""
+    if isinstance(value, str):
+        return value
+    return '' if value is None else str(value)
+
+
+def _steer_annotations(steers: list[dict] | None) -> list[dict]:
+    """Project steer records to the annotation shape persisted on the reply."""
+    annotations: list[dict] = []
+    for steer in steers or []:
+        if not isinstance(steer, dict) or not steer.get('id'):
+            continue
+        meta = steer.get('meta') if isinstance(steer.get('meta'), dict) else {}
+        annotations.append(
+            {
+                'id': steer['id'],
+                'source': _steer_text(meta.get('source')) or 'user',
+                'content': _steer_text(steer.get('content')),
+            }
+        )
+    return annotations
+
+
+def _merge_steer_annotations(existing, consumed) -> list[dict]:
+    """Merge annotation lists by steer id, preserving first-seen order."""
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for annotation in [*(existing or []), *(consumed or [])]:
+        if not isinstance(annotation, dict):
+            continue
+        annotation_id = annotation.get('id')
+        if not annotation_id or annotation_id in seen:
+            continue
+        seen.add(annotation_id)
+        merged.append(
+            {
+                'id': annotation_id,
+                'source': _steer_text(annotation.get('source')) or 'user',
+                'content': _steer_text(annotation.get('content')),
+            }
+        )
+    return merged
+
+
+def _initial_steer_annotations(message: dict | None) -> list[dict]:
+    """Annotations already persisted by an earlier pause of this same turn.
+
+    Seeding the consumed list with them means a second approval pause writes
+    the union, not only the steers consumed in the latest handler. The final
+    merge is id-based, so seeding does not duplicate them.
+    """
+    meta = (message or {}).get('meta')
+    existing = meta.get('steers') if isinstance(meta, dict) else None
+    return _merge_steer_annotations(existing, [])
+
+
+def _build_steer_block(steers: list[dict] | None) -> str:
+    """One clearly marked synthetic block for every steer in this round."""
+    entries = [annotation for annotation in _steer_annotations(steers) if annotation['content'].strip()]
+    if not entries:
+        return ''
+    lines = [STEER_BLOCK_OPEN, STEER_BLOCK_PREAMBLE]
+    lines.extend(f'[{entry["source"]}] {entry["content"].strip()}' for entry in entries)
+    lines.append(STEER_BLOCK_CLOSE)
+    return '\n'.join(lines)
+
+
+def _append_steer_block(form_data: dict, steers: list[dict] | None) -> dict:
+    """Return a new form_data with the merged steer block appended.
+
+    The input list is never mutated: callers pass the frozen `form_data` on
+    every round, so an in-place append would accumulate steers across rounds.
+    """
+    block = _build_steer_block(steers)
+    if not block:
+        return form_data
+    messages = [*(form_data.get('messages') or []), {'role': 'user', 'content': block}]
+    return {**form_data, 'messages': messages}
+
+
+async def _steer_store_target(metadata: dict, chat_id: str) -> tuple[str, str | None]:
+    """Return `(chat holding the steer records, target child selector)`.
+
+    Both target kinds live in the *current* chat's history:
+    - parent user steers (`childID` absent) and subagent completion notices
+      (`source == 'subagent'`, `childID` names the source child) are written to
+      the parent chat;
+    - parent -> child instructions are written to the child chat itself with
+      `childID == child chat id` (Slice B calls
+      `enqueue_steer(child_chat_id, ..., source='parent', child_id=child_chat_id)`).
+
+    A subagent child turn therefore reads its own history and passes
+    `child_id=chat_id`, which selects only its parent's instructions. Every
+    other turn reads its own history with `child_id=None`, which selects parent
+    user steers and completion notices. Neither selector can see the other
+    kind, so no steer leaks across the parent/child boundary.
+
+    Only internal runs can be child turns, so normal turns avoid the extra
+    chat read.
+    """
+    if metadata.get('internal') is not True:
+        return chat_id, None
+    try:
+        chat = await Chats.get_chat_by_id(chat_id)
+    except Exception:
+        log.exception('Failed to resolve the steer store for chat %s', chat_id)
+        return chat_id, None
+    meta = (chat.meta or {}) if chat else {}
+    if meta.get('internal') is True and meta.get('type') == 'subagent':
+        return chat_id, chat_id
+    return chat_id, None
+
+
+async def _drain_boundary_steers(
+    metadata: dict,
+    user,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Read the pending steers that belong at the current request boundary.
+
+    A parent turn consumes parent-targeted steers (`child_id=None`) from its
+    own history. An internal child turn consumes its own parent->child
+    instructions (`meta.childID == its own chat id`) from its own history.
+    Exactly one selector is used per boundary, so a steer can never be injected
+    twice by overlapping selectors or leak to the other side of the link.
+
+    Compare mode is owned by the primary branch, matching the existing ledger
+    ownership rule. Without that gate every branch would inject the same
+    pending set into its own request.
+
+    `exclude_ids` contains steers already appended earlier in this same turn.
+    It matters when the delivery write failed after the provider had already
+    received the block: the record is still pending, but re-injecting it into a
+    later tool round would duplicate it in the model input.
+
+    Returns the drained records and the chat whose history holds them, so the
+    delivery status is written to the same store that produced them.
+    """
+    metadata = metadata or {}
+    chat_id = metadata.get('chat_id') or ''
+    if not is_saved_chat_id(chat_id):
+        return [], None
+    if metadata.get('compare_mode') and not metadata.get('is_primary_branch'):
+        return [], None
+    user_id = _steer_user_id(user)
+    if not user_id:
+        return [], None
+
+    store_chat_id, child_id = await _steer_store_target(metadata, chat_id)
+    try:
+        pending = await drain_pending_steers(store_chat_id, user_id, child_id=child_id)
+    except Exception:
+        # Steering is an enhancement: a read hiccup must never break the turn.
+        log.exception('Failed to read pending steers for chat %s', store_chat_id)
+        return [], None
+
+    excluded = exclude_ids or set()
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for steer in pending:
+        if not isinstance(steer, dict):
+            continue
+        steer_id = steer.get('id')
+        if not steer_id or steer_id in seen or steer_id in excluded:
+            continue
+        if not _steer_text(steer.get('content')).strip():
+            continue
+        seen.add(steer_id)
+        merged.append(steer)
+    return merged, store_chat_id
+
+
+async def _inject_pending_steers(
+    form_data: dict,
+    metadata: dict,
+    user,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> tuple[dict, list[dict], str | None]:
+    """Drain boundary steers and append one merged block to the request copy."""
+    steers, store_chat_id = await _drain_boundary_steers(metadata, user, exclude_ids=exclude_ids)
+    if not steers:
+        return form_data, [], store_chat_id
+    return _append_steer_block(form_data, steers), steers, store_chat_id
+
+
+def _response_started(response) -> bool:
+    """True when the provider accepted the request and a response is coming."""
+    # StreamingResponse carries the upstream status code, so this also rejects
+    # a provider that streams an error status back to us.
+    return getattr(response, 'status_code', 200) < 400
+
+
+def _boundary_steering_enabled(last_response_id) -> bool:
+    """False when the request replays through a stateful Responses id.
+
+    That path sends only the system message plus new output items and cannot
+    accept a synthetic user block without breaking response continuity. The
+    steer stays pending for the turn-end drain.
+    """
+    return not (ENABLE_RESPONSES_API_STATEFUL and last_response_id)
+
+
+async def _mark_boundary_steers_delivered(
+    metadata: dict,
+    user,
+    steers: list[dict],
+    response,
+    *,
+    delivery_chat_id: str | None = None,
+) -> list[dict]:
+    """Mark consumed steers delivered and return their annotations.
+
+    Called only after the provider request has started. Any exception here is
+    logged and swallowed so a status-write failure cannot fail a turn whose
+    model request already succeeded.
+    """
+    if not steers or not _response_started(response):
+        return []
+    metadata = metadata or {}
+    chat_id = delivery_chat_id or metadata.get('chat_id') or ''
+    user_id = _steer_user_id(user)
+    steer_ids = [steer.get('id') for steer in steers if isinstance(steer, dict) and steer.get('id')]
+    if not chat_id or not user_id or not steer_ids:
+        return []
+    try:
+        delivered = await mark_steer_delivered(chat_id, user_id, steer_ids)
+    except Exception:
+        log.exception('Failed to mark boundary steers delivered for chat %s', chat_id)
+        return []
+    delivered_ids = set(delivered or [])
+    return _steer_annotations([steer for steer in steers if steer.get('id') in delivered_ids])
+
+
+async def _send_with_boundary_steers(
+    send,
+    metadata: dict,
+    user,
+    steers: list[dict],
+    *,
+    delivery_chat_id: str | None = None,
+) -> tuple[object, list[dict]]:
+    """Run one provider request and reconcile its steers.
+
+    `send` is a zero-argument awaitable. A raised provider error propagates
+    before any status write, leaving the steers pending for the turn-end drain.
+    """
+    response = await send()
+    annotations = await _mark_boundary_steers_delivered(
+        metadata,
+        user,
+        steers,
+        response,
+        delivery_chat_id=delivery_chat_id,
+    )
+    return response, annotations
+
+
+# TODO(cross-slice): after Slice B merges, completion notices are
+# `type='steer'` nodes with `source='subagent'`, and its `drain_pending_steers`
+# includes them for a parent turn, so this boundary drain sees them.
+# `process_pending_internal_messages()` still does not drain parent user steers
+# (`source='user'`/`'parent'`, no `childID`) or queued parent->child
+# instructions (stored in the child chat). A user steer left pending after the
+# final response needs the Slice C turn-end behavior; a child instruction left
+# pending waits for the child's next turn (or a child turn-end sweep).
+
+
+def _build_final_message_meta(existing_meta: dict | None, consumed: list[dict] | None, *, ended_at: float) -> dict:
+    """Final assistant-message meta, carrying `steers` when any were consumed."""
+    meta = dict(existing_meta or {})
+    meta['response_ended_at'] = ended_at
+    annotations = _merge_steer_annotations(meta.get('steers'), consumed)
+    if annotations:
+        meta['steers'] = annotations
+    return meta
+
+
 def apply_subagent_alias(tool_call: dict, tools: dict) -> bool:
     """Rewrite a replayed legacy subagent call to the canonical tool, in place.
 
@@ -3699,7 +4005,15 @@ async def resume_tool_calls(request, form_data, user, model, metadata, message) 
             return True
 
 
-async def pause_for_tool_approval(chat_id: str, message_id: str, output: list[dict], form_data: dict, metadata: dict):
+async def pause_for_tool_approval(
+    chat_id: str,
+    message_id: str,
+    output: list[dict],
+    form_data: dict,
+    metadata: dict,
+    *,
+    extra_meta: dict | None = None,
+):
     result_call_ids = {
         item.get('call_id') for item in output if item.get('type') == 'function_call_output' and item.get('call_id')
     }
@@ -3728,6 +4042,9 @@ async def pause_for_tool_approval(chat_id: str, message_id: str, output: list[di
             'output': output,
             'meta': {
                 **(metadata.get('tool_approval') or {}),
+                # Preserve steers consumed earlier in this turn; the resumed
+                # request reads them back from the assistant message meta.
+                **(extra_meta or {}),
                 'session_id': metadata.get('session_id'),
                 'tool_ids': metadata.get('tool_ids') or [],
                 'skill_ids': metadata.get('skill_ids') or [],
@@ -4873,6 +5190,15 @@ async def streaming_chat_response_handler(response, ctx):
                 message.get('content', '') if message else last_assistant_message if last_assistant_message else ''
             )
             content_parts = [initial_content] if initial_content else []
+
+            # Steers consumed by this turn (annotated on the assistant message at
+            # finalization). Seed with annotations persisted by an earlier pause
+            # so a second pause preserves them too.
+            consumed_steer_annotations: list[dict] = _initial_steer_annotations(message)
+            # Records already appended to a request in this turn. Normally the
+            # delivery write removes them from the pending set; this also keeps a
+            # write failure from re-injecting the same text in a later round.
+            injected_steer_ids: set[str] = set()
 
             # Initialize output: use existing from message if continuing, else create new
             existing_output = message.get('output') if message else None
@@ -6095,6 +6421,9 @@ async def streaming_chat_response_handler(response, ctx):
                                 full_output(),
                                 form_data,
                                 metadata,
+                                extra_meta=(
+                                    {'steers': list(consumed_steer_annotations)} if consumed_steer_annotations else None
+                                ),
                             )
                         await event_emitter({'type': 'chat:completion', 'data': {'output': full_output()}})
                         return
@@ -6117,6 +6446,9 @@ async def streaming_chat_response_handler(response, ctx):
                             full_output(),
                             form_data,
                             metadata,
+                            extra_meta=(
+                                {'steers': list(consumed_steer_annotations)} if consumed_steer_annotations else None
+                            ),
                         )
                         await event_emitter(
                             {
@@ -6533,12 +6865,49 @@ async def streaming_chat_response_handler(response, ctx):
 
                         new_form_data = normalize_messages_for_model(new_form_data)
 
-                        res = await generate_chat_completion(
-                            request,
-                            new_form_data,
+                        # Boundary steering: after the complete tool batch and
+                        # every context transform, append pending steers to the
+                        # request copy immediately before the provider call. The
+                        # frozen `form_data['messages']` is never touched, so a
+                        # steer cannot accumulate across rounds.
+                        boundary_steers = []
+                        boundary_steer_chat_id = None
+                        if not _boundary_steering_enabled(last_response_id):
+                            # TODO(steering): the stateful Responses path replays
+                            # through `previous_response_id` and sends only the
+                            # system message plus new output items, so a synthetic
+                            # user block cannot be inserted without breaking state
+                            # continuity. Leave steers pending until a boundary
+                            # that supports them consumes them.
+                            pass
+                        else:
+                            new_form_data, boundary_steers, boundary_steer_chat_id = (
+                                await _inject_pending_steers(
+                                    new_form_data,
+                                    metadata,
+                                    user,
+                                    exclude_ids=injected_steer_ids,
+                                )
+                            )
+                            injected_steer_ids.update(
+                                steer['id']
+                                for steer in boundary_steers
+                                if isinstance(steer, dict) and steer.get('id')
+                            )
+
+                        res, steer_annotations = await _send_with_boundary_steers(
+                            lambda: generate_chat_completion(
+                                request,
+                                new_form_data,
+                                user,
+                                bypass_system_prompt=True,
+                            ),
+                            metadata,
                             user,
-                            bypass_system_prompt=True,
+                            boundary_steers,
+                            delivery_chat_id=boundary_steer_chat_id,
                         )
+                        consumed_steer_annotations.extend(steer_annotations)
 
                         if isinstance(res, StreamingResponse):
                             # Reset response-relative output indices; keep prior output as the UI history prefix.
@@ -6749,6 +7118,10 @@ async def streaming_chat_response_handler(response, ctx):
 
                             new_form_data = normalize_messages_for_model(new_form_data)
 
+                            # Legacy code-interpreter continuation: deliberately
+                            # out of scope for boundary steering. A steer that
+                            # arrives here stays pending for the Slice B turn-end
+                            # drain instead of being injected into this request.
                             res = await generate_chat_completion(
                                 request,
                                 new_form_data,
@@ -6779,6 +7152,14 @@ async def streaming_chat_response_handler(response, ctx):
 
                 current_output = full_output()
                 title = await Chats.get_chat_title_by_id(metadata['chat_id']) if save_to_chat else ''
+                # Annotate the final assistant message with the steers this turn
+                # consumed. Existing annotations (from a paused/resumed turn) are
+                # merged by id so a steer is never listed twice.
+                final_message_meta = _build_final_message_meta(
+                    (message or {}).get('meta'),
+                    consumed_steer_annotations,
+                    ended_at=time.time(),
+                )
                 data = {
                     'done': True,
                     'output': current_output,
@@ -6794,7 +7175,7 @@ async def streaming_chat_response_handler(response, ctx):
                         metadata['message_id'],
                         {
                             'done': True,
-                            'meta': {'response_ended_at': time.time()},
+                            'meta': final_message_meta,
                             'output': current_output,
                             **({'usage': usage} if usage else {}),
                         },
@@ -6822,6 +7203,7 @@ async def streaming_chat_response_handler(response, ctx):
                     if continuing
                     else ''.join(content_parts) or get_output_text(current_output),
                     'output': current_output,
+                    'meta': final_message_meta,
                     **({'usage': usage} if usage else {}),
                     **({'finish_reason': finish_reason} if finish_reason else {}),
                 }
@@ -6862,6 +7244,11 @@ async def streaming_chat_response_handler(response, ctx):
                             {
                                 'done': True,
                                 'output': cancelled_output,
+                                'meta': _build_final_message_meta(
+                                    (message or {}).get('meta'),
+                                    consumed_steer_annotations,
+                                    ended_at=time.time(),
+                                ),
                             },
                         )
                     await clear_response_stream(request.app.state.redis, response_stream_task_id)
