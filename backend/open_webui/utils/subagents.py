@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import copy
 import logging
+import re
 import time
 from datetime import timedelta
 from uuid import uuid4
@@ -539,13 +540,49 @@ def _is_pending_steer(message: dict | None) -> bool:
     return meta.get('status') in (None, STEER_PENDING)
 
 
-def _stale_child_result_updates(messages: dict, child_chat_id: str, *, now: int | None = None) -> dict[str, dict]:
+_SUBAGENT_ENVELOPE_SESSION = re.compile(r'<subagent\b[^>]*\bsessionID="([^"]+)"')
+
+
+def _linked_child_id(message: dict, meta: dict) -> str | None:
+    """The child a completion notice belongs to, including legacy shapes.
+
+    Current notices carry `childID` and `subagent_chat_id`; very old ones may
+    only have the `<subagent sessionID="...">` envelope in their content.
+    """
+    for key in ('childID', 'subagent_chat_id'):
+        value = meta.get(key)
+        if value:
+            return str(value)
+    # A batched notice covers several children. Superseding it for one child
+    # would drop the others, so it never gets an envelope-derived single link.
+    if meta.get('childIDs') or meta.get('subagent_chat_ids'):
+        return None
+    content = message.get('content')
+    if isinstance(content, str):
+        matches = _SUBAGENT_ENVELOPE_SESSION.findall(content)
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _stale_child_result_updates(
+    messages: dict,
+    child_chat_id: str,
+    *,
+    delegation_id: str | None = None,
+    now: int | None = None,
+) -> dict[str, dict]:
     """Build status-only updates for superseded results of one child.
 
     A result node is stale when it is an undelivered (or explicitly pending)
     completion notice for `child_chat_id`. It is marked `superseded` rather than
     removed so a reader can still audit it; the drain ignores anything that is
     not pending, and `is_pending_internal_message` keeps it from anchoring.
+
+    Multi-child (already batched) notices are never touched: they have children
+    and/or only plural ids, and superseding one would drop another child's
+    result. A legacy notice with no structured child link may still be matched
+    by `delegation_id`.
     """
     if not child_chat_id:
         return {}
@@ -561,8 +598,11 @@ def _stale_child_result_updates(messages: dict, child_chat_id: str, *, now: int 
             continue
         if meta.get('status') not in (None, STEER_PENDING):
             continue
-        linked_child = meta.get('childID') or meta.get('subagent_chat_id')
-        if linked_child != child_chat_id:
+        linked_child = _linked_child_id(message, meta)
+        if linked_child is not None:
+            if linked_child != child_chat_id:
+                continue
+        elif not delegation_id or meta.get('delegation_id') != delegation_id:
             continue
         updates[message_id] = {
             **message,
@@ -575,12 +615,19 @@ async def supersede_pending_child_results(
     parent_chat_id: str,
     user_id: str,
     child_chat_id: str,
+    *,
+    generation_id: str | None = None,
 ) -> list[str]:
     """Supersede undrained completion notices for `(parent, child)`.
 
     Called when a child is continued or when a new completion notice is
     enqueued. Otherwise a notice from the previous generation can be drained
     after the continuation and inject an answer that predates it.
+
+    A continuation also claims the child's new generation here, while holding
+    the parent lock: a previous run that finishes after this point sees the
+    generation mismatch and skips both its late notice and its terminal state
+    write, so the old answer cannot be resurrected after supersession.
     """
     if not parent_chat_id or not user_id or not child_chat_id:
         return []
@@ -589,8 +636,23 @@ async def supersede_pending_child_results(
         parent = await Chats.get_chat_by_id(parent_chat_id)
         if not parent or parent.user_id != user_id:
             return []
+        child = await Chats.get_chat_by_id(child_chat_id)
+        child_meta = (child.meta or {}) if child else {}
+        owns_child = bool(
+            child
+            and child.user_id == user_id
+            and (not child_meta.get('parent_chat_id') or child_meta.get('parent_chat_id') == parent_chat_id)
+        )
+        if generation_id and owns_child:
+            # Claim first, so an old run's parent-lock section either writes
+            # before this supersession (and is marked) or after it (and skips).
+            await _begin_child_run(child_chat_id, generation_id)
         messages = ((parent.chat or {}).get('history') or {}).get('messages') or {}
-        updates = _stale_child_result_updates(messages, child_chat_id)
+        updates = _stale_child_result_updates(
+            messages,
+            child_chat_id,
+            delegation_id=child_meta.get('delegation_id') if owns_child else None,
+        )
         if not updates:
             return []
         await Chats.update_chat_by_id(
@@ -659,6 +721,10 @@ async def enqueue_steer(
             return None
         history = (parent.chat or {}).get('history') or {}
         messages = history.get('messages') or {}
+        if steer_id in messages:
+            # Idempotent re-enqueue: never reset a delivered/superseded steer
+            # (or overwrite an unrelated message that happens to reuse the id).
+            return steer_id if _steer_meta(messages[steer_id]) is not None else None
         anchor = resolve_history_tip(
             messages,
             getattr(parent, 'current_message_id', None) or history.get('currentId'),
@@ -680,9 +746,17 @@ async def enqueue_steer(
 
     if child_id:
         # Only advertise a queued steer while the child is actually active.
+        # Re-check under the child lock so a run finishing in this window is
+        # not clobbered back to `steer_queued`.
         child = await Chats.get_chat_by_id(child_id)
-        if child and (child.meta or {}).get('state') in ('running', 'steer_queued'):
-            await _set_child_state(child_id, 'steer_queued')
+        child_meta = (child.meta or {}) if child else {}
+        if child_meta.get('state') in ('running', 'steer_queued'):
+            await _set_child_state(
+                child_id,
+                'steer_queued',
+                generation_id=child_meta.get('generation_id'),
+                only_if_state=('running', 'steer_queued'),
+            )
 
     return steer_id
 
@@ -724,10 +798,11 @@ async def drain_pending_steers(
 def _next_steer_meta(meta: dict, status: str, timestamp: int) -> dict | None:
     """Return the updated meta for a status transition, or None if terminal."""
     current = meta.get('status')
-    # A superseded steer can never be delivered; delivered is terminal.
+    # Delivered is terminal: a consumed steer must never be delivered again and
+    # must not be relabelled as superseded after the model already saw it.
     if status == STEER_DELIVERED and current not in (None, STEER_PENDING):
         return None
-    if status == STEER_SUPERSEDED and current == STEER_SUPERSEDED:
+    if status == STEER_SUPERSEDED and current in (STEER_DELIVERED, STEER_SUPERSEDED):
         return None
     new_meta = {**meta, 'status': status}
     if status == STEER_DELIVERED:
@@ -750,6 +825,7 @@ async def _update_steer_status(
         return []
 
     updated: list[str] = []
+    upserts: list[dict] = []
     async with _parent_lock_scope(parent_chat_id):
         parent = await Chats.get_chat_by_id(parent_chat_id)
         if not parent or parent.user_id != user_id:
@@ -772,6 +848,20 @@ async def _update_steer_status(
                 parent_chat_id,
                 {'history': {'messages': updates}},
             )
+            upserts = list(updates.values())
+
+    # Mirror the status into the normalized message table (the history blob is
+    # the drain's source of truth, but other readers use chat_message).
+    for message in upserts:
+        try:
+            await ChatMessages.upsert_message(
+                message_id=message['id'],
+                chat_id=parent_chat_id,
+                user_id=user_id,
+                data=message,
+            )
+        except Exception:
+            log.exception('Failed to mirror steer status for %s', message.get('id'))
     return updated
 
 
@@ -793,12 +883,53 @@ async def mark_steer_superseded(
     return await _update_steer_status(parent_chat_id, user_id, message_ids, STEER_SUPERSEDED)
 
 
-async def _set_child_state(chat_id: str, state: str) -> None:
-    """Persist a child chat's lifecycle state in `meta.state` (best effort)."""
+async def _begin_child_run(chat_id: str, generation_id: str) -> None:
+    """Claim the child's active generation and mark it running (best effort).
+
+    Later writes from an older generation check this value and no-op, so a
+    continuation cannot be clobbered by the run it superseded.
+    """
+    if not chat_id or not generation_id:
+        return
+    try:
+        async with _parent_lock_scope(chat_id):
+            await Chats.update_chat_meta_by_id(
+                chat_id,
+                {'generation_id': generation_id, 'state': 'running'},
+            )
+    except Exception:
+        log.exception('Failed to begin subagent generation %s for chat %s', generation_id, chat_id)
+
+
+async def _set_child_state(
+    chat_id: str,
+    state: str,
+    *,
+    generation_id: str | None = None,
+    only_if_state: tuple[str, ...] | None = None,
+) -> None:
+    """Persist a child chat's lifecycle state in `meta.state` (best effort).
+
+    With `generation_id`, the write is ignored when another run has since
+    claimed the child. `only_if_state` additionally guards transitions (for
+    example, never overwrite a terminal state with `steer_queued`).
+    """
     if not chat_id:
         return
     try:
-        await Chats.update_chat_meta_by_id(chat_id, {'state': state})
+        if generation_id is not None or only_if_state is not None:
+            async with _parent_lock_scope(chat_id):
+                child = await Chats.get_chat_by_id(chat_id)
+                if not child:
+                    return
+                meta = child.meta or {}
+                if generation_id is not None and meta.get('generation_id') != generation_id:
+                    return
+                if only_if_state is not None and meta.get('state') not in only_if_state:
+                    return
+                await Chats.update_chat_meta_by_id(chat_id, {'state': state})
+        else:
+            await Chats.update_chat_meta_by_id(chat_id, {'state': state})
     except Exception:
         log.exception('Failed to persist subagent state %s for chat %s', state, chat_id)
 
@@ -907,6 +1038,10 @@ async def delegate(
         run['files'] = []
 
     user = UserModel(**user_data)
+    # One token per child run. A continuation claims a fresh one before it
+    # supersedes the previous result, so a late writer from the old run can
+    # recognise that it no longer owns the child.
+    generation_id = str(uuid4())
 
     # pyodide executes in the user's browser via the inherited socket session;
     # when the session is gone the event call returns an immediate error and the
@@ -959,9 +1094,15 @@ async def delegate(
 
         # A completion notice from the previous generation may still be waiting
         # in the parent's history. Continuing the child invalidates it: draining
-        # it later would inject an answer that predates this turn. Supersede it
-        # before the new generation writes anything.
-        await supersede_pending_child_results(parent_chat_id, user.id, existing_chat.id)
+        # it later would inject an answer that predates this turn. Claim the new
+        # generation and supersede the old notice atomically, before the new
+        # generation writes anything.
+        await supersede_pending_child_results(
+            parent_chat_id,
+            user.id,
+            existing_chat.id,
+            generation_id=generation_id,
+        )
 
         # A continued turn keeps the child's workspace unless the caller selects
         # files explicitly: it inherits the files on the child's most recent user
@@ -1074,6 +1215,9 @@ async def delegate(
             if not chat:
                 raise RuntimeError('Failed to create subagent chat')
     except Exception as exc:
+        # A continuation already claimed the child generation above; make sure a
+        # write failure does not leave it stuck in `running`.
+        await _set_child_state(chat_id, 'error', generation_id=generation_id)
         prefix = 'background ' if background else ''
         return f'Error: failed to create {prefix}subagent: {exc}'
 
@@ -1109,7 +1253,6 @@ async def delegate(
             log.exception('Failed to emit subagent:created for child %s', chat_id)
 
     async def run_reserved() -> dict:
-        await _set_child_state(chat_id, 'running')
         try:
             child_request = await _build_request(request, user.id, internal=True)
             # W5: `-1` means unlimited, matching CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS.
@@ -1157,7 +1300,7 @@ async def delegate(
             await request.app.state.CHAT_COMPLETION_HANDLER(child_request, form_data, user=user)
             message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
             if not message:
-                await _set_child_state(chat_id, 'error')
+                await _set_child_state(chat_id, 'error', generation_id=generation_id)
                 return {
                     'status': 'error',
                     'summary': '',
@@ -1168,14 +1311,14 @@ async def delegate(
             if len(summary) > max_output:
                 summary = f'{summary[:max_output]}\n\n[output truncated]'
             error = message.get('error')
-            await _set_child_state(chat_id, 'error' if error else 'completed')
+            await _set_child_state(chat_id, 'error' if error else 'completed', generation_id=generation_id)
             return {
                 'status': 'error' if error else 'completed',
                 'summary': summary or ('Subagent produced no output.' if not error else ''),
                 'error': error,
             }
         except asyncio.CancelledError:
-            await _set_child_state(chat_id, 'interrupted')
+            await _set_child_state(chat_id, 'interrupted', generation_id=generation_id)
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 chat_id,
                 assistant_message_id,
@@ -1183,7 +1326,7 @@ async def delegate(
             )
             raise
         except Exception as exc:
-            await _set_child_state(chat_id, 'error')
+            await _set_child_state(chat_id, 'error', generation_id=generation_id)
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 chat_id,
                 assistant_message_id,
@@ -1205,7 +1348,9 @@ async def delegate(
         # `run_reserved` already writes the terminal state, but a task cancelled
         # before its first await never reaches that code. Make the background
         # wrapper authoritative so the child cannot stay `running` forever.
-        await _set_child_state(chat_id, state)
+        # A generation check keeps a superseded run from clobbering the
+        # continuation that has already taken over the child.
+        await _set_child_state(chat_id, state, generation_id=generation_id)
         summary = result.get('summary') or ''
         if state == 'interrupted':
             body = 'The subagent was interrupted before completing.'
@@ -1233,6 +1378,9 @@ async def delegate(
             # Persisted for legacy chats that still key off the old handle.
             'delegation_id': delegation_id,
             'subagent_chat_id': chat_id,
+            # Lets Slice B pair a completion with the child turn that produced
+            # it, and lets a superseded run recognise its own stale notice.
+            'generation_id': generation_id,
         }
         pending_message = {
             'id': pending_message_id,
@@ -1259,6 +1407,17 @@ async def delegate(
                         raise asyncio.CancelledError
                     return result
 
+                # A continuation may have claimed a newer generation while this
+                # run was finishing. Its old answer is stale: do not enqueue a
+                # notice that could be drained before the new answer lands.
+                child = await Chats.get_chat_by_id(chat_id)
+                child_meta = (child.meta or {}) if child else {}
+                child_generation = child_meta.get('generation_id')
+                if child is not None and child_generation is not None and child_generation != generation_id:
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    return result
+
                 parent_history = (parent.chat or {}).get('history') or {}
                 updated_messages = parent_history.get('messages') or {}
                 # Anchor the result at the chat's current branch tip, never at the
@@ -1280,7 +1439,11 @@ async def delegate(
                 # A newer completion replaces an undrained notice for the same
                 # child. Without this, both notices can drain and the parent
                 # replies to an answer the child has already superseded.
-                stale_updates = _stale_child_result_updates(updated_messages, chat_id)
+                stale_updates = _stale_child_result_updates(
+                    updated_messages,
+                    chat_id,
+                    delegation_id=child_meta.get('delegation_id'),
+                )
 
             # Merge only these nodes instead of overwriting the whole history blob.
             # `update_chat_by_id` re-reads the row and runs `merge_history`, so a
@@ -1325,10 +1488,10 @@ async def delegate(
             raise asyncio.CancelledError
         return result
 
-    # Mark `running` before registering the task so the caller's handle (and the
-    # list endpoint) reflects the transition immediately; the task coroutine
-    # moves it to a terminal state when it finishes.
-    await _set_child_state(chat_id, 'running')
+    # Claim a fresh generation and mark `running` before registering the task so
+    # the caller's handle (and the list endpoint) reflects the transition
+    # immediately. The same token guards the task's terminal writes.
+    await _begin_child_run(chat_id, generation_id)
     try:
         _, child_task = await create_task(
             request.app.state.redis,
@@ -1336,8 +1499,18 @@ async def delegate(
             id=chat_id,
         )
     except Exception as exc:
-        await _set_child_state(chat_id, 'error')
+        await _set_child_state(chat_id, 'error', generation_id=generation_id)
         return f'Error: {exc}'
+
+    if child_task is not None and hasattr(child_task, 'add_done_callback'):
+
+        def _finalize_cancelled(task) -> None:
+            # Covers a task cancelled before its first await: the coroutine never
+            # reached its own CancelledError handler, so finalize it here.
+            if task.cancelled():
+                asyncio.create_task(_set_child_state(chat_id, 'interrupted', generation_id=generation_id))
+
+        child_task.add_done_callback(_finalize_cancelled)
 
     if background:
         return JSONCodec.dumps(

@@ -323,13 +323,89 @@ async def test_enqueue_steer_marks_active_child_steer_queued(monkeypatch):
     assert child.meta['state'] == 'steer_queued'
 
 
-def test_pending_steer_never_anchors_history_tip():
+def test_steer_never_anchors_history_tip_in_any_status():
     messages = _parent_history(_steer_message('steer-1'))['messages']
     assert is_pending_internal_message(messages['steer-1']) is True
     assert resolve_history_tip(messages, 'tip', blocked=is_pending_internal_message) == 'tip'
 
+    # A delivered steer was only appended to the model request; it is not a
+    # visible branch node and must not become the next anchor (which would
+    # replay it into a later turn).
     messages['steer-1']['meta']['status'] = 'delivered'
+    assert is_pending_internal_message(messages['steer-1']) is True
+    assert resolve_history_tip(messages, 'tip', blocked=is_pending_internal_message) == 'tip'
+
+    messages['steer-1']['meta']['status'] = 'superseded'
+    assert is_pending_internal_message(messages['steer-1']) is True
+    assert resolve_history_tip(messages, 'tip', blocked=is_pending_internal_message) == 'tip'
+
+    # Once a real turn is attached it is traversed like any other node.
+    messages['steer-1']['childrenIds'] = ['next-assistant']
+    messages['next-assistant'] = {
+        'id': 'next-assistant',
+        'parentId': 'steer-1',
+        'childrenIds': [],
+        'role': 'assistant',
+        'content': 'answer',
+        'done': True,
+        'timestamp': 6,
+    }
     assert is_pending_internal_message(messages['steer-1']) is False
+    assert resolve_history_tip(messages, 'tip', blocked=is_pending_internal_message) == 'next-assistant'
+
+
+@pytest.mark.asyncio
+async def test_enqueue_steer_is_idempotent_for_a_message_id(monkeypatch):
+    harness = Harness(monkeypatch)
+    parent = harness.seed_parent(history=_parent_history())
+
+    first = await subagents.enqueue_steer('chat-1', 'user-1', 'first text', message_id='stable-steer')
+    assert first == 'stable-steer'
+    assert await subagents.mark_steer_delivered('chat-1', 'user-1', first) == [first]
+
+    # Re-enqueue with the same id must not reset a consumed steer to pending.
+    again = await subagents.enqueue_steer('chat-1', 'user-1', 'changed text', message_id='stable-steer')
+    assert again == 'stable-steer'
+    steers = [m for m in parent.chat['history']['messages'].values() if m.get('meta', {}).get('type') == 'steer']
+    assert len(steers) == 1
+    assert steers[0]['meta']['status'] == 'delivered'
+    assert steers[0]['content'] == 'first text'
+    assert await subagents.drain_pending_steers('chat-1', 'user-1') == []
+
+    # Reusing an id that belongs to a normal message is rejected, not overwritten.
+    normal = _steer_message('normal')
+    normal['meta'] = {}
+    parent.chat['history']['messages']['normal'] = normal
+    assert await subagents.enqueue_steer('chat-1', 'user-1', 'oops', message_id='normal') is None
+    assert parent.chat['history']['messages']['normal']['content'] == 'steer normal'
+
+
+@pytest.mark.asyncio
+async def test_steer_status_transitions_are_terminal(monkeypatch):
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+
+    delivered_id = await subagents.enqueue_steer('chat-1', 'user-1', 'already seen')
+    await subagents.mark_steer_delivered('chat-1', 'user-1', delivered_id)
+    assert await subagents.mark_steer_superseded('chat-1', 'user-1', delivered_id) == []
+    assert await subagents.mark_steer_delivered('chat-1', 'user-1', delivered_id) == []
+
+    superseded_id = await subagents.enqueue_steer('chat-1', 'user-1', 'never seen')
+    assert await subagents.mark_steer_superseded('chat-1', 'user-1', superseded_id) == [superseded_id]
+    assert await subagents.mark_steer_delivered('chat-1', 'user-1', superseded_id) == []
+    assert await subagents.mark_steer_superseded('chat-1', 'user-1', superseded_id) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_steer_is_not_drained_as_a_subagent_result(monkeypatch):
+    harness = Harness(monkeypatch)
+    parent = harness.seed_parent(history=_parent_history(_steer_message('steer-1')))
+
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+
+    assert harness.completions == []
+    assert parent.chat['history']['messages']['steer-1']['meta']['status'] == 'pending'
+    assert parent.chat['history']['currentId'] == 'tip'
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +445,55 @@ async def test_supersede_only_matches_the_target_child(monkeypatch):
     assert updated == ['stale-a']
     assert parent.chat['history']['messages']['stale-a']['meta']['status'] == 'superseded'
     assert parent.chat['history']['messages']['stale-b']['meta']['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_supersede_matches_legacy_envelope_only_result(monkeypatch):
+    harness = Harness(monkeypatch)
+    stale = _pending_result('legacy-result', child_id='child-1')
+    stale['meta'] = {'internal': True, 'type': 'subagent', 'source': 'subagent'}
+    stale['content'] = '<subagent sessionID="child-1" state="completed">\nold\n</subagent>'
+    parent = harness.seed_parent(history=_parent_history(stale))
+
+    updated = await subagents.supersede_pending_child_results('chat-1', 'user-1', 'child-1')
+
+    assert updated == ['legacy-result']
+    assert parent.chat['history']['messages']['legacy-result']['meta']['status'] == 'superseded'
+
+
+@pytest.mark.asyncio
+async def test_supersede_matches_legacy_delegation_only_result(monkeypatch):
+    harness = Harness(monkeypatch)
+    stale = _pending_result('legacy-result', child_id='child-1')
+    stale['meta'] = {'internal': True, 'type': 'subagent', 'delegation_id': 'deleg-old'}
+    stale['content'] = 'old subagent result without an envelope'
+    parent = harness.seed_parent(history=_parent_history(stale))
+    child = harness.seed_child(child_id='child-1')
+    child.meta['delegation_id'] = 'deleg-old'
+
+    updated = await subagents.supersede_pending_child_results('chat-1', 'user-1', 'child-1')
+
+    assert updated == ['legacy-result']
+    assert parent.chat['history']['messages']['legacy-result']['meta']['status'] == 'superseded'
+
+
+@pytest.mark.asyncio
+async def test_supersede_does_not_touch_batched_child_results(monkeypatch):
+    """A batched notice covers several children; one continuation must not drop it."""
+    harness = Harness(monkeypatch)
+    batched = _pending_result('batched', child_id='child-1')
+    batched['meta'] = {
+        'internal': True,
+        'type': 'subagent',
+        'source': 'subagent',
+        'childIDs': ['child-1', 'child-2'],
+    }
+    parent = harness.seed_parent(history=_parent_history(batched))
+
+    updated = await subagents.supersede_pending_child_results('chat-1', 'user-1', 'child-1')
+
+    assert updated == []
+    assert 'status' not in parent.chat['history']['messages']['batched']['meta']
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +565,95 @@ async def test_cancelled_background_child_state_interrupted(monkeypatch):
     assert child.meta['state'] == 'interrupted'
 
 
+@pytest.mark.asyncio
+async def test_new_completion_supersedes_an_older_notice_for_the_same_child(monkeypatch):
+    harness = Harness(monkeypatch, active=True)
+    parent = harness.seed_parent(history=_parent_history())
+    harness.block_event = asyncio.Event()
+
+    handle = json.loads(await run_delegate(harness, background=True))
+    child_id = handle['sessionID']
+    _, child_task = harness.registry.created[-1]
+    for _ in range(50):
+        if harness.states_seen:
+            break
+        await asyncio.sleep(0)
+
+    # A notice from an earlier generation is still waiting when this one lands.
+    parent.chat['history']['messages']['old-notice'] = _pending_result('old-notice', child_id=child_id)
+    harness.block_event.set()
+    await child_task
+
+    messages = parent.chat['history']['messages']
+    assert messages['old-notice']['meta']['status'] == 'superseded'
+    new_notices = [
+        m
+        for m in messages.values()
+        if (m.get('meta') or {}).get('type') == 'subagent'
+        and (m.get('meta') or {}).get('childID') == child_id
+        and (m.get('meta') or {}).get('generation_id')
+    ]
+    assert len(new_notices) == 1
+    assert new_notices[0]['meta'].get('status') in (None, 'pending')
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_first_step_still_finalizes_interrupted(monkeypatch):
+    harness = Harness(monkeypatch, active=True)
+    harness.seed_parent(history=_parent_history())
+
+    handle = json.loads(await run_delegate(harness, background=True))
+    child = harness.fake_chats.chats[handle['sessionID']]
+    _, child_task = harness.registry.created[-1]
+    assert child.meta['state'] == 'running'
+
+    # Cancel before the coroutine gets its first step; its own handler never runs.
+    child_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await child_task
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if child.meta['state'] == 'interrupted':
+            break
+    assert child.meta['state'] == 'interrupted'
+
+
+@pytest.mark.asyncio
+async def test_continuation_generation_ignores_a_stale_finishing_run(monkeypatch):
+    """A run that finishes after a continuation must not clobber it or emit a notice."""
+    harness = Harness(monkeypatch, active=True)
+    parent = harness.seed_parent(history=_parent_history())
+    harness.block_event = asyncio.Event()
+
+    handle = json.loads(await run_delegate(harness, background=True))
+    child_id = handle['sessionID']
+    child = harness.fake_chats.chats[child_id]
+    old_generation = child.meta['generation_id']
+    _, child_task = harness.registry.created[-1]
+
+    for _ in range(50):
+        if harness.states_seen:
+            break
+        await asyncio.sleep(0)
+    assert child.meta['state'] == 'running'
+
+    # Simulate the continuation claiming the child before the old run finishes.
+    child.meta['generation_id'] = 'next-generation'
+    child.meta['state'] = 'running'
+    harness.block_event.set()
+    await child_task
+
+    # The old run's terminal state and late notice are both discarded.
+    assert child.meta['state'] == 'running'
+    assert child.meta['generation_id'] == 'next-generation'
+    assert old_generation != child.meta['generation_id']
+    messages = parent.chat['history']['messages']
+    assert not any(
+        (m.get('meta') or {}).get('type') == 'subagent' and (m.get('meta') or {}).get('childID') == child_id
+        for m in messages.values()
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /api/v1/chats/{id}/subagents ownership
 # ---------------------------------------------------------------------------
@@ -496,4 +710,9 @@ async def test_subagent_listing_rejects_non_owner(monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         await get_chat_subagents_by_id('chat-1', user=user, db=None)
+    assert exc.value.status_code == 401
+
+    # A missing/foreign parent is the same non-disclosing 401, not a 500.
+    with pytest.raises(HTTPException) as exc:
+        await get_chat_subagents_by_id('missing-chat', user=SimpleNamespace(id='user-1'), db=None)
     assert exc.value.status_code == 401

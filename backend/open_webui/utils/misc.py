@@ -225,8 +225,9 @@ def is_pending_internal_message(message) -> bool:
     into a synthesis turn. Two of them must stay *siblings* (so they batch)
     rather than chaining one under the other. Superseded results are terminal
     tombstones: they are never drained, and must not become anchors either.
-    Pending steers are ephemeral model-input appends, so they must be skipped
-    until they are delivered/superseded.
+    Steers are ephemeral model-input appends: pending, delivered, and superseded
+    steer nodes all stay off the visible branch, so none of them may become an
+    anchor (a delivered steer would otherwise be replayed into a later turn).
     """
     if not isinstance(message, dict) or message.get('role') != 'user':
         return False
@@ -238,7 +239,10 @@ def is_pending_internal_message(message) -> bool:
     if meta.get('type') == 'subagent':
         return meta.get('status') in (None, 'pending', 'superseded')
     if meta.get('type') == 'steer':
-        return meta.get('status') in (None, 'pending')
+        # Delivered steers are not promoted into the durable tree; the turn
+        # annotates the assistant message instead. Keep every terminal-status
+        # steer off the branch so it is never re-injected.
+        return True
     return meta.get('type') == 'timer'
 
 
