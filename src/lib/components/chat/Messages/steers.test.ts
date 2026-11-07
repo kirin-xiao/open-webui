@@ -69,6 +69,28 @@ describe('steer history nodes', () => {
 		});
 		expect(after).toEqual([]);
 	});
+
+	it('does not duplicate a promoted steer that is rendered inline', () => {
+		const byChild = steerNode(
+			's1',
+			'promoted by child',
+			{ status: 'delivered' },
+			{ childrenIds: ['a1'] }
+		);
+		const byMarker = steerNode(
+			's2',
+			'promoted by marker',
+			{ status: 'delivered', promoted: true },
+			{ childrenIds: [] }
+		);
+		const messages = {
+			s1: byChild,
+			s2: byMarker,
+			a1: { id: 'a1', role: 'assistant', content: 'answer', parentId: 's1', childrenIds: [] }
+		};
+
+		expect(collectUnannotatedDeliveredSteers(messages)).toEqual([]);
+	});
 });
 
 describe('assistant meta.steers annotations', () => {
@@ -216,6 +238,49 @@ describe('steer currentId repair', () => {
 		expect(messages.tip.childrenIds).toEqual(['u2']);
 		expect(messages.s1.childrenIds).toEqual([]);
 		expect(history.currentId).toBe('u2');
+	});
+
+	it('re-anchors past a chain of non-promoted steers', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1'] },
+			s1: steerNode(
+				's1',
+				'outer',
+				{ status: 'delivered' },
+				{ parentId: 'tip', childrenIds: ['s2'] }
+			),
+			s2: steerNode(
+				's2',
+				'inner',
+				{ status: 'delivered' },
+				{ parentId: 's1', childrenIds: ['u2'] }
+			),
+			u2: { id: 'u2', role: 'user', content: 'next', parentId: 's2', childrenIds: [] }
+		};
+		const history = { currentId: 's1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(true);
+		expect(messages.u2.parentId).toBe('tip');
+		expect(messages.tip.childrenIds).toContain('u2');
+		expect(messages.s2.childrenIds).toEqual([]);
+		expect(history.currentId).not.toBe('s1');
+	});
+
+	it('moves a marker-promoted steer currentId to its assistant descendant', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1'] },
+			s1: steerNode(
+				's1',
+				'promoted steer',
+				{ status: 'delivered', promoted: true },
+				{ parentId: 'tip', childrenIds: ['a1'] }
+			),
+			a1: { id: 'a1', role: 'assistant', content: 'answer', parentId: 's1', childrenIds: [] }
+		};
+		const history = { currentId: 's1', messages };
+
+		expect(repairSteerCurrentId(history)).toBe(true);
+		expect(history.currentId).toBe('a1');
 	});
 
 	it('leaves healthy histories untouched', () => {

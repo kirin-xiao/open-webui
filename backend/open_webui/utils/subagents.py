@@ -305,6 +305,11 @@ async def process_pending_internal_messages(
                     'type': STEER_TYPE,
                     'source': first_meta.get('source') or 'user',
                     'status': STEER_DELIVERED,
+                    # Explicit promotion marker. Readers must treat this node as
+                    # a real visible turn, not a model-input-only steer. Older
+                    # chats lack the marker and fall back to "has an assistant
+                    # child" detection.
+                    'promoted': True,
                 }
             else:
                 delegation_ids = [

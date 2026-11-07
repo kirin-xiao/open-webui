@@ -494,6 +494,74 @@ def test_repair_promoted_steer_keeps_its_assistant_turn_reachable():
     assert chain == ['tip', 'steer-1', 'assistant-2']
 
 
+def test_repair_trusts_the_promoted_marker_without_an_assistant_child():
+    """The promote path marks its node, so detection cannot be fooled by a
+    boundary steer that happens to have a child."""
+    history = {
+        'currentId': 'next-user',
+        'messages': {
+            'tip': {
+                'id': 'tip',
+                'parentId': None,
+                'childrenIds': [],
+                'role': 'assistant',
+                'content': 'answer',
+                'done': True,
+                'timestamp': 10,
+            },
+            'steer-1': {
+                'id': 'steer-1',
+                'parentId': 'tip',
+                'childrenIds': ['next-user'],
+                'role': 'user',
+                'content': 'promoted steer',
+                'meta': {
+                    'internal': True,
+                    'type': 'steer',
+                    'source': 'user',
+                    'status': 'delivered',
+                    'promoted': True,
+                },
+                'timestamp': 10,
+            },
+            'next-user': {
+                'id': 'next-user',
+                'parentId': 'steer-1',
+                'childrenIds': [],
+                'role': 'user',
+                'content': 'next question',
+                'timestamp': 11,
+            },
+        },
+    }
+
+    repaired, _ = _repair_history(history)
+
+    # The promoted node is a real turn: its child stays anchored on it and the
+    # steer still resolves as the visible user message for that turn.
+    assert repaired['messages']['next-user']['parentId'] == 'steer-1'
+    assert repaired['currentId'] == 'next-user'
+    chain = [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])]
+    assert chain == ['tip', 'steer-1', 'next-user']
+
+
+def test_current_message_id_is_steer_detects_a_stale_column():
+    steer = _steer_message('steer-1', status='delivered')
+    model = ChatModel(
+        id='chat-1',
+        user_id='user-1',
+        title='Chat',
+        chat={'history': {'currentId': 'tip', 'messages': {'steer-1': steer}}},
+        created_at=1,
+        updated_at=1,
+        current_message_id='steer-1',
+    )
+
+    assert Chats._current_message_id_is_steer(model) is True
+    model.current_message_id = 'tip'
+    assert Chats._current_message_id_is_steer(model) is False
+
+
 def test_repair_reanchors_polluted_next_turn_and_moves_current_id_off_steer():
     """A steer currentId left by an old save self-heals; the next turn survives."""
     history = {
@@ -530,6 +598,41 @@ def test_repair_reanchors_polluted_next_turn_and_moves_current_id_off_steer():
     assert repaired['currentId'] == 'next-user'
     chain = [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])]
     assert 'steer-1' not in chain
+    assert chain == ['tip', 'next-user']
+
+
+def test_repair_reanchors_past_a_chain_of_steers():
+    history = {
+        'currentId': 'steer-1',
+        'messages': {
+            'tip': {
+                'id': 'tip',
+                'parentId': None,
+                'childrenIds': ['steer-1'],
+                'role': 'assistant',
+                'content': 'answer',
+                'done': True,
+                'timestamp': 10,
+            },
+            'steer-1': _steer_message('steer-1', status='delivered') | {'childrenIds': ['steer-2']},
+            'steer-2': _steer_message('steer-2', status='delivered') | {'childrenIds': ['next-user']},
+            'next-user': {
+                'id': 'next-user',
+                'parentId': 'steer-2',
+                'childrenIds': [],
+                'role': 'user',
+                'content': 'next question',
+                'timestamp': 11,
+            },
+        },
+    }
+    history['messages']['steer-2']['parentId'] = 'steer-1'
+
+    repaired, _ = _repair_history(history)
+
+    assert repaired['messages']['next-user']['parentId'] == 'tip'
+    assert repaired['currentId'] == 'next-user'
+    chain = [message['id'] for message in get_message_list(repaired['messages'], repaired['currentId'])]
     assert chain == ['tip', 'next-user']
 
 
@@ -771,6 +874,8 @@ async def test_pending_user_steer_is_promoted_at_turn_end_not_as_a_result(monkey
     assert promoted['meta']['type'] == 'steer'
     assert promoted['meta']['source'] == 'user'
     assert promoted['meta']['status'] == 'delivered'
+    # Explicit marker: readers must not have to infer promotion from the tree.
+    assert promoted['meta']['promoted'] is True
 
     # A later turn-end drain has nothing left to deliver.
     await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})

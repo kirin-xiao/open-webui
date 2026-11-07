@@ -166,6 +166,7 @@ export function pruneSteerBranches(messages: HistoryMessages): boolean {
 function isPromotedSteer(messages: HistoryMessages, messageId: string): boolean {
 	const message = messages?.[messageId];
 	if (!isInternalSteerNode(message)) return false;
+	if (message?.meta?.promoted === true) return true;
 	const children = Array.isArray(message?.childrenIds) ? message.childrenIds : [];
 	return children.some((childId) => {
 		if (typeof childId !== 'string') return false;
@@ -232,7 +233,9 @@ export function repairSteerCurrentId(
 		if (!isInternalSteerNode(steer) || isPromotedSteer(messages, steerId)) continue;
 		const children = Array.isArray(steer?.childrenIds) ? [...steer.childrenIds] : [];
 		if (children.length === 0) continue;
-		const parentId = typeof steer?.parentId === 'string' ? steer.parentId : null;
+		// Re-anchor to the nearest non-steer ancestor so a chain of steers
+		// cannot leave one in the re-anchored turn's parent chain.
+		const parentId = nonSteerAncestorId(messages, steerId);
 		const kept: unknown[] = [];
 		for (const childId of children) {
 			if (typeof childId !== 'string') {
@@ -244,12 +247,16 @@ export function repairSteerCurrentId(
 				kept.push(childId);
 				continue;
 			}
-			child.parentId = parentId;
-			const parent = parentId ? messages[parentId] : null;
-			if (parent && Array.isArray(parent.childrenIds) && !parent.childrenIds.includes(childId)) {
-				parent.childrenIds = [...parent.childrenIds, childId];
+			// Only a child actually anchored on the steer is polluted by it; a
+			// stale childrenIds entry is dropped without moving a real branch.
+			if (child.parentId === steerId) {
+				child.parentId = parentId;
+				const parent = parentId ? messages[parentId] : null;
+				if (parent && Array.isArray(parent.childrenIds) && !parent.childrenIds.includes(childId)) {
+					parent.childrenIds = [...parent.childrenIds, childId];
+				}
+				changed = true;
 			}
-			changed = true;
 		}
 		if (kept.length !== children.length) {
 			steer.childrenIds = kept;
@@ -411,6 +418,10 @@ export function collectUnannotatedDeliveredSteers(messages: HistoryMessages): St
 		(entry) =>
 			entry.status === 'delivered' &&
 			!entry.childID &&
+			// A promoted steer is a real visible turn rendered inline by
+			// UserMessage. Showing it again as a queued/delivered chip would
+			// duplicate the block.
+			!isPromotedSteer(messages, entry.id) &&
 			!annotated.ids.has(entry.id) &&
 			!annotated.texts.has(entry.content)
 	);

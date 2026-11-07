@@ -584,6 +584,17 @@ class ChatTable:
         return True
 
     @staticmethod
+    def _current_message_id_is_steer(model: 'ChatModel') -> bool:
+        """True when the denormalized tip column still points at a steer node.
+
+        The read path repairs ``history.currentId`` in memory; the column can be
+        stale independently and shadows the in-JSON tip on the client, so it
+        must be reconciled whenever it names a steer.
+        """
+        messages = ((model.chat or {}).get('history') or {}).get('messages') or {}
+        return is_internal_steer_node(messages.get(model.current_message_id))
+
+    @staticmethod
     def _steer_has_assistant_child(messages: dict, message_id: str) -> bool:
         """True when a steer was promoted into a real turn.
 
@@ -632,7 +643,18 @@ class ChatTable:
             if self._steer_has_assistant_child(messages, steer_id):
                 continue
             steer = messages[steer_id]
+            # Anchor re-anchored children on the nearest non-steer ancestor so a
+            # chain of steers cannot leave one in the turn's parent chain.
             parent_id = steer.get('parentId')
+            seen_ancestors = {steer_id}
+            while (
+                isinstance(parent_id, str)
+                and parent_id in messages
+                and is_internal_steer_node(messages[parent_id])
+                and parent_id not in seen_ancestors
+            ):
+                seen_ancestors.add(parent_id)
+                parent_id = messages[parent_id].get('parentId')
             children = steer.get('childrenIds')
             if not isinstance(children, list) or not children:
                 continue
@@ -642,11 +664,14 @@ class ChatTable:
                 if not isinstance(child, dict) or is_internal_steer_node(child):
                     kept.append(child_id)
                     continue
+                # Only a child actually anchored on the steer is polluted by it.
+                # A stale childrenIds entry is dropped without moving a message
+                # that legitimately belongs to another branch.
                 if child.get('parentId') == steer_id:
                     child['parentId'] = parent_id
                     changed = True
-                if isinstance(parent_id, str) and parent_id in messages:
-                    changed = self._add_child_id_to_parent(messages, parent_id, child_id) or changed
+                    if isinstance(parent_id, str) and parent_id in messages:
+                        changed = self._add_child_id_to_parent(messages, parent_id, child_id) or changed
             if kept != children:
                 steer['childrenIds'] = kept
                 changed = True
@@ -972,7 +997,10 @@ class ChatTable:
                         ):
                             updated['history']['messages'][mid] = message
                     updated['history'] = self.merge_history(updated['history'], {})
-                self._repair_chat_current_id(updated)
+                    # Repair only when this write actually carries history. A
+                    # metadata-only patch (models/files/params) must not advance
+                    # the stored branch tip as a side effect.
+                    self._repair_chat_current_id(updated)
 
                 updated = self._clean_null_bytes(updated)
                 chat_item.chat = updated
@@ -2070,9 +2098,9 @@ class ChatTable:
 
                 model = ChatModel.model_validate(chat_item)
                 model.chat = self._clean_null_bytes(model.chat)
-                if self._repair_chat_current_id(model.chat):
+                if self._repair_chat_current_id(model.chat) or self._current_message_id_is_steer(model):
                     # The denormalized column shadows the in-JSON tip on read, so
-                    # a repaired steer tip must move it too.
+                    # a repaired (or stale steer) tip must move it too.
                     model.current_message_id = self.get_current_message_id(model.chat)
                 return model
 
@@ -2112,7 +2140,7 @@ class ChatTable:
 
                 model = ChatModel.model_validate(chat)
                 model.chat = self._clean_null_bytes(model.chat)
-                if self._repair_chat_current_id(model.chat):
+                if self._repair_chat_current_id(model.chat) or self._current_message_id_is_steer(model):
                     model.current_message_id = self.get_current_message_id(model.chat)
                 return model
 

@@ -241,12 +241,17 @@ def is_internal_steer_node(message) -> bool:
 def is_promoted_internal_steer(message, messages_map) -> bool:
     """True when an internal steer was promoted into a real visible turn.
 
-    The turn-end drain attaches an assistant response to a promoted steer. A
-    boundary-delivered or pending steer has no such child; any user child it has
-    is a polluted next-turn link.
+    The promote path in ``process_pending_internal_messages`` writes an explicit
+    ``meta.promoted`` marker. Older chats predate the marker, so fall back to
+    the historical inference: the drain attaches an assistant response to the
+    promoted user turn. A boundary-delivered or pending steer has no such child;
+    any user child it has is a polluted next-turn link.
     """
     if not is_internal_steer_node(message):
         return False
+    meta = message.get('meta')
+    if isinstance(meta, dict) and meta.get('promoted') is True:
+        return True
     child_ids = message.get('childrenIds')
     if not isinstance(child_ids, list):
         return False
