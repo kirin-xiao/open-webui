@@ -3481,7 +3481,7 @@ def _steering_output_parts(
         if isinstance(steer, dict) and steer.get('id')
     }
     user_id = _steer_user_id(user)
-    user_name = getattr(user, 'name', None) or ''
+    user_name = (user.get('name') if isinstance(user, dict) else getattr(user, 'name', None)) or ''
     parts: list[dict] = []
     for annotation in annotations or []:
         if not isinstance(annotation, dict):
@@ -6989,6 +6989,10 @@ async def streaming_chat_response_handler(response, ctx):
                             else []
                         )
                         if appended_steering_parts:
+                            # Persist the part in the in-progress stream snapshot too,
+                            # so a mid-turn reload already sees the steer at its
+                            # boundary instead of falling back to a queued bubble.
+                            await save_current_response_stream()
                             await event_emitter(
                                 {
                                     'type': 'chat:completion',

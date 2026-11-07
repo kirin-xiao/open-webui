@@ -97,7 +97,8 @@
 		collectUnannotatedDeliveredSteers,
 		mergeSubagentCompletionStates,
 		planBusySubmit,
-		repairSteerCurrentId
+		repairSteerCurrentId,
+		steerIdsInOutput
 	} from './Messages/steers';
 
 	import {
@@ -4243,10 +4244,16 @@
 				if (result?.reason === 'no_active_task') return 'inactive';
 				if (!result?.queued || !result.id) return 'failed';
 
-				// Optimistically add the durable node so the queued chip appears
+				// Optimistically add the durable node so the queued bubble appears
 				// immediately. It is anchored without touching `currentId` or the
 				// parent's children, so the live branch is never forked.
 				const steerId = result.id;
+				// The boundary may already have consumed this steer before the POST
+				// response reached us (the live `chat:completion` snapshot can beat
+				// the HTTP reply). In that case the inline part is authoritative and
+				// adding a `pending` node would resurrect a stale bubble until the
+				// next refresh.
+				const deliveredInline = steerIdsInOutput(history.messages).has(steerId);
 				history.messages[steerId] = {
 					id: steerId,
 					parentId: history.currentId ?? null,
@@ -4261,7 +4268,7 @@
 						internal: true,
 						type: 'steer',
 						source: 'user',
-						status: 'pending'
+						status: deliveredInline ? 'delivered' : 'pending'
 					}
 				};
 				history = history;

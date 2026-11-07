@@ -446,19 +446,25 @@ export function steerIdsInOutput(messages: HistoryMessages): Set<string> {
  * middleware has not annotated the response (or the chat predates Slice A).
  */
 export function collectUnannotatedDeliveredSteers(messages: HistoryMessages): SteerEntry[] {
-	const annotated = annotatedSteers(messages);
-	const inlined = steerIdsInOutput(messages);
-	return collectSteerNodes(messages).filter(
+	const candidates = collectSteerNodes(messages).filter(
 		(entry) =>
 			entry.status === 'delivered' &&
 			!entry.childID &&
 			// A promoted steer is a real visible turn rendered inline by
 			// UserMessage. Showing it again as a queued/delivered chip would
 			// duplicate the block.
-			!isPromotedSteer(messages, entry.id) &&
-			!inlined.has(entry.id) &&
-			!annotated.ids.has(entry.id) &&
-			!annotated.texts.has(entry.content)
+			!isPromotedSteer(messages, entry.id)
+	);
+	// This runs on every streaming update. Scanning every output item is the
+	// expensive part, so only do it once a delivered node actually needs a
+	// fallback decision.
+	if (candidates.length === 0) return [];
+
+	const annotated = annotatedSteers(messages);
+	const inlined = steerIdsInOutput(messages);
+	return candidates.filter(
+		(entry) =>
+			!inlined.has(entry.id) && !annotated.ids.has(entry.id) && !annotated.texts.has(entry.content)
 	);
 }
 

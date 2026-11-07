@@ -612,3 +612,65 @@ def test_steering_output_parts_are_display_only_and_follow_the_boundary():
 
     # A retry/replay must not duplicate the same steer part.
     assert middleware._append_steering_output_parts(output, parts) == []
+
+    # A dict-shaped user is supported as well (some internal callers use one).
+    dict_user_parts = middleware._steering_output_parts(
+        [annotation], [steer], {'id': 'user-2', 'name': 'Grace'}
+    )
+    assert dict_user_parts[0]['user'] == {'id': 'user-2', 'name': 'Grace'}
+
+
+def test_only_delivered_annotations_become_inline_parts():
+    delivered = _steer('steer-1', 'show it inline', source='subagent')
+    failed = _steer('steer-2', 'failed provider, stays pending')
+    annotations = middleware._steer_annotations([delivered])
+
+    parts = middleware._steering_output_parts(
+        annotations, [delivered, failed], SimpleNamespace(id='user-1', name='Ada')
+    )
+
+    # `_send_with_boundary_steers` returns annotations only for the records the
+    # delivery write confirmed, so an undelivered steer never gets a part.
+    assert [part['steer_id'] for part in parts] == ['steer-1']
+    assert all(part['type'] == 'open_webui:steering' for part in parts)
+
+
+def test_steering_part_is_wired_after_delivery_and_before_the_index_reset():
+    """Pin the handler ordering: deliver -> insert part -> snapshot -> reset."""
+    handler = _streaming_handler()
+
+    send_line = _call_lines(handler, '_send_with_boundary_steers')[0]
+
+    build = _call_nodes(handler, '_steering_output_parts')
+    assert len(build) == 1
+    # Built from the *delivered* annotations, never from the drained records.
+    assert isinstance(build[0].args[0], ast.Name)
+    assert build[0].args[0].id == 'steer_annotations'
+    assert build[0].lineno > send_line
+
+    append = _call_nodes(handler, '_append_steering_output_parts')
+    assert len(append) == 1
+    assert isinstance(append[0].args[0], ast.Name)
+    assert append[0].args[0].id == 'output'
+    assert append[0].lineno > build[0].lineno
+
+    # The snapshot with delivered ids is emitted before the prior-output reset;
+    # the new stream's output_index therefore starts after the inserted part.
+    delivered_key_lines = [
+        node.lineno
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(key, ast.Constant) and key.value == 'delivered_steer_ids' for key in node.keys)
+    ]
+    assert len(delivered_key_lines) == 1
+    assert delivered_key_lines[0] > append[0].lineno
+
+    prior_reset_lines = [
+        node.lineno
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == 'prior_output' for target in node.targets)
+        and node.lineno > append[0].lineno
+    ]
+    assert prior_reset_lines
+    assert delivered_key_lines[0] < min(prior_reset_lines)
