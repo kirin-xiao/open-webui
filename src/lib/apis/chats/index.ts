@@ -803,7 +803,8 @@ export const steerChatById = async (
 	token: string,
 	id: string,
 	content: string,
-	modelId?: string
+	modelId?: string,
+	steerId?: string
 ): Promise<{ queued: boolean; id?: string; reason?: string }> => {
 	let error = null;
 
@@ -816,7 +817,8 @@ export const steerChatById = async (
 		},
 		body: JSON.stringify({
 			content,
-			...(modelId ? { model_id: modelId } : {})
+			...(modelId ? { model_id: modelId } : {}),
+			...(steerId ? { steer_id: steerId } : {})
 		})
 	})
 		.then(async (res) => {

@@ -6,6 +6,8 @@ import {
 	hasPreSteerNote,
 	isSteerMessage,
 	mergeSubagentCompletionStates,
+	planBusySubmit,
+	pruneSteerBranches,
 	steerEntriesFromAnnotation,
 	subagentStatesToCompleted
 } from './steers';
@@ -94,12 +96,16 @@ describe('subagent status reconciliation', () => {
 				['done', 'completed'],
 				['failed', 'error'],
 				['stopped', 'interrupted'],
+				['old', 'superseded'],
+				['unknown', 'future-state'],
 				['running', 'running'],
-				['queued', 'steer_queued']
+				['queued', 'steer_queued'],
+				['blank', '']
 			])
 		);
 
-		expect([...completed].sort()).toEqual(['done', 'failed', 'stopped']);
+		// Anything non-active is terminal, so a future state cannot pin the row.
+		expect([...completed].sort()).toEqual(['done', 'failed', 'old', 'stopped', 'unknown']);
 	});
 
 	it('lets persisted state stop a missed-completion spinner', () => {
@@ -125,5 +131,65 @@ describe('subagent status reconciliation', () => {
 		);
 
 		expect(completed.has('child-1')).toBe(false);
+	});
+});
+
+describe('steer branch pruning', () => {
+	it('removes every steer node from childrenIds so it never becomes a branch', () => {
+		const messages = {
+			tip: { id: 'tip', role: 'assistant', content: 'done', childrenIds: ['s1', 'u2'] },
+			s1: steerNode('s1', 'steer me'),
+			u2: { id: 'u2', role: 'user', content: 'next', parentId: 'tip', childrenIds: ['s2'] },
+			s2: steerNode('s2', 'delivered steer', { status: 'delivered' }),
+			a2: { id: 'a2', role: 'assistant', content: 'ok', parentId: 'u2', childrenIds: [] }
+		};
+
+		expect(pruneSteerBranches(messages)).toBe(true);
+		expect(messages.tip.childrenIds).toEqual(['u2']);
+		expect(messages.u2.childrenIds).toEqual([]);
+		// The nodes stay in history so the chip/annotation fallback can render.
+		expect(messages.s1.content).toBe('steer me');
+		expect(messages.s2.meta.status).toBe('delivered');
+	});
+
+	it('is a no-op for normal histories', () => {
+		const messages = {
+			u1: { id: 'u1', role: 'user', content: 'hi', childrenIds: ['a1'] },
+			a1: { id: 'a1', role: 'assistant', content: 'hello', parentId: 'u1', childrenIds: [] }
+		};
+
+		expect(pruneSteerBranches(messages)).toBe(false);
+		expect(messages.u1.childrenIds).toEqual(['a1']);
+	});
+});
+
+describe('busy-turn submission routing', () => {
+	const base = { delivery: 'steer' as const, hasFiles: false, enableMessageQueue: true };
+
+	it('steers by default while a turn runs', () => {
+		expect(planBusySubmit(base)).toBe('steer');
+	});
+
+	it('queues when the user chose queue-by-default', () => {
+		expect(planBusySubmit({ ...base, delivery: 'queue' })).toBe('queue');
+	});
+
+	it('never steers attachments', () => {
+		expect(planBusySubmit({ ...base, hasFiles: true })).toBe('queue');
+		expect(planBusySubmit({ ...base, hasFiles: true, enableMessageQueue: false })).toBe(
+			'interrupt'
+		);
+	});
+
+	it('falls back to queue or interrupt when the steer request fails', () => {
+		expect(planBusySubmit({ ...base, steerOutcome: 'failed' })).toBe('queue');
+		expect(planBusySubmit({ ...base, steerOutcome: 'failed', enableMessageQueue: false })).toBe(
+			'interrupt'
+		);
+	});
+
+	it('submits normally only after the server reports no active task', () => {
+		expect(planBusySubmit({ ...base, steerOutcome: 'inactive' })).toBe('submit');
+		expect(planBusySubmit({ ...base, steerOutcome: 'queued' })).toBe('steer');
 	});
 });

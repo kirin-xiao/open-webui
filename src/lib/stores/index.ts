@@ -334,6 +334,8 @@ type Settings = {
 	splitLargeDeltas?: boolean;
 	chatDirection?: 'LTR' | 'RTL' | 'auto';
 	ctrlEnterToSend?: boolean;
+	enableMessageQueue?: boolean;
+	userMessageDelivery?: 'steer' | 'queue';
 	keyboardShortcuts?: boolean;
 	chatHoverPreview?: boolean;
 	renderMarkdownInPreviews?: boolean;

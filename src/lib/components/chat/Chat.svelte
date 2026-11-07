@@ -95,7 +95,9 @@
 	import {
 		collectPendingSteers,
 		collectUnannotatedDeliveredSteers,
-		mergeSubagentCompletionStates
+		mergeSubagentCompletionStates,
+		planBusySubmit,
+		pruneSteerBranches
 	} from './Messages/steers';
 
 	import {
@@ -1502,8 +1504,15 @@
 			history.currentId = incoming.currentId;
 			autoScrollToBottom();
 		}
+		// A reload carries the backend-rebuilt `childrenIds`, which include steer
+		// nodes anchored at the tip. Never let one become a visible branch.
+		pruneSteerBranches(history.messages);
 		history = history;
 	};
+
+	// Monotonic token so an older `/subagents` response cannot clobber a newer
+	// one (two refreshes can overlap around a turn boundary and reconnect).
+	let subagentStatesRequest = 0;
 
 	/**
 	 * Reconcile background subagent rows with persisted child state. The
@@ -1512,8 +1521,10 @@
 	 */
 	const refreshSubagentStates = async (id: string) => {
 		if (!id || isTemporaryChatId(id)) return;
+		const requestId = ++subagentStatesRequest;
 		try {
 			const children = await getSubagentChatsByParentId(localStorage.token, id);
+			if (requestId !== subagentStatesRequest) return;
 			if ($chatId !== id || isTemporaryChatId(id)) return;
 			const next = new Map<string, string>();
 			for (const child of children ?? []) {
@@ -2064,6 +2075,9 @@
 		joinedChatId = '';
 		syncChatRoom($socket, $chatId, $temporaryChatEnabled);
 		const id = $chatId;
+		// A reconnect can have missed `subagent:created`/completion events. This is
+		// independent of the task lookup below, so do not skip it when that fails.
+		void refreshSubagentStates(id);
 		const tasks = await getTaskIdsByChatId(localStorage.token, id).catch(() => null);
 		if ($chatId !== id || !tasks) return;
 		taskIds = tasks.task_ids?.length ? tasks.task_ids : null;
@@ -2072,8 +2086,6 @@
 			const loaded = await loadChat();
 			if (loaded && $chatId === id) await processNextInQueue(id);
 		}
-		// A reconnect can have missed `subagent:created`/completion events.
-		void refreshSubagentStates(id);
 	};
 
 	onMount(() => {
@@ -3196,6 +3208,8 @@
 				// Sanitize history: repair orphaned references and structurally-malformed
 				// nodes from failed regenerations (#24424, #24157, #20474)
 				sanitizeHistory(history);
+				// Steers are model-input only; drop their backend-built branch links.
+				pruneSteerBranches(history.messages);
 
 				chatTitle.set(chatContent.title);
 
@@ -4170,6 +4184,15 @@
 		return _chatId;
 	};
 
+	// A double-submit (Enter twice before the first response lands) must not
+	// create two identical steer records. Share the in-flight request per
+	// chat+content; a different prompt still gets its own steer.
+	type SteerOutcome = 'queued' | 'inactive' | 'failed' | 'duplicate';
+	let steeringSubmission: {
+		key: string;
+		promise: Promise<SteerOutcome>;
+	} | null = null;
+
 	/**
 	 * Send a user message as a steer for the active turn.
 	 *
@@ -4177,47 +4200,62 @@
 	 * the caller should send normally instead of queueing for a turn that is
 	 * already over. `failed` keeps the existing queue fallback.
 	 */
-	const submitSteer = async (userPrompt: string): Promise<'queued' | 'inactive' | 'failed'> => {
+	const submitSteer = (userPrompt: string): Promise<SteerOutcome> => {
 		const id = $chatId;
-		if (!id || isTemporaryChatId(id) || !String(userPrompt).trim()) return 'failed';
-
 		const content = String(userPrompt);
-		try {
-			const result = await steerChatById(
-				localStorage.token,
-				id,
-				content,
-				selectedModels.find((modelId) => modelId) ?? undefined
-			);
-			if (!$chatId || $chatId !== id) return 'failed';
-			if (result?.reason === 'no_active_task') return 'inactive';
-			if (!result?.queued || !result.id) return 'failed';
+		if (!id || isTemporaryChatId(id) || !content.trim()) return Promise.resolve('failed');
 
-			// Optimistically add the durable node so the queued chip appears
-			// immediately. It is anchored without touching `currentId` or the
-			// parent's children, so the live branch is never forked.
-			const steerId = result.id;
-			history.messages[steerId] = {
-				id: steerId,
-				parentId: history.currentId ?? null,
-				childrenIds: [],
-				role: 'user',
-				content,
-				timestamp: Math.floor(Date.now() / 1000),
-				models: selectedModels,
-				meta: {
-					internal: true,
-					type: 'steer',
-					source: 'user',
-					status: 'pending'
-				}
-			};
-			history = history;
-			return 'queued';
-		} catch (error) {
-			console.warn('[steer] failed to queue steering message', error);
-			return 'failed';
-		}
+		const key = `${id}:${content}`;
+		// The first in-flight submission owns this message. Absorb an identical
+		// double-submit instead of creating a second steer or queued copy.
+		if (steeringSubmission?.key === key) return Promise.resolve('duplicate');
+
+		const promise = (async (): Promise<SteerOutcome> => {
+			try {
+				const result = await steerChatById(
+					localStorage.token,
+					id,
+					content,
+					selectedModels.find((modelId) => modelId) ?? undefined,
+					// Idempotency key: a retried request reuses the same node.
+					uuidv4()
+				);
+				if (!$chatId || $chatId !== id) return 'failed';
+				if (result?.reason === 'no_active_task') return 'inactive';
+				if (!result?.queued || !result.id) return 'failed';
+
+				// Optimistically add the durable node so the queued chip appears
+				// immediately. It is anchored without touching `currentId` or the
+				// parent's children, so the live branch is never forked.
+				const steerId = result.id;
+				history.messages[steerId] = {
+					id: steerId,
+					parentId: history.currentId ?? null,
+					childrenIds: [],
+					role: 'user',
+					content,
+					timestamp: Math.floor(Date.now() / 1000),
+					models: selectedModels,
+					meta: {
+						internal: true,
+						type: 'steer',
+						source: 'user',
+						status: 'pending'
+					}
+				};
+				history = history;
+				return 'queued';
+			} catch (error) {
+				console.warn('[steer] failed to queue steering message', error);
+				return 'failed';
+			}
+		})();
+
+		steeringSubmission = { key, promise };
+		void promise.finally(() => {
+			if (steeringSubmission?.promise === promise) steeringSubmission = null;
+		});
+		return promise;
 	};
 
 	const submitHandler = async (
@@ -4391,10 +4429,11 @@
 			if (bridgeRequest) return { status: 'deferred' };
 
 			const delivery = $settings?.userMessageDelivery === 'queue' ? 'queue' : 'steer';
-			// Attachments have no steer representation; they always use the queue.
-			const canSteer = delivery === 'steer' && files.length === 0;
-			let steerInactive = false;
-			if (canSteer) {
+			const enableMessageQueue = $settings?.enableMessageQueue ?? true;
+			const hasFiles = files.length > 0;
+			let plan = planBusySubmit({ delivery, hasFiles, enableMessageQueue });
+
+			if (plan === 'steer') {
 				const outcome = await submitSteer(userPrompt);
 				if (outcome === 'queued') {
 					messageInput?.setText('');
@@ -4402,30 +4441,48 @@
 					files = [];
 					return { status: 'rejected' };
 				}
-				if (outcome === 'inactive') {
+				if (outcome === 'duplicate') {
+					// The in-flight submission clears the input and owns the reply.
+					return { status: 'rejected' };
+				}
+				plan = planBusySubmit({
+					delivery,
+					hasFiles,
+					enableMessageQueue,
+					steerOutcome: outcome
+				});
+				if (plan === 'submit') {
+					// The server saw no active task: local taskIds were stale. Drop
+					// them, and reconcile any unfinished assistant leaf before
+					// sending so the new turn does not fork under a dead response.
 					taskIds = null;
-					steerInactive = true;
+					if (isGenerating) {
+						const loaded = await loadChat();
+						if (!loaded) return { status: 'rejected' };
+						// The reconcile restores the saved draft; this submission
+						// had no attachments, so do not pick unrelated ones up.
+						files = [];
+					}
 				}
 			}
 
-			if (!steerInactive) {
-				if (delivery === 'queue' || ($settings?.enableMessageQueue ?? true)) {
-					// Enqueue the request
-					const _files = structuredClone(files);
-					chatRequestQueues.update((q) => ({
-						...q,
-						[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
-					}));
-					// Clear input
-					messageInput?.setText('');
-					prompt = '';
-					files = [];
-					return { status: 'rejected' };
-				} else {
-					// Interrupt: stop current generation and proceed
-					await stopResponse();
-					await tick();
-				}
+			if (plan === 'queue') {
+				// Enqueue the request
+				const _files = structuredClone(files);
+				chatRequestQueues.update((q) => ({
+					...q,
+					[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
+				}));
+				// Clear input
+				messageInput?.setText('');
+				prompt = '';
+				files = [];
+				return { status: 'rejected' };
+			}
+			if (plan === 'interrupt') {
+				// Interrupt: stop current generation and proceed
+				await stopResponse();
+				await tick();
 			}
 		}
 

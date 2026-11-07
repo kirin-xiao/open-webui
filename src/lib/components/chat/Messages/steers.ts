@@ -122,6 +122,36 @@ export function isSteerMessage(message: HistoryMessage | null | undefined): bool
 	return typeof message.content === 'string' && message.content.trim().length > 0;
 }
 
+/**
+ * Remove steer nodes from every message's `childrenIds`.
+ *
+ * The durable enqueue anchors a steer at the current tip, and the backend
+ * rebuilds `childrenIds` from `parentId`. That would make a steer a sibling
+ * branch of the next user turn, exposing an undelivered steer as a normal user
+ * bubble through the branch controls. Steers are model-input only, so the
+ * client prunes them from the visible tree after every load/merge.
+ *
+ * Returns true when anything changed (so callers can reassign the history).
+ */
+export function pruneSteerBranches(messages: HistoryMessages): boolean {
+	if (!messages) return false;
+	let changed = false;
+	for (const message of Object.values(messages)) {
+		if (!message || !Array.isArray(message.childrenIds)) continue;
+		const children = message.childrenIds as unknown[];
+		const kept = children.filter((childId) => {
+			if (typeof childId !== 'string') return true;
+			const child = messages[childId];
+			return !(child && child.role === 'user' && isSteerMeta(child.meta));
+		});
+		if (kept.length !== children.length) {
+			message.childrenIds = kept;
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 function steerStatus(meta: Record<string, unknown>): SteerStatus {
 	const status = typeof meta.status === 'string' ? meta.status : '';
 	if (status === 'delivered') return 'delivered';
@@ -258,4 +288,34 @@ export function hasPreSteerNote(meta: Record<string, unknown> | null | undefined
 	if (!meta) return false;
 	if (meta.pre_steer === true) return true;
 	return steerEntriesFromAnnotation(meta.steers).some((entry) => entry.preSteer);
+}
+
+export type BusySubmitPlan = 'steer' | 'queue' | 'interrupt' | 'submit';
+
+/**
+ * Decide what to do with a user submission while a turn is already active.
+ *
+ * `steerOutcome` is undefined until the steer endpoint has been tried; after it
+ * runs, `queued` means the message is handled, `inactive` means the server no
+ * longer has an active task (so the caller may submit normally after
+ * reconciling stale state), and `failed` falls back to queue/interrupt.
+ *
+ * Attachments have no steer representation, so they never use the steer path.
+ */
+export function planBusySubmit({
+	delivery,
+	hasFiles,
+	enableMessageQueue,
+	steerOutcome
+}: {
+	delivery: 'steer' | 'queue';
+	hasFiles: boolean;
+	enableMessageQueue: boolean;
+	steerOutcome?: 'queued' | 'inactive' | 'failed';
+}): BusySubmitPlan {
+	if (steerOutcome === 'queued') return 'steer';
+	if (steerOutcome === 'inactive') return 'submit';
+	if (steerOutcome === undefined && delivery === 'steer' && !hasFiles) return 'steer';
+	if (delivery === 'queue' || enableMessageQueue) return 'queue';
+	return 'interrupt';
 }
