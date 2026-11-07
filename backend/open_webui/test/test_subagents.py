@@ -582,7 +582,11 @@ async def test_background_completion_injects_legacy_compatible_synthetic(monkeyp
     await task
 
     messages = harness._db_chat.chat['history']['messages']
-    injected = [m for m in messages.values() if (m.get('meta') or {}).get('type') == 'subagent']
+    injected = [
+        m
+        for m in messages.values()
+        if (m.get('meta') or {}).get('type') == 'steer' and (m.get('meta') or {}).get('source') == 'subagent'
+    ]
     assert len(injected) == 1
     meta = injected[0]['meta']
     assert meta['source'] == 'subagent'
@@ -609,7 +613,11 @@ async def test_background_failure_preserves_child_id_and_error_state(monkeypatch
     await task  # run_background swallows the failure into an error result
 
     messages = harness._db_chat.chat['history']['messages']
-    injected = [m for m in messages.values() if (m.get('meta') or {}).get('type') == 'subagent']
+    injected = [
+        m
+        for m in messages.values()
+        if (m.get('meta') or {}).get('type') == 'steer' and (m.get('meta') or {}).get('source') == 'subagent'
+    ]
     assert len(injected) == 1
     assert injected[0]['meta']['childID'] == child_id
     assert injected[0]['meta']['state'] == 'error'
@@ -917,7 +925,11 @@ async def test_background_result_anchors_to_current_tip_not_completed_assistant(
     await task
 
     messages = harness._db_chat.chat['history']['messages']
-    injected = [m for m in messages.values() if (m.get('meta') or {}).get('type') == 'subagent']
+    injected = [
+        m
+        for m in messages.values()
+        if (m.get('meta') or {}).get('type') == 'steer' and (m.get('meta') or {}).get('source') == 'subagent'
+    ]
     assert len(injected) == 1
     # Anchored on the live tip, not the completed assistant.
     assert injected[0]['parentId'] == 'followup-assistant'
@@ -982,12 +994,16 @@ async def test_two_background_results_stay_siblings_and_both_drain(monkeypatch):
     await second_task
 
     messages = harness._db_chat.chat['history']['messages']
-    injected = [m for m in messages.values() if (m.get('meta') or {}).get('type') == 'subagent']
+    injected = [
+        m
+        for m in messages.values()
+        if (m.get('meta') or {}).get('type') == 'steer' and (m.get('meta') or {}).get('source') == 'subagent'
+    ]
     assert len(injected) == 2
     # Both are siblings under the live tip; neither chains onto the other.
     assert {m['parentId'] for m in injected} == {'followup-assistant'}
     assert all(m['meta']['status'] == 'pending' for m in injected)
-    assert messages['followup-assistant']['childrenIds'] == [m['id'] for m in injected]
+    assert set(messages['followup-assistant']['childrenIds']) == {m['id'] for m in injected}
     assert messages['completed-assistant']['childrenIds'] == ['followup-user']
 
 
@@ -1427,8 +1443,8 @@ async def test_sessionid_continuation_inherits_child_files(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sessionid_continuation_rejects_running_child(monkeypatch):
-    """Continuing a child whose turn is still running must not race its history."""
+async def test_sessionid_steers_running_child_instead_of_rejecting(monkeypatch):
+    """Steering a running child queues the instruction rather than racing it."""
     harness = Harness(monkeypatch)
     await harness.seed_parent_via_insert('root')
     child = ChatModelLike('child-1', meta={'internal': True, 'type': 'subagent', 'parent_chat_id': 'root'})
@@ -1458,9 +1474,19 @@ async def test_sessionid_continuation_rejects_running_child(monkeypatch):
 
     result = await run_delegate(harness, parent_chat_id='root', session_id='child-1', prompt='again')
 
-    assert result == 'Error: sessionID "child-1" is still running; wait for it to finish before continuing.'
-    # The child was not mutated and no child turn was started.
-    assert set(child.chat['history']['messages']) == {'old-user', 'running-assistant'}
+    payload = json.loads(result)
+    assert payload['status'] == 'steer_queued'
+    assert payload['sessionID'] == 'child-1'
+    # The child was not given a new turn; the live run gets a pending steer.
+    added = set(child.chat['history']['messages']) - {'old-user', 'running-assistant'}
+    assert len(added) == 1
+    steer = child.chat['history']['messages'][added.pop()]
+    assert steer['meta']['type'] == 'steer'
+    assert steer['meta']['source'] == 'parent'
+    assert steer['meta']['childID'] == 'child-1'
+    assert steer['meta']['status'] == 'pending'
+    assert 'again' in steer['content']
+    assert child.meta['state'] == 'steer_queued'
     assert harness.completions == []
 
 
