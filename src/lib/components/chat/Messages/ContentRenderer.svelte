@@ -98,6 +98,8 @@
 	export let editCodeBlock = true;
 	export let topPadding = false;
 	export let allowEmbeds = false;
+	/** Shared/read-only chats render inline subagent links as plain text. */
+	export let linkable = true;
 
 	export let onSave = (e) => {};
 	export let onSourceClick = (e) => {};
@@ -298,6 +300,7 @@
 			{compactPreview}
 			{done}
 			{allowEmbeds}
+			{linkable}
 			{editCodeBlock}
 			{topPadding}
 			{sourceIds}

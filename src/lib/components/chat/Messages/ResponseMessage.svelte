@@ -65,7 +65,7 @@
 	import ContentRenderer from './ContentRenderer.svelte';
 	import ContextCompactionLabel from './ContextCompactionLabel.svelte';
 	import SteerBlock from './SteerBlock.svelte';
-	import { hasPreSteerNote, steerEntriesFromAnnotation } from './steers';
+	import { hasPreSteerNote } from './steers';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
@@ -137,8 +137,6 @@
 	export let history;
 	export let messageId;
 	$: compactionStatus = $contextCompactions?.[messageId];
-	// Consumed steers are annotated on the assistant message by the middleware.
-	$: consumedSteers = steerEntriesFromAnnotation(message?.meta?.steers);
 	$: preSteerNote = hasPreSteerNote(message?.meta);
 	export let selectedModels = [];
 
@@ -731,13 +729,8 @@
 				<ContextCompactionLabel summary={message.contextSummary} {compactPreview} />
 			{/if}
 
-			{#if consumedSteers.length > 0 || preSteerNote}
-				<SteerBlock
-					steers={consumedSteers}
-					showPreSteerNote={preSteerNote}
-					{compactPreview}
-					linkable={!readOnly}
-				/>
+			{#if preSteerNote}
+				<SteerBlock steers={[]} showPreSteerNote={true} {compactPreview} linkable={!readOnly} />
 			{/if}
 
 			<div>
@@ -908,6 +901,7 @@
 									{topPadding}
 									done={message?.done ?? false}
 									allowEmbeds={!readOnly}
+									linkable={!readOnly}
 									{model}
 									onTaskClick={async (e) => {
 										console.log(e);

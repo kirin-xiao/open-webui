@@ -76,6 +76,11 @@ export type OutputDisplayItem =
 			type: 'context_compaction';
 			id: string;
 			summary: string;
+	  }
+	| {
+			type: 'steering';
+			id: string;
+			item: OutputItem;
 	  };
 
 type ResponseStreamEvent = {
@@ -550,6 +555,21 @@ export function buildOutputDisplayItems(
 				type: 'context_compaction',
 				id: item.id ?? `context-compaction-${index}`,
 				summary: typeof item.summary === 'string' ? item.summary : ''
+			});
+			return;
+		}
+
+		if (item.type === 'open_webui:steering') {
+			// A delivered steer is display-only state embedded at the exact
+			// boundary the model saw it. Keep it out of the tool-detail group so
+			// it renders as its own normal message / subagent row.
+			const text = typeof item.text === 'string' ? item.text : '';
+			if (!text.trim()) return;
+			flushDetails();
+			displayItems.push({
+				type: 'steering',
+				id: item.id ?? `steering-${index}`,
+				item
 			});
 			return;
 		}

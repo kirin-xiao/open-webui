@@ -12,6 +12,7 @@ import {
 	repairSteerCurrentId,
 	steerEntriesFromAnnotation,
 	steerEntryFromMessage,
+	steerIdsInOutput,
 	subagentStatesToCompleted
 } from './steers';
 
@@ -69,6 +70,30 @@ describe('steer history nodes', () => {
 			}
 		});
 		expect(after).toEqual([]);
+	});
+
+	it('does not show a fallback bubble for a delivered steer already rendered inline', () => {
+		const delivered = steerNode('s1', 'focus on tests', { status: 'delivered' });
+		const messages = {
+			s1: delivered,
+			a1: {
+				id: 'a1',
+				role: 'assistant',
+				content: 'done',
+				output: [
+					{
+						type: 'open_webui:steering',
+						id: 'steering-s1',
+						steer_id: 's1',
+						source: 'user',
+						text: 'focus on tests'
+					}
+				]
+			}
+		};
+
+		expect(steerIdsInOutput(messages)).toEqual(new Set(['s1']));
+		expect(collectUnannotatedDeliveredSteers(messages)).toEqual([]);
 	});
 
 	it('does not duplicate a promoted steer that is rendered inline', () => {

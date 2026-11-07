@@ -38,6 +38,7 @@ type HistoryMessage = {
 	parentId?: unknown;
 	childrenIds?: unknown;
 	timestamp?: unknown;
+	output?: unknown;
 	meta?: Record<string, unknown> | null;
 };
 
@@ -417,12 +418,36 @@ function annotatedSteers(messages: HistoryMessages): { texts: Set<string>; ids: 
 }
 
 /**
+ * Steer ids already rendered inline as `open_webui:steering` output parts.
+ *
+ * The part is authoritative for display: it sits at the boundary where the
+ * model saw the steer. A delivered durable steer node must not also appear as
+ * a fallback bubble/chip for the same id.
+ */
+export function steerIdsInOutput(messages: HistoryMessages): Set<string> {
+	const ids = new Set<string>();
+	for (const message of Object.values(messages ?? {})) {
+		if (message?.role !== 'assistant' || !Array.isArray(message.output)) continue;
+		for (const item of message.output) {
+			if (!item || typeof item !== 'object') continue;
+			const record = item as Record<string, unknown>;
+			if (record.type !== 'open_webui:steering') continue;
+			if (typeof record.steer_id === 'string' && record.steer_id) {
+				ids.add(record.steer_id);
+			}
+		}
+	}
+	return ids;
+}
+
+/**
  * Delivered steer nodes that are not yet reflected by an assistant
  * `meta.steers` annotation. Used as the backward-compatible fallback when the
  * middleware has not annotated the response (or the chat predates Slice A).
  */
 export function collectUnannotatedDeliveredSteers(messages: HistoryMessages): SteerEntry[] {
 	const annotated = annotatedSteers(messages);
+	const inlined = steerIdsInOutput(messages);
 	return collectSteerNodes(messages).filter(
 		(entry) =>
 			entry.status === 'delivered' &&
@@ -431,6 +456,7 @@ export function collectUnannotatedDeliveredSteers(messages: HistoryMessages): St
 			// UserMessage. Showing it again as a queued/delivered chip would
 			// duplicate the block.
 			!isPromotedSteer(messages, entry.id) &&
+			!inlined.has(entry.id) &&
 			!annotated.ids.has(entry.id) &&
 			!annotated.texts.has(entry.content)
 	);

@@ -561,3 +561,54 @@ def test_stateful_guard_and_annotation_wiring():
             isinstance(argument, ast.Name) and argument.id == 'consumed_steer_annotations'
             for argument in finalizer.args
         )
+
+
+def test_steering_output_parts_are_display_only_and_follow_the_boundary():
+    content = '<subagent sessionID="child-1" state="completed">\nCHILD_TIP\n</subagent>'
+    annotation = {'id': 'steer-1', 'source': 'subagent', 'content': content}
+    steer = {
+        'id': 'steer-1',
+        'content': content,
+        'meta': {
+            'internal': True,
+            'type': 'steer',
+            'source': 'subagent',
+            'childID': 'child-1',
+            'description': 'Child marker',
+            'state': 'completed',
+        },
+    }
+
+    parts = middleware._steering_output_parts(
+        [annotation], [steer], SimpleNamespace(id='user-1', name='Ada')
+    )
+
+    assert len(parts) == 1
+    part = parts[0]
+    assert part['type'] == 'open_webui:steering'
+    assert part['role'] == 'user'
+    assert part['steer_id'] == 'steer-1'
+    assert part['source'] == 'subagent'
+    assert part['text'] == content
+    assert part['user'] == {'id': 'user-1', 'name': 'Ada'}
+    assert part['childID'] == 'child-1'
+    assert part['description'] == 'Child marker'
+    assert part['state'] == 'completed'
+
+    # Appended after the tool result, not inside the tool batch.
+    output = [
+        {'type': 'function_call', 'call_id': 'call-1'},
+        {'type': 'function_call_output', 'call_id': 'call-1'},
+        {'type': 'message'},
+    ]
+    appended = middleware._append_steering_output_parts(output, parts)
+    assert appended == [part]
+    assert output[-1] is part
+    assert [item['type'] for item in output[:3]] == [
+        'function_call',
+        'function_call_output',
+        'message',
+    ]
+
+    # A retry/replay must not duplicate the same steer part.
+    assert middleware._append_steering_output_parts(output, parts) == []

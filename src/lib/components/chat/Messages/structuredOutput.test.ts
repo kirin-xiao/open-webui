@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	buildOutputDisplayItems,
 	collectCompletedSubagentIds,
+	getOutputText,
 	parseSubagentResult,
 	subagentResultHasPreSteer,
 	type OutputDetailToken,
@@ -280,5 +281,69 @@ describe('collectCompletedSubagentIds', () => {
 		expect(ids.has('steer-child')).toBe(true);
 		expect(ids.has('stale-child')).toBe(false);
 		expect(ids.has('instruction-child')).toBe(false);
+	});
+});
+
+describe('buildOutputDisplayItems steering parts', () => {
+	it('places a consumed steer between the two tool batches', () => {
+		const output: OutputItem[] = [
+			{
+				type: 'message',
+				content: [{ type: 'output_text', text: 'I will sleep first.' }]
+			},
+			{
+				type: 'function_call',
+				name: 'sleep_seconds',
+				call_id: 'call-1',
+				status: 'completed',
+				arguments: JSON.stringify({ seconds: 10 })
+			},
+			{
+				type: 'function_call_output',
+				call_id: 'call-1',
+				output: [{ type: 'output_text', text: 'slept' }]
+			},
+			{
+				type: 'open_webui:steering',
+				id: 'steering-s1',
+				steer_id: 's1',
+				source: 'user',
+				role: 'user',
+				text: 'SLEEP_TWICE'
+			},
+			{
+				type: 'function_call',
+				name: 'sleep_seconds',
+				call_id: 'call-2',
+				status: 'completed',
+				arguments: JSON.stringify({ seconds: 10 })
+			},
+			{
+				type: 'function_call_output',
+				call_id: 'call-2',
+				output: [{ type: 'output_text', text: 'slept' }]
+			},
+			{
+				type: 'message',
+				content: [{ type: 'output_text', text: 'ok' }]
+			}
+		];
+
+		const items = buildOutputDisplayItems(output);
+		const steering = items.findIndex((item) => item.type === 'steering');
+		const finalMessage = items.findLastIndex((item) => item.type === 'message');
+		const steeringItem = items[steering];
+
+		expect(steering).toBeGreaterThan(-1);
+		// The steering bubble is after the first tool group and before the final answer.
+		expect(items[steering - 1]?.type).toMatch(/^detail_/);
+		expect(steering).toBeLessThan(finalMessage);
+		expect(steeringItem.type).toBe('steering');
+		if (steeringItem.type === 'steering') {
+			expect(steeringItem.item.steer_id).toBe('s1');
+		}
+
+		// Display-only: copy/export text never includes the steering content.
+		expect(getOutputText(output)).not.toContain('SLEEP_TWICE');
 	});
 });

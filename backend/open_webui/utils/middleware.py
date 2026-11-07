@@ -3462,6 +3462,73 @@ def _steer_annotations(steers: list[dict] | None) -> list[dict]:
     return annotations
 
 
+def _steering_output_parts(
+    annotations: list[dict] | None,
+    steers: list[dict] | None,
+    user,
+) -> list[dict]:
+    """Build display-only output parts for steers consumed at a boundary.
+
+    The part is ordered in the assistant message's `output` exactly where the
+    model saw the steer (after the complete tool batch), so the transcript can
+    render a normal user message between the two assistant steps. It is a
+    display/audit part: `convert_output_to_messages` ignores the
+    `open_webui:steering` namespace, so it never re-enters a provider request.
+    """
+    by_id = {
+        steer.get('id'): steer
+        for steer in (steers or [])
+        if isinstance(steer, dict) and steer.get('id')
+    }
+    user_id = _steer_user_id(user)
+    user_name = getattr(user, 'name', None) or ''
+    parts: list[dict] = []
+    for annotation in annotations or []:
+        if not isinstance(annotation, dict):
+            continue
+        steer_id = annotation.get('id')
+        text = _steer_text(annotation.get('content'))
+        if not steer_id or not text.strip():
+            continue
+        steer = by_id.get(steer_id) or {}
+        meta = steer.get('meta') if isinstance(steer.get('meta'), dict) else {}
+        part = {
+            'type': 'open_webui:steering',
+            'id': f'steering-{steer_id}',
+            'steer_id': steer_id,
+            'source': annotation.get('source') or _steer_text(meta.get('source')) or 'user',
+            'role': 'user',
+            'text': text,
+            'timestamp': time.time(),
+            'status': 'delivered',
+        }
+        if user_id:
+            part['user'] = {'id': user_id, 'name': user_name}
+        for key in ('childID', 'description', 'state', 'pre_steer'):
+            if meta.get(key) is not None:
+                part[key] = meta[key]
+        parts.append(part)
+    return parts
+
+
+def _append_steering_output_parts(output: list[dict], parts: list[dict]) -> list[dict]:
+    """Append steering parts to a round's output, skipping duplicates by steer id."""
+    existing = {
+        item.get('steer_id')
+        for item in output
+        if isinstance(item, dict) and item.get('type') == 'open_webui:steering'
+    }
+    appended: list[dict] = []
+    for part in parts:
+        steer_id = part.get('steer_id')
+        if not steer_id or steer_id in existing:
+            continue
+        output.append(part)
+        existing.add(steer_id)
+        appended.append(part)
+    return appended
+
+
 def _merge_steer_annotations(existing, consumed) -> list[dict]:
     """Merge annotation lists by steer id, preserving first-seen order."""
     merged: list[dict] = []
@@ -6908,6 +6975,31 @@ async def streaming_chat_response_handler(response, ctx):
                             delivery_chat_id=boundary_steer_chat_id,
                         )
                         consumed_steer_annotations.extend(steer_annotations)
+
+                        # Render each delivered steer at the boundary where the
+                        # model saw it. The part lives in the assistant output
+                        # (display-only) and the same snapshot tells the client
+                        # to clear its optimistic pending bubble atomically.
+                        steering_parts = _steering_output_parts(
+                            steer_annotations, boundary_steers, user
+                        )
+                        appended_steering_parts = (
+                            _append_steering_output_parts(output, steering_parts)
+                            if steering_parts
+                            else []
+                        )
+                        if appended_steering_parts:
+                            await event_emitter(
+                                {
+                                    'type': 'chat:completion',
+                                    'data': {
+                                        'output': full_output(),
+                                        'delivered_steer_ids': [
+                                            part['steer_id'] for part in appended_steering_parts
+                                        ],
+                                    },
+                                }
+                            )
 
                         if isinstance(res, StreamingResponse):
                             # Reset response-relative output indices; keep prior output as the UI history prefix.

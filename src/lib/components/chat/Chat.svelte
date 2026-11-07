@@ -315,7 +315,11 @@
 
 		const messages = createMessagesList(history, history.currentId);
 		const threshold =
-			getContextThreshold(atSelectedModel?.id ?? selectedModels.find((id) => id), $models, params) ??
+			getContextThreshold(
+				atSelectedModel?.id ?? selectedModels.find((id) => id),
+				$models,
+				params
+			) ??
 			serverContextUsage?.threshold ??
 			null;
 		const systemTokens = estimateTokens($settings?.system ?? '');
@@ -3761,6 +3765,20 @@
 			message.sources = sources;
 		}
 
+		// Boundary steering: the same snapshot that carries the inline steering
+		// part names the records it consumed. Clear the optimistic pending bubble
+		// live instead of waiting for a turn-end refresh.
+		const deliveredSteerIds = data.delivered_steer_ids;
+		if (Array.isArray(deliveredSteerIds) && deliveredSteerIds.length > 0) {
+			for (const steerId of deliveredSteerIds) {
+				const steer = history.messages[steerId];
+				if (steer?.meta?.internal === true && steer.meta.type === 'steer') {
+					steer.meta = { ...steer.meta, status: 'delivered' };
+				}
+			}
+			history = history;
+		}
+
 		if (choices && !output) {
 			if (choices[0]?.message?.content) {
 				// Non-stream response
@@ -4237,6 +4255,8 @@
 					content,
 					timestamp: Math.floor(Date.now() / 1000),
 					models: selectedModels,
+					user: { id: $user?.id, name: $user?.name },
+					user_id: $user?.id,
 					meta: {
 						internal: true,
 						type: 'steer',

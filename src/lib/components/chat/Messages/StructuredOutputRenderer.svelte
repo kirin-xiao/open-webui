@@ -5,6 +5,8 @@
 	import Image from '$lib/components/common/Image.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import ToolOutputFile from './ToolOutputFile.svelte';
+	import SubagentResultRow from './SubagentResultRow.svelte';
+	import SteeringMessage from './SteeringMessage.svelte';
 	import { resolveChatMessageToolCall } from '$lib/apis/chats';
 	import { settings, subagentCompletions, subagentSessions } from '$lib/stores';
 	import { toast } from 'svelte-sonner';
@@ -34,6 +36,8 @@
 	export let topPadding = false;
 	export let allowEmbeds = false;
 	export let sourceIds: string[] = [];
+	/** Shared/read-only chats render inline subagent links as plain text. */
+	export let linkable = true;
 	export let formatMessageContent: (content: string) => string = (content) => content;
 	export let onSave: any = () => {};
 	export let onSourceClick: any = () => {};
@@ -205,6 +209,22 @@
 				{/each}
 			</div>
 		</ConsecutiveDetailsGroup>
+	{:else if displayItem.type === 'steering'}
+		{#if String(displayItem.item.source ?? '') === 'subagent'}
+			<SubagentResultRow
+				content={String(displayItem.item.text ?? '')}
+				result={{
+					source: 'subagent',
+					childID: typeof displayItem.item.childID === 'string' ? displayItem.item.childID : '',
+					description:
+						typeof displayItem.item.description === 'string' ? displayItem.item.description : '',
+					state: typeof displayItem.item.state === 'string' ? displayItem.item.state : ''
+				}}
+				{linkable}
+			/>
+		{:else}
+			<SteeringMessage text={String(displayItem.item.text ?? '')} />
+		{/if}
 	{:else if displayItem.type === 'file'}
 		{#if displayItem.item?.displayed || $settings?.terminalFileDisplay === 'inline'}
 			<ToolOutputFile item={displayItem.item} {chatId} />
