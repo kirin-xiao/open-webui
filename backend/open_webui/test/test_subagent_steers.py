@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from open_webui.models.chats import ChatModel
+from open_webui.models.chats import ChatModel, Chats
 from open_webui.routers.chats import get_chat_subagents_by_id
 from open_webui.test.subagent_test_utils import (
     FakeChatMessages,
@@ -341,6 +341,59 @@ async def _finish_registered_tasks(harness):
 # ---------------------------------------------------------------------------
 
 
+def test_merge_history_keeps_steers_out_of_branch_children():
+    """A steer keeps its anchor but never becomes a branch sibling.
+
+    `update_chat_by_id` runs `merge_history` twice, so the guard must hold on a
+    follow-up merge as well. Normal messages, legacy subagent notices, and timer
+    nodes must still be linked exactly as before.
+    """
+    existing = _parent_history()
+    next_user = {
+        'id': 'next-user',
+        'parentId': 'tip',
+        'childrenIds': [],
+        'role': 'user',
+        'content': 'next question',
+        'timestamp': 11,
+    }
+    timer = {
+        'id': 'timer-1',
+        'parentId': 'tip',
+        'childrenIds': [],
+        'role': 'user',
+        'content': 'timer fired',
+        'meta': {'internal': True, 'type': 'timer'},
+        'timestamp': 12,
+    }
+    incoming = {
+        'messages': {
+            'steer-1': _steer_message('steer-1'),
+            'next-user': next_user,
+            'legacy-result': _pending_result('legacy-result'),
+            'timer-1': timer,
+        }
+    }
+
+    merged = Chats.merge_history(existing, incoming)
+    children = merged['messages']['tip']['childrenIds']
+
+    assert 'steer-1' not in children
+    assert 'next-user' in children
+    assert 'legacy-result' in children
+    assert 'timer-1' in children
+    # The steer stays readable and keeps its anchor for drain/update.
+    assert merged['messages']['steer-1']['parentId'] == 'tip'
+    assert merged['messages']['steer-1']['content'] == 'steer steer-1'
+    assert merged['currentId'] == 'tip'
+
+    # Second pass mirrors `update_chat_by_id`'s final normalisation merge.
+    again = Chats.merge_history(merged, {})
+    assert 'steer-1' not in again['messages']['tip']['childrenIds']
+    assert 'steer-1' in again['messages']
+    assert again['currentId'] == 'tip'
+
+
 @pytest.mark.asyncio
 async def test_steer_enqueue_drain_deliver_supersede_roundtrip(monkeypatch):
     harness = Harness(monkeypatch)
@@ -354,7 +407,8 @@ async def test_steer_enqueue_drain_deliver_supersede_roundtrip(monkeypatch):
     assert message['meta']['source'] == 'user'
     assert message['parentId'] == 'tip'
     assert message['childrenIds'] == []
-    # The pending steer is in the history tree but not the visible tip.
+    # The pending steer is in the history tree but not a branch child or the tip.
+    assert steer_id not in parent.chat['history']['messages']['tip']['childrenIds']
     assert parent.chat['history']['currentId'] == 'tip'
     assert is_pending_internal_message(message) is True
 

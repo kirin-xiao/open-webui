@@ -8,6 +8,7 @@ import {
 	type OutputDisplayItem,
 	type OutputItem
 } from './structuredOutput';
+import { mergeSubagentCompletionStates } from './steers';
 
 function allTokens(items: OutputDisplayItem[]): OutputDetailToken[] {
 	return items.flatMap((item) =>
@@ -78,6 +79,23 @@ describe('buildOutputDisplayItems subagent rows', () => {
 		expect(token?.attributes.done).not.toBe('true');
 		expect(token?.attributes.sessionID).toBe('c1');
 		expect(token?.attributes.status).toBe('in_progress');
+	});
+
+	it('stops reporting Executing... when the persisted child state is terminal', () => {
+		// The dispatch handle says `running`, and no completion message exists in
+		// history; the status endpoint must still settle the row.
+		const completed = mergeSubagentCompletionStates(new Set(), new Map([['c1', 'completed']]));
+		const tokens = allTokens(
+			buildOutputDisplayItems(
+				subagentOutput(JSON.stringify({ sessionID: 'c1', status: 'running' }), true),
+				completed
+			)
+		);
+		const token = tokens.find((t) => t.attributes.type === 'tool_calls');
+
+		expect(token?.summary).toBe('Tool Executed');
+		expect(token?.attributes.done).toBe('true');
+		expect(token?.attributes.status).not.toBe('in_progress');
 	});
 
 	it('marks a background dispatch done once the child is completed', () => {

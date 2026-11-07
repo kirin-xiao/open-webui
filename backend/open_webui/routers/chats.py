@@ -52,6 +52,7 @@ from open_webui.utils.context_compaction import (
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
+from open_webui.utils.subagents import enqueue_steer, mark_steer_superseded
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1375,6 +1376,88 @@ async def get_chat_by_id(
         return data
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+
+############################
+# SteerChatById
+############################
+
+
+class SteerChatForm(BaseModel):
+    content: str
+    model_id: str | None = None
+    # Client-generated idempotency key. Retries reuse the same durable node.
+    steer_id: str | None = None
+
+
+class SteerChatResponse(BaseModel):
+    queued: bool
+    id: str | None = None
+    reason: str | None = None
+
+
+@router.post('/{id}/steer', response_model=SteerChatResponse)
+async def steer_chat_by_id(
+    request: Request,
+    id: str,
+    form_data: SteerChatForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Queue a user steer for a chat with an active response turn.
+
+    A steer is persisted as a pending internal history node; it never starts a
+    second completion turn. The middleware consumes it at the next model
+    boundary (or the turn-end drain does). When no task is active, callers
+    should fall back to the normal submit path.
+    """
+    chat = await Chats.get_chat_by_id_and_user_id(
+        id,
+        user.id,
+        db=db,
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    content = (form_data.content or '').strip()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Steer content is required')
+
+    if not await has_active_tasks(request.app.state.redis, id):
+        return SteerChatResponse(queued=False, reason='no_active_task')
+
+    # An idempotent retry must not be treated as a fresh steer: the earlier
+    # request may already have been consumed, and re-checking the task below
+    # would wrongly supersede it and tell the client to submit again.
+    if form_data.steer_id:
+        messages = ((chat.chat or {}).get('history') or {}).get('messages') or {}
+        existing = messages.get(form_data.steer_id)
+        existing_meta = (existing or {}).get('meta') or {}
+        if existing and existing_meta.get('internal') is True and existing_meta.get('type') == 'steer':
+            if existing_meta.get('status') in (None, 'pending', 'delivered'):
+                return SteerChatResponse(queued=True, id=form_data.steer_id)
+            if existing_meta.get('status') == 'superseded':
+                return SteerChatResponse(queued=False, reason='no_active_task')
+
+    steer_id = await enqueue_steer(
+        id,
+        user.id,
+        content,
+        source='user',
+        model_id=form_data.model_id,
+        message_id=form_data.steer_id,
+    )
+    if not steer_id:
+        return SteerChatResponse(queued=False, reason='not_queued')
+
+    # The turn may have ended between the check above and the write. Leaving the
+    # steer pending would strand it until a later turn (and show a permanent
+    # "Steering queued" chip), so hand the caller a usable fallback instead.
+    if not await has_active_tasks(request.app.state.redis, id):
+        await mark_steer_superseded(id, user.id, steer_id)
+        return SteerChatResponse(queued=False, reason='no_active_task')
+
+    return SteerChatResponse(queued=True, id=steer_id)
 
 
 ############################
