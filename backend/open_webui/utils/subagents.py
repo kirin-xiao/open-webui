@@ -204,6 +204,15 @@ async def process_pending_internal_messages(
     user_id: str,
     run: dict,
 ) -> None:
+    """Turn-end backstop for durable pending nodes in one chat.
+
+    Drains, in its own turn, whichever shape the pending list starts with:
+    timers, child completion notices (``source == 'subagent'``), or
+    parent-targeted user steers that no model boundary consumed. Child-targeted
+    instructions are never promoted here; they belong to the child chat and are
+    drained by that chat's own boundary/turn. Pending nodes left by a different
+    kind stay queued for the recursive drain after this synthesis.
+    """
     await _wait_for_active_tasks(source_request.app.state.redis, parent_chat_id)
 
     # Imported here (not at module load) to avoid a circular import at startup.
@@ -228,13 +237,27 @@ async def process_pending_internal_messages(
 
             history = copy.deepcopy((chat.chat or {}).get('history') or {})
             messages = history.get('messages') or {}
-            pending = [message for message in messages.values() if _is_pending_completion_message(message)]
+            pending = [
+                message
+                for message in messages.values()
+                if _is_pending_completion_message(message) or _is_pending_parent_steer(message)
+            ]
             if not pending:
                 return
 
             first = pending[0]
             first_meta = first.get('meta') or {}
-            kind = 'timer' if first_meta.get('internal') is True and first_meta.get('type') == 'timer' else 'subagent'
+            if first_meta.get('internal') is True and first_meta.get('type') == 'timer':
+                kind = 'timer'
+            elif _is_pending_parent_steer(first):
+                # A user steer that never reached a model request (for example,
+                # the turn's provider call failed after it was queued) is
+                # promoted into a normal turn here. This is the universal
+                # turn-end backstop; child-targeted instructions are excluded
+                # because they belong to the child chat, not this one.
+                kind = 'steer'
+            else:
+                kind = 'subagent'
             # The enqueue-time anchor. Re-resolved below, before the synthesis turn
             # is built, because the tip may have advanced since this was written.
             stored_parent_id = first.get('parentId')
@@ -244,6 +267,15 @@ async def process_pending_internal_messages(
             model_id = first.get('model') or run['model_id']
             if kind == 'timer':
                 batch = [first]
+            elif kind == 'steer':
+                # Batch every parent-targeted steer for this chat/model into one
+                # user turn. Completion notices stay pending for their own
+                # branch/batch and are never double-delivered here.
+                batch = [
+                    message
+                    for message in pending
+                    if _is_pending_parent_steer(message) and (message.get('model') or model_id) == model_id
+                ]
             else:
                 batch = [
                     message
@@ -264,6 +296,16 @@ async def process_pending_internal_messages(
                     combined_meta['timer_id'] = timer_ids[0]
                 elif timer_ids:
                     combined_meta['timer_ids'] = timer_ids
+            elif kind == 'steer':
+                # The promoted node becomes the visible user turn: keep the
+                # steer identity for the UI, but mark it delivered so the
+                # pending drain never sees it again.
+                combined_meta = {
+                    'internal': True,
+                    'type': STEER_TYPE,
+                    'source': first_meta.get('source') or 'user',
+                    'status': STEER_DELIVERED,
+                }
             else:
                 delegation_ids = [
                     message['meta']['delegation_id']
@@ -573,6 +615,28 @@ def _is_pending_completion_message(message: dict | None) -> bool:
     return _is_child_completion_notice(meta) and meta.get('status') in (None, STEER_PENDING)
 
 
+def _is_pending_parent_steer(message: dict | None) -> bool:
+    """A pending steer addressed to *this* chat, for the turn-end backstop.
+
+    This is the user/system steer that normally Slice A consumes at a model
+    boundary. It is promoted into a normal turn when no boundary consumed it
+    (for example, the provider call failed after it was queued).
+
+    Child-targeted instructions (``childID`` set) are excluded: they belong in
+    the child's chat and must never start a turn in the wrong chat. Completion
+    notices (``source == 'subagent'``) are excluded too; they have their own
+    drain path and must not be double-delivered.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user' or message.get('childrenIds'):
+        return False
+    meta = _steer_meta(message)
+    if meta is None or meta.get('status') not in (None, STEER_PENDING):
+        return False
+    if meta.get('source') == 'subagent' or meta.get('childID'):
+        return False
+    return True
+
+
 def _pending_child_completion_notice(messages: dict, child_chat_id: str) -> dict | None:
     """The newest undrained completion notice for ``child_chat_id``, if any."""
     if not messages or not child_chat_id:
@@ -825,9 +889,12 @@ async def enqueue_steer(
 ) -> str | None:
     """Persist a pending steer node and return its id (None on invalid input).
 
-    The node is anchored at the current branch tip but never advances
-    `currentId`, so it stays invisible until a boundary consumes it. The
-    optional `request` is accepted for symmetry with the timer/subagent
+    Write into the chat that will *consume* the steer: the child chat for a
+    parent -> child instruction (``source='parent'``, ``childID=<child>``), and
+    the parent/target chat for a user steer or a child completion notice
+    (``source='subagent'``). The node is anchored at the current branch tip but
+    never advances `currentId`, so it stays invisible until a boundary consumes
+    it. The optional `request` is accepted for symmetry with the timer/subagent
     enqueue paths; it is not used by the durable write.
     """
     del request  # Reserved for a future socket notification; the write is durable.
@@ -890,10 +957,12 @@ async def enqueue_steer(
         data=message,
     )
 
-    if child_id:
+    if child_id and source != 'subagent':
         # Only advertise a queued steer while the child is actually active.
         # Re-check under the child lock so a run finishing in this window is
-        # not clobbered back to `steer_queued`.
+        # not clobbered back to `steer_queued`. Completion notices name their
+        # source child but are not instructions for it, so they never touch its
+        # state.
         await _mark_child_steer_queued(child_id)
 
     return steer_id
@@ -905,17 +974,25 @@ async def drain_pending_steers(
     *,
     child_id: str | None = None,
 ) -> list[dict]:
-    """Read pending steers without consuming them.
+    """Read pending steers without consuming them from ``parent_chat_id``.
 
     Callers append the returned content to their model request, then call
     `mark_steer_delivered` once the request has started. On a failed request
     they leave the records pending for the existing turn-end drain backstop.
 
-    `child_id=None` selects parent-targeted steers: nodes without a child, a
-    steer stored in the child chat itself (``childID == parent_chat_id``), and
-    completion notices (``source == 'subagent'``) that name their source child
-    but are delivered to the parent. Passing a child id selects only
-    parent->child instructions for that child, never a completion notice.
+    The chat passed here must be the one that holds the records:
+
+    * A parent -> child instruction is stored in the **child** chat and drained
+      with ``parent_chat_id=<child id>, child_id=<child id>``.
+    * A user steer or child completion notice (``source == 'subagent'``) is
+      stored in the **parent/target** chat and drained with its id and
+      ``child_id=None``.
+
+    ``child_id=None`` selects parent-targeted records: nodes without a child, a
+    steer stored in this chat itself (``childID == parent_chat_id``), and
+    completion notices that name their source child but are delivered to the
+    parent. Passing a child id selects only parent->child instructions for that
+    child, never a completion notice.
     """
     parent = await Chats.get_chat_by_id(parent_chat_id)
     if not parent or parent.user_id != user_id:
@@ -1268,6 +1345,8 @@ async def delegate(
             # pending until the next child turn. The acceptance-time race below
             # is handled, but the clean fix for this narrower window is a child
             # turn-end sweep that starts a new turn (with the pre_steer note).
+            # The record lives in the child chat: that is the chat whose
+            # boundary drain (child_id == existing_chat.id) consumes it.
             steer_id = await enqueue_steer(
                 existing_chat.id,
                 user.id,
