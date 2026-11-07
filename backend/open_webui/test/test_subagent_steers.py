@@ -242,6 +242,100 @@ def _steer_message(message_id, *, status='pending', child_id=None, parent_id='ti
     }
 
 
+def _completion_steer(
+    message_id='notice-1',
+    *,
+    child_id='child-1',
+    status='pending',
+    generation_id='gen-old',
+    state='completed',
+    body='old answer',
+    parent_id='tip',
+):
+    meta = {
+        'internal': True,
+        'type': 'steer',
+        'source': 'subagent',
+        'status': status,
+        'childID': child_id,
+        'generation_id': generation_id,
+        'state': state,
+    }
+    return {
+        'id': message_id,
+        'parentId': parent_id,
+        'childrenIds': [],
+        'role': 'user',
+        'content': f'<subagent sessionID="{child_id}" state="{state}">\n{body}\n</subagent>',
+        'model': 'test-model',
+        'meta': meta,
+        'timestamp': 5,
+    }
+
+
+def _parent_completions(harness):
+    """Completion handler calls for the parent chat (not the child's own run)."""
+    return [call for call in harness.completions if call[1].get('chat_id') == 'chat-1']
+
+
+def _completion_notices(messages, *, pending_only=True):
+    return [
+        message
+        for message in messages.values()
+        if (message.get('meta') or {}).get('type') == 'steer'
+        and (message.get('meta') or {}).get('source') == 'subagent'
+        and (not pending_only or (message.get('meta') or {}).get('status') in (None, 'pending'))
+    ]
+
+
+def _running_child_history(child_id='child-1'):
+    return {
+        'currentId': 'child-assistant',
+        'messages': {
+            'child-user': {
+                'id': 'child-user',
+                'parentId': None,
+                'childrenIds': ['child-assistant'],
+                'role': 'user',
+                'content': 'original task',
+                'timestamp': 1,
+            },
+            'child-assistant': {
+                'id': 'child-assistant',
+                'parentId': 'child-user',
+                'childrenIds': [],
+                'role': 'assistant',
+                'content': '',
+                'done': False,
+                'timestamp': 2,
+            },
+        },
+    }
+
+
+async def _task_started(harness):
+    for _ in range(50):
+        if harness.states_seen:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError('child task never started')
+
+
+async def _finish_registered_tasks(harness):
+    for _ in range(20):
+        pending = [task for _, task in harness.registry.created if task is not None and not task.done()]
+        if not pending:
+            await asyncio.sleep(0)
+            pending = [task for _, task in harness.registry.created if task is not None and not task.done()]
+            if not pending:
+                return
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Steer record contract
 # ---------------------------------------------------------------------------
@@ -397,15 +491,37 @@ async def test_steer_status_transitions_are_terminal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pending_steer_is_not_drained_as_a_subagent_result(monkeypatch):
+async def test_pending_user_steer_is_promoted_at_turn_end_not_as_a_result(monkeypatch):
+    """The turn-end backstop promotes an unconsumed user steer into a normal turn.
+
+    It must not be treated as a completion notice, and the promoted node must
+    not remain pending (which would deliver it a second time).
+    """
     harness = Harness(monkeypatch)
     parent = harness.seed_parent(history=_parent_history(_steer_message('steer-1')))
 
     await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    await harness.registry.created[-1][1]
 
-    assert harness.completions == []
-    assert parent.chat['history']['messages']['steer-1']['meta']['status'] == 'pending'
-    assert parent.chat['history']['currentId'] == 'tip'
+    completions = _parent_completions(harness)
+    assert len(completions) == 1
+    assert completions[0][1]['messages'][-1]['content'] == 'steer steer-1'
+
+    messages = parent.chat['history']['messages']
+    # Collapsed into the new visible turn, not left pending for a later drain.
+    assert 'steer-1' not in messages
+    promoted = next(
+        message
+        for message in messages.values()
+        if message.get('role') == 'user' and message.get('content') == 'steer steer-1'
+    )
+    assert promoted['meta']['type'] == 'steer'
+    assert promoted['meta']['source'] == 'user'
+    assert promoted['meta']['status'] == 'delivered'
+
+    # A later turn-end drain has nothing left to deliver.
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    assert len(_parent_completions(harness)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +705,8 @@ async def test_new_completion_supersedes_an_older_notice_for_the_same_child(monk
     new_notices = [
         m
         for m in messages.values()
-        if (m.get('meta') or {}).get('type') == 'subagent'
+        if (m.get('meta') or {}).get('type') == 'steer'
+        and (m.get('meta') or {}).get('source') == 'subagent'
         and (m.get('meta') or {}).get('childID') == child_id
         and (m.get('meta') or {}).get('generation_id')
     ]
@@ -716,3 +833,331 @@ async def test_subagent_listing_rejects_non_owner(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await get_chat_subagents_by_id('missing-chat', user=SimpleNamespace(id='user-1'), db=None)
     assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Slice B: parent -> child steering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_steering_a_running_child_enqueues_and_acks(monkeypatch):
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+    child = harness.seed_child(state='running', history=_running_child_history())
+    before_ids = set(child.chat['history']['messages'])
+
+    result = json.loads(await run_delegate(harness, session_id='child-1', prompt='focus on the failing tests'))
+
+    assert result['status'] == 'steer_queued'
+    assert result['sessionID'] == 'child-1'
+    assert 'queued' in result['output']
+    # No second child turn and no new task: the live run consumes the steer.
+    assert harness.registry.created == []
+    assert child.meta['state'] == 'steer_queued'
+
+    added = set(child.chat['history']['messages']) - before_ids
+    assert len(added) == 1
+    steer = child.chat['history']['messages'][added.pop()]
+    assert steer['meta']['type'] == 'steer'
+    assert steer['meta']['source'] == 'parent'
+    assert steer['meta']['childID'] == 'child-1'
+    assert steer['meta']['status'] == 'pending'
+    assert 'focus on the failing tests' in steer['content']
+    assert is_pending_internal_message(steer) is True
+
+    # The child drain sees a steer addressed to this chat; delivering it resumes
+    # the run from steer_queued.
+    drained = await subagents.drain_pending_steers('child-1', 'user-1')
+    assert [item['id'] for item in drained] == [steer['id']]
+    assert await subagents.mark_steer_delivered('child-1', 'user-1', steer['id']) == [steer['id']]
+    assert child.meta['state'] == 'running'
+    assert await subagents.drain_pending_steers('child-1', 'user-1') == []
+
+
+@pytest.mark.asyncio
+async def test_steering_a_running_child_works_for_background_calls(monkeypatch):
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+    harness.seed_child(state='running', history=_running_child_history())
+
+    result = json.loads(await run_delegate(harness, session_id='child-1', prompt='also run lint', background=True))
+
+    assert result['status'] == 'steer_queued'
+    assert harness.registry.created == []
+
+
+@pytest.mark.asyncio
+async def test_steer_that_loses_the_running_race_falls_back_to_continuation(monkeypatch):
+    """A child finishing between the activity check and the write must not strand a steer."""
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+    child = harness.seed_child(state='running', history=_running_child_history())
+
+    real_enqueue = subagents.enqueue_steer
+
+    async def racing_enqueue(*args, **kwargs):
+        # The child writes its final tip and terminal state just before the
+        # steer is persisted.
+        child.meta['state'] = 'completed'
+        child.chat['history']['messages']['child-assistant']['done'] = True
+        child.chat['history']['messages']['child-assistant']['content'] = 'finished first'
+        return await real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(subagents, 'enqueue_steer', racing_enqueue)
+
+    result = await run_delegate(harness, session_id='child-1', prompt='too late to steer')
+
+    # The stale steer is not queued; the call becomes a normal continuation.
+    assert result.startswith('<subagent sessionID="child-1" state="completed">')
+    steers = [
+        message
+        for message in child.chat['history']['messages'].values()
+        if (message.get('meta') or {}).get('type') == 'steer' and (message.get('meta') or {}).get('source') == 'parent'
+    ]
+    assert len(steers) == 1
+    assert steers[0]['meta']['status'] == 'superseded'
+    assert child.meta['state'] == 'completed'
+    assert _completion_notices(harness.fake_chats.chats['chat-1'].chat['history']['messages']) == []
+
+
+# ---------------------------------------------------------------------------
+# Slice B: child -> parent completion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_completion_notice_uses_child_latest_tip_at_completion(monkeypatch):
+    harness = Harness(monkeypatch, active=True)
+    parent = harness.seed_parent(history=_parent_history())
+    harness.block_event = asyncio.Event()
+
+    before_tasks = len(harness.registry.created)
+    handle = json.loads(await run_delegate(harness, background=True))
+    child_id = handle['sessionID']
+    child = harness.fake_chats.chats[child_id]
+    child_task = harness.registry.created[before_tasks][1]
+    await _task_started(harness)
+
+    # A steer/continuation attached a newer final assistant leaf while the run
+    # was still finishing. The notice must describe that tip, not the spawn-time
+    # assistant snapshot the handler writes into.
+    assistant_id = next(
+        message['id'] for message in child.chat['history']['messages'].values() if message.get('role') == 'assistant'
+    )
+    await harness.fake_chats.upsert_message_to_chat_by_id_and_message_id(
+        child_id,
+        'final-after-steer',
+        {
+            'id': 'final-after-steer',
+            'parentId': assistant_id,
+            'childrenIds': [],
+            'role': 'assistant',
+            'content': 'final answer after the steer',
+            'done': True,
+            'timestamp': 99,
+        },
+    )
+    harness.block_event.set()
+    await child_task
+
+    notices = _completion_notices(parent.chat['history']['messages'])
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice['meta']['childID'] == child_id
+    assert notice['meta']['generation_id']
+    assert 'final answer after the steer' in notice['content']
+    assert 'state="completed"' in notice['content']
+    # No legacy pending result node is created alongside the steer notice.
+    assert not [
+        message
+        for message in parent.chat['history']['messages'].values()
+        if (message.get('meta') or {}).get('type') == 'subagent'
+        and (message.get('meta') or {}).get('status') in (None, 'pending')
+    ]
+    assert child.meta['state'] == 'completed'
+    # Parent is active: Slice A owns boundary delivery, so no synthesis here.
+    assert _parent_completions(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_idle_parent_delivers_completion_steer_once(monkeypatch):
+    harness = Harness(monkeypatch, active=False)
+    parent = harness.seed_parent(history=_parent_history())
+
+    before_tasks = len(harness.registry.created)
+    handle = json.loads(await run_delegate(harness, background=True))
+    child_id = handle['sessionID']
+    child_task = harness.registry.created[before_tasks][1]
+    await child_task
+    await _finish_registered_tasks(harness)
+
+    parent_completions = _parent_completions(harness)
+    assert len(parent_completions) == 1
+    payload = parent_completions[0][1]
+    completion_content = payload['messages'][-1]['content']
+    assert '<subagent' in completion_content
+    assert harness.summary in completion_content
+    # The completion steer was consumed by the drain, not left pending.
+    assert _completion_notices(parent.chat['history']['messages']) == []
+
+    # A second turn-end drain must not synthesize the completion again.
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    assert len(_parent_completions(harness)) == 1
+    assert child_id
+
+
+@pytest.mark.asyncio
+async def test_turn_end_drain_ignores_child_targeted_instructions(monkeypatch):
+    """A parent -> child steer stays for the child's boundary, never this chat."""
+    harness = Harness(monkeypatch)
+    child_steer = _steer_message('child-steer', child_id='child-1')
+    child_steer['meta']['source'] = 'parent'
+    parent = harness.seed_parent(history=_parent_history(child_steer))
+
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+
+    assert _parent_completions(harness) == []
+    assert parent.chat['history']['messages']['child-steer']['meta']['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_turn_end_drain_delivers_steer_and_completion_once(monkeypatch):
+    """The two pending shapes drain on their own turns without duplication."""
+    harness = Harness(monkeypatch)
+    parent = harness.seed_parent(
+        history=_parent_history(
+            _steer_message('user-steer'),
+            _completion_steer('notice-1', child_id='child-1', body='old answer'),
+        )
+    )
+
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    await _finish_registered_tasks(harness)
+
+    completions = _parent_completions(harness)
+    assert len(completions) == 2
+    contents = [call[1]['messages'][-1]['content'] for call in completions]
+    assert sum('steer user-steer' in content for content in contents) == 1
+    assert sum('old answer' in content for content in contents) == 1
+    assert _completion_notices(parent.chat['history']['messages']) == []
+
+
+@pytest.mark.asyncio
+async def test_delivered_completion_steer_is_not_drained_again(monkeypatch):
+    harness = Harness(monkeypatch)
+    parent = harness.seed_parent(history=_parent_history(_completion_steer('notice-1', status='delivered')))
+
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+
+    assert harness.completions == []
+    assert parent.chat['history']['messages']['notice-1']['meta']['status'] == 'delivered'
+
+
+@pytest.mark.asyncio
+async def test_completion_steer_is_parent_deliverable_not_a_child_instruction(monkeypatch):
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history(_completion_steer('notice-1', child_id='child-1')))
+
+    parent_steers = await subagents.drain_pending_steers('chat-1', 'user-1')
+    assert [item['id'] for item in parent_steers] == ['notice-1']
+    # A completion notice names its source child; it must never be re-injected
+    # into that child as a parent instruction.
+    assert await subagents.drain_pending_steers('chat-1', 'user-1', child_id='child-1') == []
+
+
+# ---------------------------------------------------------------------------
+# Slice B: supersession and late steer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_continuation_supersedes_a_pending_completion_steer(monkeypatch):
+    harness = Harness(monkeypatch)
+    parent = harness.seed_parent(history=_parent_history(_completion_steer('old-notice', generation_id='gen-old')))
+    harness.seed_child(child_id='child-1', state='completed')
+
+    result = await run_delegate(harness, session_id='child-1', prompt='continue the work')
+
+    assert result.startswith('<subagent sessionID="child-1" state="completed">')
+    assert parent.chat['history']['messages']['old-notice']['meta']['status'] == 'superseded'
+    assert _completion_notices(parent.chat['history']['messages']) == []
+    assert _parent_completions(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_late_steer_returns_pre_steer_note_and_queues_new_turn(monkeypatch):
+    harness = Harness(monkeypatch, active=False)
+    parent = harness.seed_parent(history=_parent_history(_completion_steer('old-notice', body='old final answer')))
+    harness.seed_child(child_id='child-1', state='completed')
+
+    before_tasks = len(harness.registry.created)
+    result = await run_delegate(
+        harness,
+        session_id='child-1',
+        prompt='change direction',
+        background=True,
+    )
+
+    assert 'pre_steer="true"' in result
+    assert 'old final answer' in result
+    assert 'generated before your steering message' in result
+    assert 'new response is coming' in result
+    assert parent.chat['history']['messages']['old-notice']['meta']['status'] == 'superseded'
+
+    # The new turn runs even though the caller could have expected a running
+    # handle; it is not synthesized from the old completion.
+    new_tasks = harness.registry.created[before_tasks:]
+    assert len(new_tasks) == 1
+    child_task = new_tasks[0][1]
+    child = harness.fake_chats.chats['child-1']
+    assert child.meta['state'] == 'running'
+
+    await child_task
+    await _finish_registered_tasks(harness)
+
+    assert child.meta['state'] == 'completed'
+    parent_completions = _parent_completions(harness)
+    assert len(parent_completions) == 1
+    synthesis_content = parent_completions[0][1]['messages'][-1]['content']
+    assert harness.summary in synthesis_content
+    assert 'old final answer' not in synthesis_content
+
+
+@pytest.mark.asyncio
+async def test_cancelled_child_with_queued_steer_stays_interrupted(monkeypatch):
+    harness = Harness(monkeypatch, active=True)
+    parent = harness.seed_parent(history=_parent_history())
+    harness.block_event = asyncio.Event()
+
+    before_tasks = len(harness.registry.created)
+    handle = json.loads(await run_delegate(harness, background=True))
+    child_id = handle['sessionID']
+    child = harness.fake_chats.chats[child_id]
+    child_task = harness.registry.created[before_tasks][1]
+    await _task_started(harness)
+    assert child.meta['state'] == 'running'
+
+    ack = json.loads(await run_delegate(harness, session_id=child_id, prompt='change direction'))
+    assert ack['status'] == 'steer_queued'
+    assert child.meta['state'] == 'steer_queued'
+
+    child_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await child_task
+    assert child.meta['state'] == 'interrupted'
+
+    steer = next(
+        message
+        for message in child.chat['history']['messages'].values()
+        if (message.get('meta') or {}).get('type') == 'steer'
+    )
+    assert await subagents.mark_steer_delivered(child_id, 'user-1', steer['id']) == [steer['id']]
+    # Delivery must not resurrect a finished child as running.
+    assert child.meta['state'] == 'interrupted'
+
+    # The interrupted completion is delivered to the parent as a completion
+    # steer, so the parent learns the child stopped instead of hanging.
+    notices = _completion_notices(parent.chat['history']['messages'])
+    assert len(notices) == 1
+    assert notices[0]['meta']['state'] == 'interrupted'

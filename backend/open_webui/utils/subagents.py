@@ -204,6 +204,15 @@ async def process_pending_internal_messages(
     user_id: str,
     run: dict,
 ) -> None:
+    """Turn-end backstop for durable pending nodes in one chat.
+
+    Drains, in its own turn, whichever shape the pending list starts with:
+    timers, child completion notices (``source == 'subagent'``), or
+    parent-targeted user steers that no model boundary consumed. Child-targeted
+    instructions are never promoted here; they belong to the child chat and are
+    drained by that chat's own boundary/turn. Pending nodes left by a different
+    kind stay queued for the recursive drain after this synthesis.
+    """
     await _wait_for_active_tasks(source_request.app.state.redis, parent_chat_id)
 
     # Imported here (not at module load) to avoid a circular import at startup.
@@ -231,24 +240,24 @@ async def process_pending_internal_messages(
             pending = [
                 message
                 for message in messages.values()
-                for meta in [message.get('meta') or {}]
-                if message.get('role') == 'user'
-                and not message.get('childrenIds')
-                and (
-                    (
-                        meta.get('internal') is True
-                        and meta.get('type') == 'subagent'
-                        and meta.get('status') in (None, 'pending')
-                    )
-                    or (meta.get('internal') is True and meta.get('type') == 'timer')
-                )
+                if _is_pending_completion_message(message) or _is_pending_parent_steer(message)
             ]
             if not pending:
                 return
 
             first = pending[0]
             first_meta = first.get('meta') or {}
-            kind = 'timer' if first_meta.get('internal') is True and first_meta.get('type') == 'timer' else 'subagent'
+            if first_meta.get('internal') is True and first_meta.get('type') == 'timer':
+                kind = 'timer'
+            elif _is_pending_parent_steer(first):
+                # A user steer that never reached a model request (for example,
+                # the turn's provider call failed after it was queued) is
+                # promoted into a normal turn here. This is the universal
+                # turn-end backstop; child-targeted instructions are excluded
+                # because they belong to the child chat, not this one.
+                kind = 'steer'
+            else:
+                kind = 'subagent'
             # The enqueue-time anchor. Re-resolved below, before the synthesis turn
             # is built, because the tip may have advanced since this was written.
             stored_parent_id = first.get('parentId')
@@ -258,6 +267,15 @@ async def process_pending_internal_messages(
             model_id = first.get('model') or run['model_id']
             if kind == 'timer':
                 batch = [first]
+            elif kind == 'steer':
+                # Batch every parent-targeted steer for this chat/model into one
+                # user turn. Completion notices stay pending for their own
+                # branch/batch and are never double-delivered here.
+                batch = [
+                    message
+                    for message in pending
+                    if _is_pending_parent_steer(message) and (message.get('model') or model_id) == model_id
+                ]
             else:
                 batch = [
                     message
@@ -265,11 +283,8 @@ async def process_pending_internal_messages(
                     for meta in [message.get('meta') or {}]
                     if message.get('parentId') == stored_parent_id
                     and (message.get('model') or model_id) == model_id
-                    and (
-                        meta.get('internal') is True
-                        and meta.get('type') == 'subagent'
-                        and meta.get('status') in (None, 'pending')
-                    )
+                    and _is_child_completion_notice(meta)
+                    and meta.get('status') in (None, 'pending')
                 ]
             combined_content = '\n\n'.join(message.get('content', '') for message in batch if message.get('content'))
             if kind == 'timer':
@@ -281,6 +296,16 @@ async def process_pending_internal_messages(
                     combined_meta['timer_id'] = timer_ids[0]
                 elif timer_ids:
                     combined_meta['timer_ids'] = timer_ids
+            elif kind == 'steer':
+                # The promoted node becomes the visible user turn: keep the
+                # steer identity for the UI, but mark it delivered so the
+                # pending drain never sees it again.
+                combined_meta = {
+                    'internal': True,
+                    'type': STEER_TYPE,
+                    'source': first_meta.get('source') or 'user',
+                    'status': STEER_DELIVERED,
+                }
             else:
                 delegation_ids = [
                     message['meta']['delegation_id']
@@ -565,6 +590,125 @@ def _linked_child_id(message: dict, meta: dict) -> str | None:
     return None
 
 
+def _is_child_completion_notice(meta: dict | None) -> bool:
+    """True for a node that carries a child's completion into the parent.
+
+    Completion notices are the legacy ``type: subagent`` pending nodes and the
+    newer ``type: steer`` synthetic steers (``source: subagent``). Both shape a
+    parent synthesis turn; only the steer form is boundary-deliverable.
+    """
+    if not isinstance(meta, dict) or meta.get('internal') is not True:
+        return False
+    if meta.get('type') == 'subagent':
+        return True
+    return meta.get('type') == STEER_TYPE and meta.get('source') == 'subagent'
+
+
+def _is_pending_completion_message(message: dict | None) -> bool:
+    if not isinstance(message, dict) or message.get('role') != 'user' or message.get('childrenIds'):
+        return False
+    meta = message.get('meta') or {}
+    if meta.get('internal') is not True:
+        return False
+    if meta.get('type') == 'timer':
+        return True
+    return _is_child_completion_notice(meta) and meta.get('status') in (None, STEER_PENDING)
+
+
+def _is_pending_parent_steer(message: dict | None) -> bool:
+    """A pending steer addressed to *this* chat, for the turn-end backstop.
+
+    This is the user/system steer that normally Slice A consumes at a model
+    boundary. It is promoted into a normal turn when no boundary consumed it
+    (for example, the provider call failed after it was queued).
+
+    Child-targeted instructions (``childID`` set) are excluded: they belong in
+    the child's chat and must never start a turn in the wrong chat. Completion
+    notices (``source == 'subagent'``) are excluded too; they have their own
+    drain path and must not be double-delivered.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user' or message.get('childrenIds'):
+        return False
+    meta = _steer_meta(message)
+    if meta is None or meta.get('status') not in (None, STEER_PENDING):
+        return False
+    if meta.get('source') == 'subagent' or meta.get('childID'):
+        return False
+    return True
+
+
+def _pending_child_completion_notice(messages: dict, child_chat_id: str) -> dict | None:
+    """The newest undrained completion notice for ``child_chat_id``, if any."""
+    if not messages or not child_chat_id:
+        return None
+    notices = [
+        message
+        for message in messages.values()
+        if isinstance(message, dict)
+        and not message.get('childrenIds')
+        and _is_child_completion_notice(message.get('meta') or {})
+        and (message.get('meta') or {}).get('status') in (None, STEER_PENDING)
+        and _linked_child_id(message, message.get('meta') or {}) == child_chat_id
+    ]
+    if not notices:
+        return None
+    return max(notices, key=lambda message: message.get('timestamp', 0))
+
+
+def _completion_notice_body(notice: dict) -> str:
+    content = notice.get('content') or ''
+    match = re.match(r'\s*<subagent\b[^>]*>\n?(.*?)\n?</subagent>\s*$', content, re.S)
+    return (match.group(1) if match else content).strip()
+
+
+def _terminal_state_for_tip(tip: dict | None) -> str:
+    """Best-effort terminal state for a finished child tip (late-steer race)."""
+    error = (tip or {}).get('error') if isinstance(tip, dict) else None
+    if not error:
+        return 'completed'
+    content = error.get('content') if isinstance(error, dict) else str(error)
+    if content and 'cancel' in content.lower():
+        return 'interrupted'
+    return 'error'
+
+
+def _pre_steer_response(chat_id: str, state: str | None, body: str) -> str:
+    """Return a stale final answer with an explicit late-steer note.
+
+    The new turn is already queued in the background; this only tells the parent
+    that the text predates the steering instruction.
+    """
+    note = 'Note: this response was generated before your steering message; a new response is coming.'
+    return (
+        f'<subagent sessionID="{chat_id}" state="{state or "completed"}" pre_steer="true">\n'
+        f'{body}\n\n{note}\n</subagent>'
+    )
+
+
+async def _latest_child_tip_message(chat_id: str, fallback_id: str) -> dict | None:
+    """Read the child's current branch tip instead of a spawn-time snapshot.
+
+    A steer or continuation may have attached a newer assistant leaf while the
+    same run was finishing. Prefer that leaf so the completion notice describes
+    what the child actually ended with.
+    """
+    chat = await Chats.get_chat_by_id(chat_id)
+    messages = ((chat.chat or {}).get('history') or {}).get('messages') or {} if chat else {}
+    tip_id = resolve_history_tip(
+        messages,
+        ((chat.chat or {}).get('history') or {}).get('currentId') if chat else fallback_id,
+        fallback_id if fallback_id in messages else None,
+        blocked=is_pending_internal_message,
+    )
+    message = messages.get(tip_id)
+    if isinstance(message, dict) and message.get('role') == 'assistant':
+        return message
+    fallback = messages.get(fallback_id)
+    if isinstance(fallback, dict) and fallback.get('role') == 'assistant':
+        return fallback
+    return await Chats.get_message_by_id_and_message_id(chat_id, fallback_id)
+
+
 def _stale_child_result_updates(
     messages: dict,
     child_chat_id: str,
@@ -594,7 +738,7 @@ def _stale_child_result_updates(
         if message.get('childrenIds'):
             continue
         meta = message.get('meta') or {}
-        if meta.get('internal') is not True or meta.get('type') != 'subagent':
+        if not _is_child_completion_notice(meta):
             continue
         if meta.get('status') not in (None, STEER_PENDING):
             continue
@@ -662,34 +806,16 @@ async def supersede_pending_child_results(
     return list(updates)
 
 
-async def enqueue_steer(
-    parent_chat_id: str,
-    user_id: str,
-    content: str,
+def _build_steer_meta(
     *,
-    source: str = 'user',
-    child_id: str | None = None,
-    generation_id: str | None = None,
-    pre_steer: bool = False,
-    parent_id: str | None = None,
-    model_id: str | None = None,
-    message_id: str | None = None,
-    request: Request | None = None,
-) -> str | None:
-    """Persist a pending steer node and return its id (None on invalid input).
-
-    The node is anchored at the current branch tip but never advances
-    `currentId`, so it stays invisible until a boundary consumes it. The
-    optional `request` is accepted for symmetry with the timer/subagent
-    enqueue paths; it is not used by the durable write.
-    """
-    del request  # Reserved for a future socket notification; the write is durable.
-    text = (content or '').strip()
-    if not text or not parent_chat_id or not user_id:
-        return None
-
-    steer_id = message_id or str(uuid4())
-    timestamp = int(time.time())
+    source: str,
+    child_id: str | None,
+    generation_id: str | None,
+    pre_steer: bool,
+    state: str | None,
+    description: str | None,
+    delegation_id: str | None,
+) -> dict:
     meta = {
         'internal': True,
         'type': STEER_TYPE,
@@ -702,6 +828,91 @@ async def enqueue_steer(
         meta['generation_id'] = generation_id
     if pre_steer:
         meta['pre_steer'] = True
+    if state:
+        meta['state'] = state
+    if description:
+        meta['description'] = description
+    if source == 'subagent' and child_id:
+        # Legacy completion nodes carried these two fields; keep them so older
+        # readers and supersession paths still match a steer-shaped notice.
+        meta['subagent_chat_id'] = child_id
+        if delegation_id:
+            meta['delegation_id'] = delegation_id
+    return meta
+
+
+async def _steer_generation_allowed(child_id: str | None, expected_generation_id: str | None) -> bool:
+    """False when a continuation has replaced the child's run since spawning.
+
+    Called under the parent lock (the same lock a continuation uses to claim the
+    next generation), so a stale run cannot enqueue its completion afterwards.
+    """
+    if expected_generation_id is None:
+        return True
+    child = await Chats.get_chat_by_id(child_id) if child_id else None
+    if child is None:
+        return False
+    child_generation = (child.meta or {}).get('generation_id')
+    # A missing generation on a legacy child is allowed (nothing to compare).
+    return child_generation is None or child_generation == expected_generation_id
+
+
+async def _mark_child_steer_queued(child_id: str) -> None:
+    child = await Chats.get_chat_by_id(child_id)
+    child_meta = (child.meta or {}) if child else {}
+    if child_meta.get('state') in ('running', 'steer_queued', None):
+        await _set_child_state(
+            child_id,
+            'steer_queued',
+            generation_id=child_meta.get('generation_id'),
+            only_if_state=('running', 'steer_queued', None),
+        )
+
+
+async def enqueue_steer(
+    parent_chat_id: str,
+    user_id: str,
+    content: str,
+    *,
+    source: str = 'user',
+    child_id: str | None = None,
+    generation_id: str | None = None,
+    pre_steer: bool = False,
+    parent_id: str | None = None,
+    model_id: str | None = None,
+    message_id: str | None = None,
+    state: str | None = None,
+    description: str | None = None,
+    delegation_id: str | None = None,
+    expected_generation_id: str | None = None,
+    request: Request | None = None,
+) -> str | None:
+    """Persist a pending steer node and return its id (None on invalid input).
+
+    Write into the chat that will *consume* the steer: the child chat for a
+    parent -> child instruction (``source='parent'``, ``childID=<child>``), and
+    the parent/target chat for a user steer or a child completion notice
+    (``source='subagent'``). The node is anchored at the current branch tip but
+    never advances `currentId`, so it stays invisible until a boundary consumes
+    it. The optional `request` is accepted for symmetry with the timer/subagent
+    enqueue paths; it is not used by the durable write.
+    """
+    del request  # Reserved for a future socket notification; the write is durable.
+    text = (content or '').strip()
+    if not text or not parent_chat_id or not user_id:
+        return None
+
+    steer_id = message_id or str(uuid4())
+    timestamp = int(time.time())
+    meta = _build_steer_meta(
+        source=source,
+        child_id=child_id,
+        generation_id=generation_id,
+        pre_steer=pre_steer,
+        state=state,
+        description=description,
+        delegation_id=delegation_id,
+    )
 
     message = {
         'id': steer_id,
@@ -718,6 +929,8 @@ async def enqueue_steer(
     async with _parent_lock_scope(parent_chat_id):
         parent = await Chats.get_chat_by_id(parent_chat_id)
         if not parent or parent.user_id != user_id:
+            return None
+        if not await _steer_generation_allowed(child_id, expected_generation_id):
             return None
         history = (parent.chat or {}).get('history') or {}
         messages = history.get('messages') or {}
@@ -744,19 +957,13 @@ async def enqueue_steer(
         data=message,
     )
 
-    if child_id:
+    if child_id and source != 'subagent':
         # Only advertise a queued steer while the child is actually active.
         # Re-check under the child lock so a run finishing in this window is
-        # not clobbered back to `steer_queued`.
-        child = await Chats.get_chat_by_id(child_id)
-        child_meta = (child.meta or {}) if child else {}
-        if child_meta.get('state') in ('running', 'steer_queued'):
-            await _set_child_state(
-                child_id,
-                'steer_queued',
-                generation_id=child_meta.get('generation_id'),
-                only_if_state=('running', 'steer_queued'),
-            )
+        # not clobbered back to `steer_queued`. Completion notices name their
+        # source child but are not instructions for it, so they never touch its
+        # state.
+        await _mark_child_steer_queued(child_id)
 
     return steer_id
 
@@ -767,14 +974,25 @@ async def drain_pending_steers(
     *,
     child_id: str | None = None,
 ) -> list[dict]:
-    """Read pending steers without consuming them.
+    """Read pending steers without consuming them from ``parent_chat_id``.
 
     Callers append the returned content to their model request, then call
     `mark_steer_delivered` once the request has started. On a failed request
     they leave the records pending for the existing turn-end drain backstop.
 
-    `child_id=None` selects parent-targeted steers (no `meta.childID`); passing
-    a child id selects steers enqueued for that child.
+    The chat passed here must be the one that holds the records:
+
+    * A parent -> child instruction is stored in the **child** chat and drained
+      with ``parent_chat_id=<child id>, child_id=<child id>``.
+    * A user steer or child completion notice (``source == 'subagent'``) is
+      stored in the **parent/target** chat and drained with its id and
+      ``child_id=None``.
+
+    ``child_id=None`` selects parent-targeted records: nodes without a child, a
+    steer stored in this chat itself (``childID == parent_chat_id``), and
+    completion notices that name their source child but are delivered to the
+    parent. Passing a child id selects only parent->child instructions for that
+    child, never a completion notice.
     """
     parent = await Chats.get_chat_by_id(parent_chat_id)
     if not parent or parent.user_id != user_id:
@@ -787,10 +1005,11 @@ async def drain_pending_steers(
         meta = message.get('meta') or {}
         target = meta.get('childID')
         if child_id is None:
-            if target:
+            if target and target != parent_chat_id and meta.get('source') != 'subagent':
                 continue
-        elif target != child_id:
-            continue
+        else:
+            if meta.get('source') == 'subagent' or target != child_id:
+                continue
         drained.append(copy.deepcopy(message))
     return drained
 
@@ -810,6 +1029,36 @@ def _next_steer_meta(meta: dict, status: str, timestamp: int) -> dict | None:
     elif status == STEER_SUPERSEDED:
         new_meta['superseded_at'] = timestamp
     return new_meta
+
+
+async def _mirror_steer_statuses(parent_chat_id: str, user_id: str, messages: list[dict]) -> None:
+    """Mirror steer statuses into the normalized message table."""
+    for message in messages:
+        try:
+            await ChatMessages.upsert_message(
+                message_id=message['id'],
+                chat_id=parent_chat_id,
+                user_id=user_id,
+                data=message,
+            )
+        except Exception:
+            log.exception('Failed to mirror steer status for %s', message.get('id'))
+
+
+async def _resume_children_after_steer_delivery(messages: list[dict]) -> None:
+    """Resume children paused in `steer_queued` once their steer was consumed.
+
+    `only_if_state` keeps a concurrent completion (or interruption) authoritative.
+    Completion notices (``source == 'subagent'``) name the child that produced
+    them and must not touch its terminal state.
+    """
+    for message in messages:
+        meta = message.get('meta') or {}
+        if meta.get('source') == 'subagent':
+            continue
+        child_id = meta.get('childID')
+        if child_id:
+            await _set_child_state(child_id, 'running', only_if_state=('steer_queued',))
 
 
 async def _update_steer_status(
@@ -850,18 +1099,11 @@ async def _update_steer_status(
             )
             upserts = list(updates.values())
 
-    # Mirror the status into the normalized message table (the history blob is
-    # the drain's source of truth, but other readers use chat_message).
-    for message in upserts:
-        try:
-            await ChatMessages.upsert_message(
-                message_id=message['id'],
-                chat_id=parent_chat_id,
-                user_id=user_id,
-                data=message,
-            )
-        except Exception:
-            log.exception('Failed to mirror steer status for %s', message.get('id'))
+    # The history blob is the drain's source of truth, but other readers use
+    # chat_message; keep both in step.
+    await _mirror_steer_statuses(parent_chat_id, user_id, upserts)
+    if status == STEER_DELIVERED:
+        await _resume_children_after_steer_delivery(upserts)
     return updated
 
 
@@ -1066,6 +1308,8 @@ async def delegate(
     existing_chat = None
     existing_messages: dict = {}
     continuation_tip_id = None
+    late_body: str | None = None
+    late_state: str | None = None
     if session_id:
         existing_chat = await Chats.get_chat_by_id(session_id)
         if not existing_chat or existing_chat.user_id != user.id:
@@ -1085,12 +1329,97 @@ async def delegate(
                 'id'
             )
 
-        # A child that is still producing a turn has an unfinished assistant tip.
-        # Continuing it now would race that turn's history writes, so reject until
-        # it finishes (the background handle is returned while the child runs).
+        # A child that is still producing a turn is steered, not continued: the
+        # instruction is queued durably and the child's middleware consumes it at
+        # its next request boundary. Continuing here would race the live turn's
+        # history writes.
         tip = existing_messages.get(continuation_tip_id) if continuation_tip_id else None
-        if tip and tip.get('role') == 'assistant' and tip.get('done') is False:
-            return f'Error: sessionID "{session_id}" is still running; wait for it to finish before continuing.'
+        child_running = bool(
+            (tip and tip.get('role') == 'assistant' and tip.get('done') is False)
+            or await has_active_tasks(request.app.state.redis, existing_chat.id)
+        )
+        if child_running:
+            # TODO(late-steer boundary race): if the child has already generated
+            # its final response but its turn has not finalized, Slice A may have
+            # no further model request to consume this steer. It then stays
+            # pending until the next child turn. The acceptance-time race below
+            # is handled, but the clean fix for this narrower window is a child
+            # turn-end sweep that starts a new turn (with the pre_steer note).
+            # The record lives in the child chat: that is the chat whose
+            # boundary drain (child_id == existing_chat.id) consumes it.
+            steer_id = await enqueue_steer(
+                existing_chat.id,
+                user.id,
+                prompt_text,
+                source='parent',
+                child_id=existing_chat.id,
+                generation_id=existing_meta.get('generation_id'),
+                model_id=run['model_id'],
+            )
+            if steer_id is None:
+                return f'Error: could not queue a steering message for sessionID "{session_id}".'
+
+            # The run may have finished between the activity check and the write.
+            # If so the queued steer has no live consumer: tombstone it and fall
+            # through to the normal continuation/late-steer path instead of
+            # leaving the child stranded in `steer_queued`.
+            refreshed = await Chats.get_chat_by_id(existing_chat.id)
+            refreshed_history = ((refreshed.chat or {}).get('history') or {}) if refreshed else {}
+            refreshed_messages = refreshed_history.get('messages') or {}
+            refreshed_tip_id = resolve_history_tip(
+                refreshed_messages,
+                refreshed_history.get('currentId') or continuation_tip_id,
+                continuation_tip_id,
+                blocked=is_pending_internal_message,
+            )
+            refreshed_tip = refreshed_messages.get(refreshed_tip_id)
+            still_running = bool(
+                (refreshed_tip and refreshed_tip.get('role') == 'assistant' and refreshed_tip.get('done') is False)
+                or await has_active_tasks(request.app.state.redis, existing_chat.id)
+            )
+            if still_running:
+                return JSONCodec.dumps(
+                    {
+                        'sessionID': existing_chat.id,
+                        'status': 'steer_queued',
+                        'output': (
+                            f'The steering message was queued for the running subagent '
+                            f'(sessionID: {existing_chat.id}). It will be applied at the next safe '
+                            'boundary. Do NOT poll, sleep, or duplicate its work.'
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            await mark_steer_superseded(existing_chat.id, user.id, steer_id)
+            if refreshed and (refreshed.meta or {}).get('state') == 'steer_queued':
+                await _set_child_state(
+                    existing_chat.id,
+                    _terminal_state_for_tip(refreshed_tip),
+                    only_if_state=('steer_queued',),
+                )
+            # Continue from the refreshed branch, not the pre-write snapshot.
+            existing_messages = copy.deepcopy(refreshed_messages)
+            continuation_tip_id = refreshed_tip_id
+
+        # Detect a late steer: the child finished after the parent decided to send
+        # an instruction, and its completion notice is still undrained. The old
+        # answer is returned now (with a pre_steer note) while the new turn runs.
+        #
+        # TODO(late-steer race): an intentional foreground continuation of an
+        # idle child is indistinguishable from a late foreground steer, so we
+        # only take the note path for `background=True` (the shape a parent uses
+        # when it expects an immediate handle). Foreground calls keep the existing
+        # continuation semantics and never return a stale answer. A dedicated
+        # tool-level mode is the clean fix if this ambiguity matters.
+        late_notice = None
+        if background:
+            parent_chat = await Chats.get_chat_by_id(parent_chat_id)
+            if parent_chat and parent_chat.user_id == user.id:
+                parent_messages = ((parent_chat.chat or {}).get('history') or {}).get('messages') or {}
+                late_notice = _pending_child_completion_notice(parent_messages, existing_chat.id)
+        late_body = _completion_notice_body(late_notice) if late_notice else None
+        late_state = (late_notice.get('meta') or {}).get('state') if late_notice else None
 
         # A completion notice from the previous generation may still be waiting
         # in the parent's history. Continuing the child invalidates it: draining
@@ -1298,7 +1627,10 @@ async def delegate(
             if run.get('tool_servers'):
                 form_data['tool_servers'] = run['tool_servers']
             await request.app.state.CHAT_COMPLETION_HANDLER(child_request, form_data, user=user)
-            message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
+            # Prefer the child's current tip over the spawn-time assistant id: a
+            # steer/continuation completed during this run may have attached a
+            # newer final answer.
+            message = await _latest_child_tip_message(chat_id, assistant_message_id)
             if not message:
                 await _set_child_state(chat_id, 'error', generation_id=generation_id)
                 return {
@@ -1365,39 +1697,15 @@ async def delegate(
             body = summary or 'Subagent completed without a final summary.'
         envelope = f'<subagent sessionID="{chat_id}" state="{state}">\n{body}\n</subagent>'
 
-        pending_message_id = str(uuid4())
-        pending_meta = {
-            'internal': True,
-            'type': 'subagent',
-            'source': 'subagent',
-            'childID': chat_id,
-            'state': state,
-            # opencode carries the label through to the parent result so the UI
-            # can show it instead of the first line of the output.
-            'description': description,
-            # Persisted for legacy chats that still key off the old handle.
-            'delegation_id': delegation_id,
-            'subagent_chat_id': chat_id,
-            # Lets Slice B pair a completion with the child turn that produced
-            # it, and lets a superseded run recognise its own stale notice.
-            'generation_id': generation_id,
-        }
-        pending_message = {
-            'id': pending_message_id,
-            'parentId': None,
-            'childrenIds': [],
-            'role': 'user',
-            'content': envelope,
-            'model': run['model_id'],
-            'meta': pending_meta,
-            'timestamp': int(time.time()),
-        }
+        # Completion is delivered as a synthetic steer: it rides the same durable
+        # pending-node path as user/parent steers, so the parent boundary drain
+        # (or the turn-end drain when the parent is idle) can deliver it. The
+        # deterministic id keeps one notice per child generation.
+        notice_id = f'subagent-completion-{chat_id}-{generation_id}'
 
         async with _parent_lock_scope(parent_chat_id):
-            # Read the parent (ownership-checked) just to resolve the anchor. The
-            # session is closed before the merge write: the write opens its own
-            # session, and holding a `FOR UPDATE` row lock across it would
-            # self-deadlock on Postgres.
+            # Read the parent (ownership-checked) to confirm it still exists and
+            # that no continuation has claimed the child while this run finished.
             async with get_async_db() as db:
                 stmt = select(Chat).where(Chat.id == parent_chat_id, Chat.user_id == user.id)
                 result_row = await db.execute(stmt)
@@ -1418,71 +1726,46 @@ async def delegate(
                         raise asyncio.CancelledError
                     return result
 
-                parent_history = (parent.chat or {}).get('history') or {}
-                updated_messages = parent_history.get('messages') or {}
-                # Anchor the result at the chat's current branch tip, never at the
-                # "newest completed assistant". A live turn is persisted with
-                # `done: False`, so a timestamp scan skips it and forks the result
-                # off an earlier turn — orphaning the user's in-flight message.
-                # opencode's promote step appends a background completion at the
-                # session tip, so mirror that here. Prefer the denormalized tip
-                # column, falling back to the in-JSON tip for older rows.
-                result_parent_id = resolve_history_tip(
-                    updated_messages,
-                    parent.current_message_id or parent_history.get('currentId'),
-                    parent_message_id,
-                    blocked=is_pending_internal_message,
-                )
-                pending_message['parentId'] = result_parent_id
-                if await has_active_tasks(request.app.state.redis, parent_chat_id):
-                    pending_message['meta']['status'] = 'pending'
-                # A newer completion replaces an undrained notice for the same
-                # child. Without this, both notices can drain and the parent
-                # replies to an answer the child has already superseded.
-                stale_updates = _stale_child_result_updates(
-                    updated_messages,
-                    chat_id,
-                    delegation_id=child_meta.get('delegation_id'),
-                )
+        # Replace any undrained notice from an earlier generation before this one
+        # lands. `enqueue_steer` re-checks the generation under the parent lock,
+        # closing the window against a continuation that starts here.
+        await supersede_pending_child_results(parent_chat_id, user.id, chat_id)
+        steer_id = await enqueue_steer(
+            parent_chat_id,
+            user.id,
+            envelope,
+            source='subagent',
+            child_id=chat_id,
+            generation_id=generation_id,
+            model_id=run['model_id'],
+            message_id=notice_id,
+            state=state,
+            description=description,
+            delegation_id=delegation_id,
+            parent_id=parent_message_id,
+            expected_generation_id=generation_id,
+        )
+        if steer_id is None:
+            # Parent vanished or a continuation took over the child; the answer
+            # this run produced must not be delivered.
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
 
-            # Merge only these nodes instead of overwriting the whole history blob.
-            # `update_chat_by_id` re-reads the row and runs `merge_history`, so a
-            # normal turn that wrote since our read is preserved. `currentId` is
-            # intentionally omitted: merge_history keeps the stored tip, and this
-            # node must not steal it (it may still be `pending`, and the drain
-            # advances the tip when the synthesis lands).
-            await Chats.update_chat_by_id(
-                parent_chat_id,
-                {
-                    'history': {
-                        'messages': {
-                            **stale_updates,
-                            pending_message_id: pending_message,
-                        }
-                    }
-                },
-            )
-
-            await ChatMessages.upsert_message(
-                message_id=pending_message_id,
-                chat_id=parent_chat_id,
-                user_id=user.id,
-                data=pending_message,
-            )
-
-        if pending_message['meta'].get('status') == 'pending':
+        parent_active = await has_active_tasks(request.app.state.redis, parent_chat_id)
+        if parent_active:
             from open_webui.socket.main import sio
 
             await sio.emit(
                 'events',
                 {
                     'chat_id': parent_chat_id,
-                    'message_id': pending_message_id,
+                    'message_id': steer_id,
                     'data': {'type': 'chat:reload'},
                 },
                 room=f'user:{user.id}',
             )
-        if not await has_active_tasks(request.app.state.redis, parent_chat_id):
+        if not parent_active:
             await process_pending_internal_messages(request, parent_chat_id, user.id, run)
         if cancelled:
             raise asyncio.CancelledError
@@ -1492,10 +1775,13 @@ async def delegate(
     # the caller's handle (and the list endpoint) reflects the transition
     # immediately. The same token guards the task's terminal writes.
     await _begin_child_run(chat_id, generation_id)
+    # A late steer returns the old final answer immediately, so the new turn must
+    # run in the background even when the caller did not ask for background.
+    run_in_background = background or late_body is not None
     try:
         _, child_task = await create_task(
             request.app.state.redis,
-            run_background() if background else run_reserved(),
+            run_background() if run_in_background else run_reserved(),
             id=chat_id,
         )
     except Exception as exc:
@@ -1511,6 +1797,9 @@ async def delegate(
                 asyncio.create_task(_set_child_state(chat_id, 'interrupted', generation_id=generation_id))
 
         child_task.add_done_callback(_finalize_cancelled)
+
+    if late_body is not None:
+        return _pre_steer_response(chat_id, late_state, late_body)
 
     if background:
         return JSONCodec.dumps(

@@ -1857,6 +1857,9 @@ async def subagent(
       asynchronously. Use when you have other independent work to perform while the subagent
       runs. **Do NOT poll or sleep:** the subagent's final result is automatically injected into
       this chat upon completion.
+    - **Steering a running subagent:** Calling with the `sessionID` of a subagent that is still
+      running queues the `prompt` as a steering instruction and returns immediately
+      (`status: "steer_queued"`). It is applied at the subagent's next safe boundary.
     - **Follow-ups:** Send follow-up instructions to a completed subagent by calling this tool
       with its `sessionID` and a new `prompt`, without restarting from scratch.
 
@@ -1866,6 +1869,8 @@ async def subagent(
     - **Background (`background=true`):** An immediate acknowledgment
       `{"sessionID": "...", "status": "running", "output": "..."}`; the subagent's final output
       will be delivered to this chat when complete.
+    - **Running child steered:** An immediate acknowledgment
+      `{"sessionID": "...", "status": "steer_queued", "output": "..."}`.
 
     :param description: (required) A concise 3-5 word title summarizing the task. Visible to the
         user in UI.
