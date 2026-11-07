@@ -20,6 +20,7 @@
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import MCPApp from '$lib/components/chat/Messages/MCPApp.svelte';
 	import ToolOutputDisplay from '../chat/Messages/ToolOutputDisplay.svelte';
+	import { subagentResultHasPreSteer } from '$lib/components/chat/Messages/structuredOutput';
 	import { settings } from '$lib/stores';
 	import {
 		formatToolArguments,
@@ -143,6 +144,9 @@
 	export let resultContent: string = '';
 
 	$: result = resultContent || decode(attributes?.result ?? '');
+	// A late steer returns the child's pre-steer answer immediately; show the
+	// presentation-only warning without requiring the caller to expand the row.
+	$: preSteer = subagentResultHasPreSteer(result);
 	$: files = parseJSONString(decode(attributes?.files ?? ''));
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
 	$: isAskUser = attributes?.name === 'ask_user';
@@ -340,6 +344,14 @@
 				{/if}
 			</div>
 		</div>
+
+		{#if preSteer && !open}
+			<p class="mt-0.5 px-1 text-[0.75rem] leading-snug text-amber-600 dark:text-amber-500">
+				{$i18n.t(
+					'This response was generated before your steering message. A new response is coming.'
+				)}
+			</p>
+		{/if}
 
 		{#if open}
 			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>

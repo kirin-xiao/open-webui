@@ -2,8 +2,10 @@
 
 Covers the durable steer record contract, stale completion supersession,
 child chat lifecycle state, and the ownership-checked subagent listing
-endpoint. These use the same in-memory ``Chats`` fake as ``test_subagents`` so
-the real delegate / drain coroutines run without a database or Redis.
+endpoint. The final section also exercises the Slice A boundary helpers against
+Slice B's real store, so the cross-slice delivery contracts are pinned here.
+These use the same in-memory ``Chats`` fake as ``test_subagents`` so the real
+delegate / drain coroutines run without a database or Redis.
 """
 
 from __future__ import annotations
@@ -1215,3 +1217,166 @@ async def test_cancelled_child_with_queued_steer_stays_interrupted(monkeypatch):
     notices = _completion_notices(parent.chat['history']['messages'])
     assert len(notices) == 1
     assert notices[0]['meta']['state'] == 'interrupted'
+
+
+# ---------------------------------------------------------------------------
+# Cross-slice integration: Slice B's durable store <-> Slice A's boundaries
+# ---------------------------------------------------------------------------
+
+
+def _bind_middleware_to_harness(monkeypatch, harness):
+    """Point the middleware steers at the same fake store the harness uses."""
+    from open_webui.utils import middleware
+
+    monkeypatch.setattr(middleware, 'Chats', harness.fake_chats)
+    monkeypatch.setattr(middleware, 'drain_pending_steers', subagents.drain_pending_steers)
+    monkeypatch.setattr(middleware, 'mark_steer_delivered', subagents.mark_steer_delivered)
+    return middleware
+
+
+@pytest.mark.asyncio
+async def test_parent_user_steer_is_delivered_once_at_a_boundary(monkeypatch):
+    """B enqueues in the parent chat; A's parent boundary consumes and annotates."""
+    harness = Harness(monkeypatch, active=False)
+    harness.seed_parent(history=_parent_history())
+    middleware = _bind_middleware_to_harness(monkeypatch, harness)
+    user = SimpleNamespace(id='user-1')
+
+    steer_id = await subagents.enqueue_steer(
+        'chat-1',
+        'user-1',
+        'focus on the failing test',
+        source='user',
+        model_id='test-model',
+    )
+    assert steer_id
+
+    # A parent turn (not internal) reads its own chat with the parent selector.
+    injected, pending, store_chat_id = await middleware._inject_pending_steers(
+        {'messages': [{'role': 'user', 'content': 'start'}]},
+        {'chat_id': 'chat-1'},
+        user,
+    )
+    assert [steer['id'] for steer in pending] == [steer_id]
+    assert store_chat_id == 'chat-1'
+    assert middleware.STEER_BLOCK_OPEN in injected['messages'][-1]['content']
+
+    annotations = await middleware._mark_boundary_steers_delivered(
+        {'chat_id': 'chat-1'},
+        user,
+        pending,
+        SimpleNamespace(status_code=200),
+        delivery_chat_id=store_chat_id,
+    )
+    assert annotations == [{'id': steer_id, 'source': 'user', 'content': 'focus on the failing test'}]
+
+    # Delivered is terminal: neither a later boundary nor the idle turn-end
+    # drain can promote the same steer into a second turn.
+    assert await subagents.drain_pending_steers('chat-1', 'user-1') == []
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    assert harness.completions == []
+
+
+@pytest.mark.asyncio
+async def test_parent_child_steer_stays_in_the_child_store_and_resumes_it(monkeypatch):
+    """B writes the instruction to the child; A's child boundary consumes it."""
+    harness = Harness(monkeypatch)
+    harness.seed_parent(history=_parent_history())
+    child = harness.seed_child(child_id='child-1', state='running')
+    middleware = _bind_middleware_to_harness(monkeypatch, harness)
+    user = SimpleNamespace(id='user-1')
+
+    steer_id = await subagents.enqueue_steer(
+        'child-1',
+        'user-1',
+        'focus on the failing test',
+        source='parent',
+        child_id='child-1',
+        model_id='test-model',
+    )
+    assert steer_id
+    assert child.meta['state'] == 'steer_queued'
+
+    # The parent turn must not see the child's instruction.
+    parent_injected, parent_pending, parent_store = await middleware._inject_pending_steers(
+        {'messages': [{'role': 'user', 'content': 'start'}]},
+        {'chat_id': 'chat-1'},
+        user,
+    )
+    assert parent_pending == []
+    assert parent_store == 'chat-1'
+    assert all(middleware.STEER_BLOCK_OPEN not in (m.get('content') or '') for m in parent_injected['messages'])
+
+    # The internal child turn reads the child chat with `child_id=<child>`.
+    child_injected, child_pending, child_store = await middleware._inject_pending_steers(
+        {'messages': [{'role': 'tool', 'tool_call_id': 'call-1', 'content': 'ok'}]},
+        {'chat_id': 'child-1', 'internal': True},
+        user,
+    )
+    assert [steer['id'] for steer in child_pending] == [steer_id]
+    assert child_store == 'child-1'
+    assert child_injected['messages'][-1]['content'].count('focus on the failing test') == 1
+
+    annotations = await middleware._mark_boundary_steers_delivered(
+        {'chat_id': 'child-1', 'internal': True},
+        user,
+        child_pending,
+        SimpleNamespace(status_code=200),
+        delivery_chat_id=child_store,
+    )
+    assert annotations == [{'id': steer_id, 'source': 'parent', 'content': 'focus on the failing test'}]
+    # Delivery writes to the same store and resumes the paused child.
+    assert child.meta['state'] == 'running'
+    assert await subagents.drain_pending_steers('child-1', 'user-1', child_id='child-1') == []
+
+
+@pytest.mark.asyncio
+async def test_completion_steer_is_parent_only_and_drains_once(monkeypatch):
+    """A parent boundary sees the completion; a child boundary never does."""
+    harness = Harness(monkeypatch, active=False)
+    parent = harness.seed_parent(history=_parent_history())
+    harness.seed_child(child_id='child-1', state='completed')
+    middleware = _bind_middleware_to_harness(monkeypatch, harness)
+    user = SimpleNamespace(id='user-1')
+
+    steer_id = await subagents.enqueue_steer(
+        'chat-1',
+        'user-1',
+        '<subagent sessionID="child-1" state="completed">\nfinished\n</subagent>',
+        source='subagent',
+        child_id='child-1',
+        generation_id='gen-1',
+        model_id='test-model',
+        message_id='notice-1',
+        state='completed',
+        description='a task',
+    )
+    assert steer_id == 'notice-1'
+
+    # A's parent boundary includes the completion notice.
+    _, parent_pending, parent_store = await middleware._inject_pending_steers(
+        {'messages': [{'role': 'user', 'content': 'start'}]},
+        {'chat_id': 'chat-1'},
+        user,
+    )
+    assert [steer['id'] for steer in parent_pending] == ['notice-1']
+    assert parent_store == 'chat-1'
+
+    # A's internal child boundary reads the child chat and excludes it.
+    _, child_pending, child_store = await middleware._inject_pending_steers(
+        {'messages': [{'role': 'user', 'content': 'start'}]},
+        {'chat_id': 'child-1', 'internal': True},
+        user,
+    )
+    assert child_pending == []
+    assert child_store == 'child-1'
+
+    # With the parent idle, the turn-end drain consumes it exactly once.
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    await _finish_registered_tasks(harness)
+    assert len(harness.completions) == 1
+    assert 'finished' in harness.completions[0][1]['messages'][-1]['content']
+    assert _completion_notices(parent.chat['history']['messages']) == []
+
+    await subagents.process_pending_internal_messages(harness.source, 'chat-1', 'user-1', {'model_id': 'test-model'})
+    assert len(harness.completions) == 1

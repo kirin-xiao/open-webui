@@ -69,6 +69,10 @@
 		envelopeAttr(content, 'sessionID')
 	);
 	$: status = firstString(result?.status, result?.state, envelopeAttr(content, 'state'));
+	// A completion node may carry the late-steer envelope; accept both the meta
+	// flag and the attribute so the note is never silently dropped.
+	$: preSteer =
+		result?.pre_steer === true || envelopeAttr(content, 'pre_steer').toLowerCase() === 'true';
 	$: raw = (content ?? '').trim() || firstString(result?.output);
 	$: body = raw.replace(/<\/?subagent\b[^>]*>/gi, '').trim();
 	$: summary = (() => {
@@ -129,7 +133,7 @@
 			/>
 		</button>
 	</div>
-	{#if result?.pre_steer}
+	{#if preSteer}
 		<p class="mt-1 text-[0.75rem] leading-snug text-amber-600 dark:text-amber-500">
 			{$i18n.t(
 				'This response was generated before your steering message. A new response is coming.'

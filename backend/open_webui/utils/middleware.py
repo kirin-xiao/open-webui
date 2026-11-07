@@ -3698,14 +3698,14 @@ async def _send_with_boundary_steers(
     return response, annotations
 
 
-# TODO(cross-slice): after Slice B merges, completion notices are
-# `type='steer'` nodes with `source='subagent'`, and its `drain_pending_steers`
-# includes them for a parent turn, so this boundary drain sees them.
-# `process_pending_internal_messages()` still does not drain parent user steers
-# (`source='user'`/`'parent'`, no `childID`) or queued parent->child
-# instructions (stored in the child chat). A user steer left pending after the
-# final response needs the Slice C turn-end behavior; a child instruction left
-# pending waits for the child's next turn (or a child turn-end sweep).
+# Completion notices (`type='steer'`, `source='subagent'`) are included in a
+# parent turn's boundary drain, so the parent sees a finished child at its next
+# tool boundary. Anything still pending when the turn ends is promoted by
+# `process_pending_internal_messages()`: parent user steers become a normal
+# turn, and completion notices become the subagent synthesis turn. A queued
+# parent -> child instruction stays in the child chat and is consumed by that
+# child's own next boundary (there is no child turn-end sweep yet; see the
+# late-steer TODO in `subagents.delegate`).
 
 
 def _build_final_message_meta(existing_meta: dict | None, consumed: list[dict] | None, *, ended_at: float) -> dict:

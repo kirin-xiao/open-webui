@@ -224,6 +224,24 @@ export function parseSubagentResult(resultText: string, name?: string): Subagent
 	};
 }
 
+/**
+ * True when a subagent result carries the late-steer note.
+ *
+ * The note is presentation-only: the tool result is the child's pre-steer final
+ * answer, returned immediately while the new turn runs in the background. It is
+ * emitted as the `pre_steer="true"` envelope attribute by `delegate`, so read it
+ * from either the structured handle or the envelope.
+ */
+export function subagentResultHasPreSteer(resultText: string): boolean {
+	const text = resultText ?? '';
+	const parsed = parseJSONStringValue(text) as Record<string, unknown> | null;
+	if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.pre_steer === true) {
+		return true;
+	}
+	const envelope = text.match(/<subagent\b[^>]*>/i)?.[0] ?? '';
+	return /pre_steer\s*=\s*"true"/i.test(envelope);
+}
+
 function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputItem) {
 	if (!callItem || !resultItem || callItem.name !== 'display_file') {
 		return null;
@@ -618,9 +636,14 @@ export function collectCompletedSubagentIds(
 
 	for (const message of Object.values(messages ?? {})) {
 		const meta = message?.meta;
-		if (meta?.internal !== true || meta?.type !== 'subagent') {
-			continue;
-		}
+		if (meta?.internal !== true) continue;
+
+		// Slice B delivers child completions as `type: 'steer'` nodes; the legacy
+		// `type: 'subagent'` shape still has to keep settling old chats.
+		const isLegacyResult = meta.type === 'subagent';
+		const isSteerNotice =
+			meta.type === 'steer' && meta.source === 'subagent' && meta.status !== 'superseded';
+		if (!isLegacyResult && !isSteerNotice) continue;
 
 		const state = typeof meta.state === 'string' ? meta.state : '';
 		const status = typeof meta.status === 'string' ? meta.status : '';

@@ -4,6 +4,7 @@ import {
 	buildOutputDisplayItems,
 	collectCompletedSubagentIds,
 	parseSubagentResult,
+	subagentResultHasPreSteer,
 	type OutputDetailToken,
 	type OutputDisplayItem,
 	type OutputItem
@@ -12,11 +13,7 @@ import { mergeSubagentCompletionStates } from './steers';
 
 function allTokens(items: OutputDisplayItem[]): OutputDetailToken[] {
 	return items.flatMap((item) =>
-		item.type === 'detail_single'
-			? [item.token]
-			: item.type === 'detail_group'
-				? item.tokens
-				: []
+		item.type === 'detail_single' ? [item.token] : item.type === 'detail_group' ? item.tokens : []
 	);
 }
 
@@ -64,6 +61,19 @@ describe('parseSubagentResult', () => {
 
 	it('returns empty values when neither shape is present', () => {
 		expect(parseSubagentResult('')).toEqual({ sessionID: '', state: '', background: false });
+	});
+
+	it('detects the late-steer note on the result envelope', () => {
+		expect(
+			subagentResultHasPreSteer(
+				'<subagent sessionID="c2" state="completed" pre_steer="true">\nold\n\nNote: later\n</subagent>'
+			)
+		).toBe(true);
+		expect(
+			subagentResultHasPreSteer('<subagent sessionID="c2" state="completed">done</subagent>')
+		).toBe(false);
+		expect(subagentResultHasPreSteer(JSON.stringify({ pre_steer: true }))).toBe(true);
+		expect(subagentResultHasPreSteer('')).toBe(false);
 	});
 });
 
@@ -167,12 +177,7 @@ describe('buildOutputDisplayItems subagent rows', () => {
 			}
 		];
 		const token = allTokens(
-			buildOutputDisplayItems(
-				output,
-				undefined,
-				new Map([['msg-1:call-1', 'live-child']]),
-				'msg-1'
-			)
+			buildOutputDisplayItems(output, undefined, new Map([['msg-1:call-1', 'live-child']]), 'msg-1')
 		).find((t) => t.attributes.type === 'tool_calls');
 
 		expect(token?.attributes.sessionID).toBe('live-child');
@@ -225,6 +230,42 @@ describe('collectCompletedSubagentIds', () => {
 			unrelated: {
 				content: '',
 				meta: { internal: true, type: 'note', childID: 'note-child' }
+			},
+			// Slice B's completion steer: a child completion in the new shape.
+			steerCompleted: {
+				content: '<subagent sessionID="steer-child" state="completed">ok</subagent>',
+				meta: {
+					internal: true,
+					type: 'steer',
+					source: 'subagent',
+					status: 'delivered',
+					state: 'completed',
+					childID: 'steer-child'
+				}
+			},
+			// A superseded notice names the same child but predates a new run.
+			steerSuperseded: {
+				content: '',
+				meta: {
+					internal: true,
+					type: 'steer',
+					source: 'subagent',
+					status: 'superseded',
+					state: 'completed',
+					childID: 'stale-child'
+				}
+			},
+			// A parent->child instruction also uses the steer subtype.
+			childInstruction: {
+				content: 'focus on tests',
+				meta: {
+					internal: true,
+					type: 'steer',
+					source: 'parent',
+					status: 'pending',
+					state: 'completed',
+					childID: 'instruction-child'
+				}
 			}
 		});
 
@@ -236,5 +277,8 @@ describe('collectCompletedSubagentIds', () => {
 		expect(ids.has('c5')).toBe(true);
 		expect(ids.has('deferred-child')).toBe(true);
 		expect(ids.has('note-child')).toBe(false);
+		expect(ids.has('steer-child')).toBe(true);
+		expect(ids.has('stale-child')).toBe(false);
+		expect(ids.has('instruction-child')).toBe(false);
 	});
 });
