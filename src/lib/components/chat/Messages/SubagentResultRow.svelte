@@ -12,6 +12,7 @@
 		description?: string;
 		status?: string;
 		state?: string;
+		pre_steer?: boolean;
 		output?: string;
 		// Persisted legacy handle.
 		delegation_id?: string;
@@ -128,6 +129,13 @@
 			/>
 		</button>
 	</div>
+	{#if result?.pre_steer}
+		<p class="mt-1 text-[0.75rem] leading-snug text-amber-600 dark:text-amber-500">
+			{$i18n.t(
+				'This response was generated before your steering message. A new response is coming.'
+			)}
+		</p>
+	{/if}
 	{#if expanded}
 		<div
 			class="mt-2 ml-3 border-l border-gray-100 dark:border-white/8 pl-3 text-[0.78125rem] leading-relaxed text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-words"

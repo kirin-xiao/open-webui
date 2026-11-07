@@ -81,6 +81,7 @@
 
 	let regenerateMenu = true;
 	let enableMessageQueue = true;
+	let userMessageDelivery: 'steer' | 'queue' = 'steer';
 
 	let landingPageMode = '';
 	let chatBubble = true;
@@ -179,6 +180,11 @@
 	const toggleLandingPageMode = async () => {
 		landingPageMode = landingPageMode === '' ? 'chat' : '';
 		saveSettings({ landingPageMode: landingPageMode });
+	};
+
+	const toggleUserMessageDelivery = () => {
+		userMessageDelivery = userMessageDelivery === 'steer' ? 'queue' : 'steer';
+		saveSettings({ userMessageDelivery });
 	};
 
 	const toggleUserLocation = async () => {
@@ -364,6 +370,7 @@
 
 		regenerateMenu = currentSettings?.regenerateMenu ?? true;
 		enableMessageQueue = currentSettings?.enableMessageQueue ?? true;
+		userMessageDelivery = currentSettings?.userMessageDelivery === 'queue' ? 'queue' : 'steer';
 
 		largeTextAsFile = currentSettings?.largeTextAsFile ?? false;
 		copyFormatted = currentSettings?.copyFormatted ?? false;
@@ -824,6 +831,33 @@
 		</div>
 		<p class={settingDescriptionClass}>
 			{$i18n.t('settings.personal.interface.enableMessageQueue.description')}
+		</p>
+	</div>
+
+	<div>
+		<div class={settingRowClass}>
+			<label
+				id="user-message-delivery-label"
+				class={settingLabelClass}
+				for="user-message-delivery-label-control"
+			>
+				{$i18n.t('settings.personal.interface.userMessageDelivery.label')}
+			</label>
+
+			<button
+				id="user-message-delivery-label-control"
+				aria-labelledby="user-message-delivery-label user-message-delivery-mode"
+				class={actionButtonClass}
+				on:click={toggleUserMessageDelivery}
+				type="button"
+			>
+				<span id="user-message-delivery-mode">
+					{userMessageDelivery === 'steer' ? $i18n.t('Steer') : $i18n.t('Queue')}
+				</span>
+			</button>
+		</div>
+		<p class={settingDescriptionClass}>
+			{$i18n.t('settings.personal.interface.userMessageDelivery.description')}
 		</p>
 	</div>
 

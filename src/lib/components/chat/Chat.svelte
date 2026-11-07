@@ -56,7 +56,8 @@
 		chatRequestQueues,
 		desktopEvent,
 		subagentCompletions,
-		subagentSessions
+		subagentSessions,
+		subagentStates
 	} from '$lib/stores';
 	import { refreshChatList, refreshFolderChatLists } from '$lib/stores/chatList';
 
@@ -91,6 +92,11 @@
 		getOutputText,
 		setOutputText
 	} from './Messages/structuredOutput';
+	import {
+		collectPendingSteers,
+		collectUnannotatedDeliveredSteers,
+		mergeSubagentCompletionStates
+	} from './Messages/steers';
 
 	import {
 		addTagById,
@@ -101,9 +107,11 @@
 		forkChatById,
 		getAllTags,
 		getChatById,
+		getSubagentChatsByParentId,
 		getTagsById,
 		importChats,
 		resolveChatMessageToolCall,
+		steerChatById,
 		updateChatById,
 		updateChatParams,
 		updateChatFolderIdById
@@ -137,6 +145,7 @@
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
 	import Messages from '$lib/components/chat/Messages.svelte';
+	import SteerBlock from './Messages/SteerBlock.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatTabs from './ChatTabs.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
@@ -1496,6 +1505,28 @@
 		history = history;
 	};
 
+	/**
+	 * Reconcile background subagent rows with persisted child state. The
+	 * `subagent:created` event only carries the id, and a completion reload can
+	 * be missed while the tab is disconnected, so this is the durable truth.
+	 */
+	const refreshSubagentStates = async (id: string) => {
+		if (!id || isTemporaryChatId(id)) return;
+		try {
+			const children = await getSubagentChatsByParentId(localStorage.token, id);
+			if ($chatId !== id || isTemporaryChatId(id)) return;
+			const next = new Map<string, string>();
+			for (const child of children ?? []) {
+				if (typeof child?.id === 'string' && child.id) {
+					next.set(child.id, typeof child.state === 'string' ? child.state : '');
+				}
+			}
+			subagentStates.set(next);
+		} catch (error) {
+			console.warn('[subagents] failed to refresh child states', error);
+		}
+	};
+
 	const refreshChat = () => {
 		const id = $chatId;
 		if (!id || $temporaryChatEnabled) return Promise.resolve();
@@ -1706,6 +1737,13 @@
 						}
 						if ($chatId && !$temporaryChatEnabled) {
 							updateLastReadAt($chatId);
+							// A turn boundary is when steers are delivered and child
+							// runs settle; reconcile both so missed events cannot
+							// leave a stale chip or spinner.
+							void refreshSubagentStates($chatId);
+							if (collectPendingSteers(history?.messages).length > 0) {
+								await refreshChat();
+							}
 						}
 					}
 				} else if (type === 'response:completion' || type === 'chat:completion') {
@@ -2034,6 +2072,8 @@
 			const loaded = await loadChat();
 			if (loaded && $chatId === id) await processNextInQueue(id);
 		}
+		// A reconnect can have missed `subagent:created`/completion events.
+		void refreshSubagentStates(id);
 	};
 
 	onMount(() => {
@@ -2621,13 +2661,27 @@
 	// "done" as soon as the immediate `running` handle lands in history.
 	let subagentCompletionKey = '';
 	$: {
-		const completed = collectCompletedSubagentIds(history?.messages ?? {});
+		// Persisted child state wins: it stops rows whose completion event was
+		// missed, and keeps a new `running` generation spinning even while an
+		// older completion result is still in history.
+		const completed = mergeSubagentCompletionStates(
+			collectCompletedSubagentIds(history?.messages ?? {}),
+			$subagentStates
+		);
 		const key = [...completed].sort().join('\n');
 		if (key !== subagentCompletionKey) {
 			subagentCompletionKey = key;
 			subagentCompletions.set(completed);
 		}
 	}
+
+	// Durable steer records. Pending nodes are not on the active branch, so the
+	// readable chip strip is fed directly from `history.messages`; delivered
+	// nodes are only shown when the assistant response does not already carry a
+	// `meta.steers` annotation (backward-compatible fallback).
+	$: pendingSteers = collectPendingSteers(history?.messages);
+	$: unannotatedSteers = collectUnannotatedDeliveredSteers(history?.messages);
+	$: visibleSteers = [...pendingSteers, ...unannotatedSteers];
 
 	// A child subagent chat gets a slim banner back to the chat it was spawned
 	// from. Derived here so the template does not reach into the loosely-typed
@@ -3217,6 +3271,10 @@
 				}
 
 				await tick();
+
+				// Persisted child states are the durable source of truth for rows
+				// whose completion event was missed.
+				void refreshSubagentStates(id);
 
 				if (signal.aborted) return;
 				if (loading) {
@@ -4112,6 +4170,56 @@
 		return _chatId;
 	};
 
+	/**
+	 * Send a user message as a steer for the active turn.
+	 *
+	 * `inactive` means the server saw no active task (stale local taskIds), so
+	 * the caller should send normally instead of queueing for a turn that is
+	 * already over. `failed` keeps the existing queue fallback.
+	 */
+	const submitSteer = async (userPrompt: string): Promise<'queued' | 'inactive' | 'failed'> => {
+		const id = $chatId;
+		if (!id || isTemporaryChatId(id) || !String(userPrompt).trim()) return 'failed';
+
+		const content = String(userPrompt);
+		try {
+			const result = await steerChatById(
+				localStorage.token,
+				id,
+				content,
+				selectedModels.find((modelId) => modelId) ?? undefined
+			);
+			if (!$chatId || $chatId !== id) return 'failed';
+			if (result?.reason === 'no_active_task') return 'inactive';
+			if (!result?.queued || !result.id) return 'failed';
+
+			// Optimistically add the durable node so the queued chip appears
+			// immediately. It is anchored without touching `currentId` or the
+			// parent's children, so the live branch is never forked.
+			const steerId = result.id;
+			history.messages[steerId] = {
+				id: steerId,
+				parentId: history.currentId ?? null,
+				childrenIds: [],
+				role: 'user',
+				content,
+				timestamp: Math.floor(Date.now() / 1000),
+				models: selectedModels,
+				meta: {
+					internal: true,
+					type: 'steer',
+					source: 'user',
+					status: 'pending'
+				}
+			};
+			history = history;
+			return 'queued';
+		} catch (error) {
+			console.warn('[steer] failed to queue steering message', error);
+			return 'failed';
+		}
+	};
+
 	const submitHandler = async (
 		userPrompt: string,
 		{
@@ -4276,24 +4384,48 @@
 				)
 			: lastMessage && lastMessage.role === 'assistant' && !lastMessage.done;
 
-		if (isGenerating) {
+		// A running turn may be the visible assistant response or a background
+		// completion task. Both accept a user steer at the next boundary.
+		const hasActiveTurn = !!isGenerating || (taskIds?.length ?? 0) > 0;
+		if (hasActiveTurn) {
 			if (bridgeRequest) return { status: 'deferred' };
-			if ($settings?.enableMessageQueue ?? true) {
-				// Enqueue the request
-				const _files = structuredClone(files);
-				chatRequestQueues.update((q) => ({
-					...q,
-					[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
-				}));
-				// Clear input
-				messageInput?.setText('');
-				prompt = '';
-				files = [];
-				return { status: 'rejected' };
-			} else {
-				// Interrupt: stop current generation and proceed
-				await stopResponse();
-				await tick();
+
+			const delivery = $settings?.userMessageDelivery === 'queue' ? 'queue' : 'steer';
+			// Attachments have no steer representation; they always use the queue.
+			const canSteer = delivery === 'steer' && files.length === 0;
+			let steerInactive = false;
+			if (canSteer) {
+				const outcome = await submitSteer(userPrompt);
+				if (outcome === 'queued') {
+					messageInput?.setText('');
+					prompt = '';
+					files = [];
+					return { status: 'rejected' };
+				}
+				if (outcome === 'inactive') {
+					taskIds = null;
+					steerInactive = true;
+				}
+			}
+
+			if (!steerInactive) {
+				if (delivery === 'queue' || ($settings?.enableMessageQueue ?? true)) {
+					// Enqueue the request
+					const _files = structuredClone(files);
+					chatRequestQueues.update((q) => ({
+						...q,
+						[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
+					}));
+					// Clear input
+					messageInput?.setText('');
+					prompt = '';
+					files = [];
+					return { status: 'rejected' };
+				} else {
+					// Interrupt: stop current generation and proceed
+					await stopResponse();
+					await tick();
+				}
 			}
 		}
 
@@ -5702,6 +5834,9 @@
 									id={embedded ? messageInputDropzoneId : undefined}
 									class=" pb-2 {dragged ? 'z-0' : 'z-10'}"
 								>
+									{#if visibleSteers.length > 0}
+										<SteerBlock steers={visibleSteers} />
+									{/if}
 									<MessageInput
 										{terminalContext}
 										{typingUsers}
@@ -5804,6 +5939,9 @@
 									</div>
 								{/if}
 								<div id={embedded ? messageInputDropzoneId : undefined} class="pb-2 z-10">
+									{#if visibleSteers.length > 0}
+										<SteerBlock steers={visibleSteers} />
+									{/if}
 									<MessageInput
 										{terminalContext}
 										{typingUsers}

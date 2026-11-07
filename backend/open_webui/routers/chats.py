@@ -52,6 +52,7 @@ from open_webui.utils.context_compaction import (
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
+from open_webui.utils.subagents import enqueue_steer
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1375,6 +1376,65 @@ async def get_chat_by_id(
         return data
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+
+############################
+# SteerChatById
+############################
+
+
+class SteerChatForm(BaseModel):
+    content: str
+    model_id: str | None = None
+
+
+class SteerChatResponse(BaseModel):
+    queued: bool
+    id: str | None = None
+    reason: str | None = None
+
+
+@router.post('/{id}/steer', response_model=SteerChatResponse)
+async def steer_chat_by_id(
+    request: Request,
+    id: str,
+    form_data: SteerChatForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Queue a user steer for a chat with an active response turn.
+
+    A steer is persisted as a pending internal history node; it never starts a
+    second completion turn. The middleware consumes it at the next model
+    boundary (or the turn-end drain does). When no task is active, callers
+    should fall back to the normal submit path.
+    """
+    chat = await Chats.get_chat_by_id_and_user_id(
+        id,
+        user.id,
+        db=db,
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    content = (form_data.content or '').strip()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Steer content is required')
+
+    if not await has_active_tasks(request.app.state.redis, id):
+        return SteerChatResponse(queued=False, reason='no_active_task')
+
+    steer_id = await enqueue_steer(
+        id,
+        user.id,
+        content,
+        source='user',
+        model_id=form_data.model_id,
+    )
+    if not steer_id:
+        return SteerChatResponse(queued=False, reason='not_queued')
+
+    return SteerChatResponse(queued=True, id=steer_id)
 
 
 ############################

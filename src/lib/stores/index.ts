@@ -65,6 +65,11 @@ export const chatTitle = writable('');
 // dispatch row keeps spinning until its child completes.
 export const subagentCompletions = writable(new Set<string>());
 
+// Child chat id -> persisted `meta.state` from `/chats/{id}/subagents`. Refreshed
+// on load, reconnect, and turn end so a missed socket event cannot leave a
+// dispatch row spinning forever.
+export const subagentStates = writable(new Map<string, string>());
+
 // Live call -> child chat id map, keyed `${message_id}:${call_id}`. Populated
 // from the `subagent:created` socket event so a tool-call row can link into its
 // child while the run is still in progress (the result envelope only exists

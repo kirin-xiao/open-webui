@@ -64,6 +64,8 @@
 	import CodeExecutions from './CodeExecutions.svelte';
 	import ContentRenderer from './ContentRenderer.svelte';
 	import ContextCompactionLabel from './ContextCompactionLabel.svelte';
+	import SteerBlock from './SteerBlock.svelte';
+	import { hasPreSteerNote, steerEntriesFromAnnotation } from './steers';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
@@ -83,6 +85,7 @@
 		content: string;
 		output?: OutputItem[];
 		contextSummary?: string;
+		meta?: Record<string, unknown> | null;
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
@@ -134,6 +137,9 @@
 	export let history;
 	export let messageId;
 	$: compactionStatus = $contextCompactions?.[messageId];
+	// Consumed steers are annotated on the assistant message by the middleware.
+	$: consumedSteers = steerEntriesFromAnnotation(message?.meta?.steers);
+	$: preSteerNote = hasPreSteerNote(message?.meta);
 	export let selectedModels = [];
 
 	let messageSource = history.messages[messageId];
@@ -723,6 +729,10 @@
 
 			{#if message.contextSummary && !compactionStatus}
 				<ContextCompactionLabel summary={message.contextSummary} {compactPreview} />
+			{/if}
+
+			{#if consumedSteers.length > 0 || preSteerNote}
+				<SteerBlock steers={consumedSteers} showPreSteerNote={preSteerNote} {compactPreview} />
 			{/if}
 
 			<div>
