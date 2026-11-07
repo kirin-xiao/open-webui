@@ -13,6 +13,8 @@
 		status?: string;
 		state?: string;
 		pre_steer?: boolean;
+		/** Annotation-only marker: a consumed completion delivered as a steer. */
+		source?: string;
 		output?: string;
 		// Persisted legacy handle.
 		delegation_id?: string;
@@ -91,9 +93,19 @@
 
 <div class="w-full min-w-0 pb-1">
 	<div class="w-full min-w-0 flex items-center gap-2 text-gray-500 dark:text-gray-400">
-		<span class="text-[0.75rem] font-normal shrink-0">
-			{$i18n.t('Background subagent finished')}
-		</span>
+		{#if childId && linkable}
+			<a
+				href={`/c/${childId}`}
+				title={childId}
+				class="text-[0.75rem] font-normal shrink-0 hover:text-gray-700 hover:underline dark:hover:text-gray-300 transition-colors"
+			>
+				{$i18n.t('Background subagent finished')}
+			</a>
+		{:else}
+			<span class="text-[0.75rem] font-normal shrink-0">
+				{$i18n.t('Background subagent finished')}
+			</span>
+		{/if}
 		{#if summary}
 			{#if childId && linkable}
 				<a

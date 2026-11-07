@@ -22,6 +22,15 @@ export type SteerEntry = {
 	timestamp?: number;
 };
 
+/**
+ * A consumed child completion. It is delivered through the same durable steer
+ * record as a user message, but the transcript renders it as a subagent result
+ * row (label, state, expandable answer, child-chat link), not a steer chip.
+ */
+export function isSubagentSteer(entry: SteerEntry | null | undefined): boolean {
+	return entry?.source === 'subagent';
+}
+
 type HistoryMessage = {
 	id?: unknown;
 	role?: unknown;

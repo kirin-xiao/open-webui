@@ -5,6 +5,7 @@ import {
 	collectUnannotatedDeliveredSteers,
 	hasPreSteerNote,
 	isSteerMessage,
+	isSubagentSteer,
 	mergeSubagentCompletionStates,
 	planBusySubmit,
 	pruneSteerBranches,
@@ -110,6 +111,20 @@ describe('assistant meta.steers annotations', () => {
 			'wrapped'
 		]);
 		expect(steerEntriesFromAnnotation([{ text: 'legacy text' }])[0].content).toBe('legacy text');
+	});
+
+	it('routes consumed subagent completions to the result row, not the steer chip', () => {
+		const [entry] = steerEntriesFromAnnotation([
+			{
+				id: 'completion-1',
+				source: 'subagent',
+				content: '<subagent sessionID="child-1" state="completed">\nCHILD_TIP\n</subagent>'
+			}
+		]);
+
+		expect(isSubagentSteer(entry)).toBe(true);
+		expect(isSubagentSteer(steerEntriesFromAnnotation(['user steer'])[0])).toBe(false);
+		expect(isSubagentSteer(undefined)).toBe(false);
 	});
 });
 

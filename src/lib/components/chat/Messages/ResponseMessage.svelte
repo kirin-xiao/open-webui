@@ -732,7 +732,12 @@
 			{/if}
 
 			{#if consumedSteers.length > 0 || preSteerNote}
-				<SteerBlock steers={consumedSteers} showPreSteerNote={preSteerNote} {compactPreview} />
+				<SteerBlock
+					steers={consumedSteers}
+					showPreSteerNote={preSteerNote}
+					{compactPreview}
+					linkable={!readOnly}
+				/>
 			{/if}
 
 			<div>
