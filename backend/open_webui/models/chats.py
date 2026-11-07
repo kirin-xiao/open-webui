@@ -1097,6 +1097,13 @@ class ChatTable:
         }
 
         for message_id, message in merged.items():
+            meta = message.get('meta') or {}
+            if meta.get('internal') is True and meta.get('type') == 'steer':
+                # Steers are model-input appends, not history branches. They keep
+                # their `parentId` anchor so the drain can find them, but must
+                # never appear in `childrenIds` (the branch picker would expose an
+                # undelivered steer as a normal user message).
+                continue
             parent_id = message.get('parentId')
             if parent_id in merged:
                 merged[parent_id]['childrenIds'].append(message_id)
