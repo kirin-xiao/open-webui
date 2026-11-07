@@ -1396,9 +1396,9 @@ async def get_chat_subagents_by_id(
     db: AsyncSession = Depends(get_async_session),
 ):
     """List the internal subagent child chats spawned from chat `id`."""
-    chat = await Chats.get_chat_by_id_for_user(
+    chat = await Chats.get_chat_by_id_and_user_id(
         id,
-        user,
+        user.id,
         db=db,
     )
 

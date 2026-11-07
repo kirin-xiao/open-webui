@@ -219,11 +219,14 @@ def get_message_list(messages_map, message_id):
 
 
 def is_pending_internal_message(message) -> bool:
-    """An internal subagent/timer result that has not been synthesized yet.
+    """An internal result that must not anchor the visible history tip.
 
     These nodes sit at the tip with no children until the drain collapses them
     into a synthesis turn. Two of them must stay *siblings* (so they batch)
-    rather than chaining one under the other.
+    rather than chaining one under the other. Superseded results are terminal
+    tombstones: they are never drained, and must not become anchors either.
+    Pending steers are ephemeral model-input appends, so they must be skipped
+    until they are delivered/superseded.
     """
     if not isinstance(message, dict) or message.get('role') != 'user':
         return False
@@ -233,6 +236,8 @@ def is_pending_internal_message(message) -> bool:
     if meta.get('internal') is not True:
         return False
     if meta.get('type') == 'subagent':
+        return meta.get('status') in (None, 'pending', 'superseded')
+    if meta.get('type') == 'steer':
         return meta.get('status') in (None, 'pending')
     return meta.get('type') == 'timer'
 
